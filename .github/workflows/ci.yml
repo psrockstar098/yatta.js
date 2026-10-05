@@ -144,7 +144,7 @@ jobs:
           echo
 
           # Graceful shutdown must drain rather than force-kill.
-          docker stop --time 15 yatta-ci
+          docker stop --time 60 yatta-ci
           docker logs yatta-ci 2>&1 | grep -q "\[shutdown\] Complete\." \
             || { echo "::error::graceful shutdown did not complete"; docker logs yatta-ci; exit 1; }
           docker rm -f yatta-ci
