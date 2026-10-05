@@ -34,7 +34,7 @@ export { mount };
  * @example
  * ```ts
  * // app/api/[[...path]]/route.ts
- * import { toNextRoute } from "yatta/next";
+ * import { toNextRoute } from "yatta.js/next";
  * import { routes } from "@/api-contract";
  * import { handlers } from "@/api-handlers";
  *

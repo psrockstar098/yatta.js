@@ -28,13 +28,13 @@
     "noPropertyAccessFromIndexSignature": false,
 
     "paths": {
-      "yatta/runtime": ["./core_runtime/index.ts"],
-      "yatta/cluster": ["./core_runtime/cluster.ts"]
+      "yatta.js/runtime": ["./core_runtime/index.ts"],
+      "yatta.js/cluster": ["./core_runtime/cluster.ts"]
     }
   },
   // Scope typechecking to the framework's own source. Scratch projects created
   // with `yatta init` live at the repo root and declare their own module
-  // augmentations (e.g. `declare module "yatta/db"`), which would otherwise
+  // augmentations (e.g. `declare module "yatta.js/db"`), which would otherwise
   // collide with the framework's.
   "include": ["src/**/*", "core_runtime/**/*"],
   "exclude": ["node_modules", "dist"]

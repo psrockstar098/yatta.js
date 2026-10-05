@@ -461,7 +461,7 @@ export interface FrontendOptions<R extends Record<string, RouteDef>> extends Cli
  *
  * @example
  * ```ts
- * import { createFrontend } from "yatta/frontend";
+ * import { createFrontend } from "yatta.js/frontend";
  * import { routes } from "./api-contract";
  *
  * export const frontend = createFrontend(routes, {

@@ -1,4 +1,4 @@
-import { createRuntime, defineSubsystem } from "yatta/runtime";
+import { createRuntime, defineSubsystem } from "yatta.js/runtime";
 import { loadEnv } from "./func/env";
 
 // Validate configuration before any subsystem, database, or socket is created.

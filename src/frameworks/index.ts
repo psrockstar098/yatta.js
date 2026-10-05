@@ -412,7 +412,7 @@ export function useSolidCall<TArgs, T>(
  *
  * ```svelte
  * <script lang="ts">
- *   import { useSvelteCall } from "yatta/frameworks";
+ *   import { useSvelteCall } from "yatta.js/frameworks";
  *   const user = useSvelteCall(store, api.getUser, { params: { id: data.id } });
  * </script>
  *

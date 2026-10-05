@@ -71,7 +71,7 @@ export const TEMPLATE_MAIN = `// yatta/main.ts — the server entrypoint.
 //
 // Every file in yatta/func/ is mounted as an isolated subsystem, so a slow
 // handler in one can never block the event loop of another.
-import { createRuntime, defineSubsystem } from "yatta/runtime";
+import { createRuntime, defineSubsystem } from "yatta.js/runtime";
 import routers from "./func/routerHelper";
 import api from "./backend/routes";
 import { realtime, sseResponse } from "./func/realtime";
@@ -231,7 +231,7 @@ process.on("SIGTERM", () => void shutdown());
 
 /** yatta/backend/index.ts — serves GET / */
 const TEMPLATE_BACKEND_INDEX = `// yatta/backend/index.ts — this file serves GET /
-import { API, createAPI } from "yatta/api";
+import { API, createAPI } from "yatta.js/api";
 
 const api = createAPI();
 
@@ -256,7 +256,7 @@ const TEMPLATE_ROUTER = `// yatta/backend/_router.ts
 // You rarely need to edit this — add a file and it is picked up.
 
 import path from "node:path";
-import { API } from "yatta/api";
+import { API } from "yatta.js/api";
 
 const fileRouter = new Bun.FileSystemRouter({
   style: "nextjs",
@@ -323,7 +323,7 @@ export async function routers(req: Request, server: any): Promise<Response> {
   if (!api) {
     console.error(
       \`Route "\${match.filePath}" must export an API instance:\` +
-        \`\\n\\n  import { API, createAPI } from "yatta/api";\\n\` +
+        \`\\n\\n  import { API, createAPI } from "yatta.js/api";\\n\` +
         \`  const api = createAPI();\\n\` +
         \`  api.get(async () => API.json({ ok: true }));\\n\` +
         \`  export default api;\\n\`,
@@ -372,7 +372,7 @@ const TEMPLATE_PKG = (name: string) =>
 const TEMPLATE_FUNC_DB = `// yatta/func/db.ts
 //
 // The ORM. Edit the schema to match your app; the table types are inferred.
-import { col, createDatabase, connect } from "yatta/db";
+import { col, createDatabase, connect } from "yatta.js/db";
 
 export const schema = {
   users: {
@@ -442,7 +442,7 @@ export const schema = {
 };
 
 // This makes db.users, db.sessions, … fully typed.
-declare module "yatta/db" {
+declare module "yatta.js/db" {
   interface Register {
     schema: typeof schema;
   }
@@ -460,7 +460,7 @@ export { connect };
 const TEMPLATE_FUNC_CACHE = `// yatta/func/cache.ts
 //
 // Two-tier cache: L1 in-process LRU, L2 persisted to SQLite.
-import { createCache, SQLiteL2CacheStore } from "yatta/cache";
+import { createCache, SQLiteL2CacheStore } from "yatta.js/cache";
 
 export const cache = createCache({
   maxItems: 20_000,
@@ -472,13 +472,13 @@ export const cache = createCache({
 const TEMPLATE_FUNC_MAIL = `// yatta/func/mail.ts
 //
 // Terminal output in development; "smtp" in production.
-import { createMailer } from "yatta/mail";
+import { createMailer } from "yatta.js/mail";
 
 export interface AppTemplates {
   welcome: { name: string; verifyUrl: string };
 }
 
-declare module "yatta/mail" {
+declare module "yatta.js/mail" {
   interface MailRegister {
     templates: AppTemplates;
   }
@@ -516,9 +516,9 @@ const TEMPLATE_FUNC_STORAGE = `// yatta/func/storage.ts
 //
 // Local disk by default. Point \`s3\` at R2/S3 for object-scale deployments;
 // local disk does not sync across machines.
-import { createStorage } from "yatta/storage";
+import { createStorage } from "yatta.js/storage";
 
-declare module "yatta/storage" {
+declare module "yatta.js/storage" {
   interface StorageRegister {
     disks: "local" | "s3";
   }
@@ -547,14 +547,14 @@ const TEMPLATE_FUNC_JOBS = `// yatta/func/jobs.ts
 //
 // Durable queue backed by SQLite (WAL). Add your job names to AppJobs to get
 // full autocompletion on .job() and .handle().
-import { createJobs, SQLiteJobStore } from "yatta/jobs";
+import { createJobs, SQLiteJobStore } from "yatta.js/jobs";
 
 export interface AppJobs {
   "send-email": { to: string; subject: string; body: string };
   "cleanup-stale-tokens": { maxAgeDays?: number };
 }
 
-declare module "yatta/jobs" {
+declare module "yatta.js/jobs" {
   interface JobRegister extends AppJobs {}
 }
 
@@ -567,14 +567,14 @@ const TEMPLATE_FUNC_EVENTS = `// yatta/func/events.ts
 //
 // Typed event bus wired to the queue, so an event can pipe straight into a
 // background job.
-import { createEvents } from "yatta/jobs";
+import { createEvents } from "yatta.js/jobs";
 import { jobs } from "./jobs";
 
 export interface AppEvents {
   "user.registered": { userId: string; email: string };
 }
 
-declare module "yatta/jobs" {
+declare module "yatta.js/jobs" {
   interface EventRegister extends AppEvents {}
 }
 
@@ -602,7 +602,7 @@ events.pipe(
 const TEMPLATE_FUNC_CRON = `// yatta/func/cron.ts
 //
 // Cron expressions use standard 5-field Vixie syntax.
-import { createCron } from "yatta/jobs";
+import { createCron } from "yatta.js/jobs";
 import { jobs } from "./jobs";
 
 export const cron = createCron();
@@ -626,7 +626,7 @@ const TEMPLATE_FUNC_OBSERVE = `// yatta/func/observe.ts
 // This is the single observer instance. Import it anywhere you need to record
 // something; do not create a second one.
 
-import { createObserver } from "yatta/observe";
+import { createObserver } from "yatta.js/observe";
 
 export const observer = createObserver({
   service: "app",
@@ -693,7 +693,7 @@ const TEMPLATE_BACKEND_HEALTH = `// yatta/backend/health.ts
 // /healthz and /readyz are handled by the framework before any route runs.
 // /health is proxied to the observer, so it is always available.
 
-import { createAPI } from "yatta/api";
+import { createAPI } from "yatta.js/api";
 import { db } from "../func/db";
 import { jobs } from "../func/jobs";
 import { observer } from "../func/observe";
@@ -772,7 +772,7 @@ export const TEMPLATE_BACKEND_AUTH = `// yatta/backend/auth.ts
 // Add password reset, passkeys, MFA or API keys here as you need them — they
 // are methods on the same \`auth\` handle.
 
-import { createAPI, HttpError } from "yatta/api";
+import { createAPI, HttpError } from "yatta.js/api";
 import { auth } from "../func/auth";
 
 const api = createAPI();
@@ -910,7 +910,7 @@ const TEMPLATE_BACKEND_ROUTES = `// yatta/backend/routes.ts
 //   yatta/backend/health.ts   ->  /api/health
 //   yatta/backend/users.ts    ->  /api/users, /api/users/:id
 
-import { createAPI } from "yatta/api";
+import { createAPI } from "yatta.js/api";
 import { observer } from "../func/observe";
 import auth from "./auth";
 import health from "./health";
@@ -1026,7 +1026,7 @@ import {
   type AuthVerificationToken,
   type AuthPasskeyCredential,
   type AuthApiKey,
-} from "yatta/auth";
+} from "yatta.js/auth";
 import { db } from "./db";
 import { mailer } from "./mail";
 
@@ -1303,7 +1303,7 @@ const TEMPLATE_FUNC_REALTIME = `// yatta/func/realtime.ts
 // The WebSocket upgrade handler is wired in main.ts. SSE is not: it is an HTTP
 // response, so main.ts needs a route that returns it — \`sseResponse()\` below
 // provides one and main.ts calls it for GET /realtime/sse.
-import { createRealtime, sse } from "yatta/realtime";
+import { createRealtime, sse } from "yatta.js/realtime";
 
 export const realtime = createRealtime({
   handlers: {
@@ -1354,7 +1354,7 @@ const TEMPLATE_FUNC_ROUTER = `// yatta/func/routerHelper.ts
 // You rarely need to edit this.
 import type { Server } from "bun";
 import path from "node:path";
-import { API } from "yatta/api";
+import { API } from "yatta.js/api";
 import { realtime } from "./realtime";
 import { storage } from "./storage";
 
@@ -1443,7 +1443,7 @@ export default async function routers(
   if (!api) {
     console.error(
       \`Route "\${match.filePath}" must export an API instance:\\n\\n\` +
-        \`  import { API, createAPI } from "yatta/api";\\n\` +
+        \`  import { API, createAPI } from "yatta.js/api";\\n\` +
         \`  const api = createAPI();\\n\` +
         \`  api.get(async () => API.json({ ok: true }));\\n\` +
         \`  export default api;\\n\`,
@@ -1708,7 +1708,7 @@ function cmdInit(): number {
   if (pkgResult.created) ok("Created package.json");
   if (pkgResult.devUpdated) ok('"dev" script → bun --watch yatta/main.ts');
   if (pkgResult.startUpdated) ok('"start" script → bun yatta/main.ts');
-  if (pkgResult.dependencyAdded) ok('Added "yatta" to dependencies');
+  if (pkgResult.dependencyAdded) ok('Added "yatta.js" to dependencies');
   if (pkgResult.moduleUpdated) ok('"module" → yatta/main.ts');
 
   if (!pkgResult.devUpdated) {
@@ -1778,7 +1778,7 @@ function frameworkResolves(root: string): boolean {
   try {
     writeFileSync(
       probe,
-      'import { createRuntime } from "yatta/runtime";\n' +
+      'import { createRuntime } from "yatta.js/runtime";\n' +
         "if (typeof createRuntime !== \"function\") process.exit(1);\n" +
         "process.exit(0);\n",
     );
@@ -1952,10 +1952,10 @@ function wireUpProjectPackage(root: string): {
   }
 
   const deps = { ...(json.dependencies ?? {}) };
-  if (!deps.yatta) {
-    // Left as a normal range: `bun add yatta` / `npm i yatta` fills in the
+  if (!deps["yatta.js"]) {
+    // Left as a normal range: `bun add yatta.js` / `npm i yatta.js` fills in the
     // version, and this keeps the file valid in the meantime.
-    deps.yatta = "*";
+    deps["yatta.js"] = "*";
     json.dependencies = deps;
     result.dependencyAdded = true;
   }
@@ -1978,8 +1978,8 @@ function cmdLink(): number {
   log(`${c.dim}    bun link yatta${c.reset}`);
   log("");
   log(`${c.dim}Then import it like a normal dependency:${c.reset}`);
-  log(`${c.dim}    import { createDatabase } from "yatta/db";${c.reset}`);
-  log(`${c.dim}    import { createRuntime } from "yatta/runtime";${c.reset}`);
+  log(`${c.dim}    import { createDatabase } from "yatta.js/db";${c.reset}`);
+  log(`${c.dim}    import { createRuntime } from "yatta.js/runtime";${c.reset}`);
   log("");
   log(`${c.dim}    registered at: ${root}${c.reset}`);
   return 0;

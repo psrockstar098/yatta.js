@@ -2316,7 +2316,7 @@ export type MailProxy = MailProxyFunction & YattaMailer;
  *
  * @example
  * ```ts
- * import { Mail } from "yatta/mail";
+ * import { Mail } from "yatta.js/mail";
  *
  * // Directly send:
  * await Mail.to("user@example.com")

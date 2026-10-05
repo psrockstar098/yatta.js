@@ -69,7 +69,7 @@ The runtime avoids the "one worker per core" trap. It sizes two pools from
 | `io-pool` | `min(16, cores * 0.8)` | `500` | DB queries, network, mail |
 
 ```ts
-import { createRuntime, defineSubsystem } from "yatta/runtime";
+import { createRuntime, defineSubsystem } from "yatta.js/runtime";
 
 const runtime = createRuntime({ taskTimeoutMs: 30_000 });
 await runtime.start();
@@ -118,7 +118,7 @@ persistent stores, and supports TypeScript module augmentation for typed keys.
 Augment the register interfaces for autocompletion and compile-time payloads:
 
 ```ts
-declare module "yatta/jobs" {
+declare module "yatta.js/jobs" {
   interface JobRegister {
     "send-email": { to: string; subject: string; body: string };
   }
@@ -130,7 +130,7 @@ declare module "yatta/jobs" {
 A route is a plain function. The framework derives everything else from it.
 
 ```ts
-import { defineRoute, createApp } from "yatta/universal";
+import { defineRoute, createApp } from "yatta.js/universal";
 
 export const api = createApp({
   getUser: defineRoute(
@@ -148,7 +148,7 @@ export const api = createApp({
 round trip, no second definition.
 
 ```ts
-import { mount, createClient } from "yatta/universal";
+import { mount, createClient } from "yatta.js/universal";
 
 Bun.serve({ fetch: mount(api) });            // HTTP, from the same table
 const client = createClient(api, { baseUrl: "/api" });  // browser, same names
@@ -334,7 +334,7 @@ Stated by the features themselves rather than left to be discovered:
 Routes are files. `src/backend/user/index.ts` serves `/user`:
 
 ```ts
-import { API, createAPI } from "yatta/api";
+import { API, createAPI } from "yatta.js/api";
 
 const api = createAPI();
 
@@ -359,7 +359,7 @@ your database code into the client bundle.
 ```ts
 // api-contract.ts — paths and shapes only. Nothing server-side lives here.
 import { z } from "zod";
-import { route } from "yatta/rpc";
+import { route } from "yatta.js/rpc";
 
 export const User = z.object({ id: z.string(), email: z.string(), name: z.string() });
 
@@ -384,7 +384,7 @@ The server adds the handlers:
 
 ```ts
 // api-server.ts
-import { serve, fail } from "yatta/rpc";
+import { serve, fail } from "yatta.js/rpc";
 import { routes } from "./api-contract";
 import { db } from "./db";
 
@@ -401,7 +401,7 @@ The browser imports the same contract and gets typed calls:
 
 ```ts
 // api-client.ts
-import { clientFor } from "yatta/rpc";
+import { clientFor } from "yatta.js/rpc";
 import { routes } from "./api-contract";
 
 const api = clientFor(routes, { baseUrl: "/api" });

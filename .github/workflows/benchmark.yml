@@ -52,6 +52,15 @@ jobs:
           echo "TUNING_EXIT=$TUNING_EXIT" >> "$GITHUB_ENV"
           echo "WORKLOAD_EXIT=$WORKLOAD_EXIT" >> "$GITHUB_ENV"
 
+    - name: Fail on benchmark errors
+      if: always()
+      run: |
+        fail=0
+        if [ "${RUNTIME_EXIT:-1}" -ne 0 ]; then echo "::error::runtime benchmark failed (exit ${RUNTIME_EXIT:-unknown})"; fail=1; fi
+        if [ "${TUNING_EXIT:-1}" -ne 0 ]; then echo "::error::tuning benchmark failed (exit ${TUNING_EXIT:-unknown})"; fail=1; fi
+        if [ "${WORKLOAD_EXIT:-1}" -ne 0 ]; then echo "::error::workload benchmark failed (exit ${WORKLOAD_EXIT:-unknown})"; fail=1; fi
+        exit $fail
+
       - name: Render BENCHMARKS.md
         env:
           COMMIT_SHA: ${{ github.sha }}
