@@ -1,5 +1,5 @@
 {
-  "name": "yatta",
+  "name": "yatta.js",
   "version": "1.0.0",
   "description": "Production-grade backend framework for Bun: hardware-aware worker runtime, type-safe SQLite ORM, auth, jobs, cache, storage, mail, and realtime.",
   "keywords": [
@@ -21,12 +21,12 @@
   "module": "src/main.ts",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yatta-dev/yatta.git"
+    "url": "git+https://github.com/psrockstar098/yatta.js.git"
   },
   "bugs": {
-    "url": "https://github.com/yatta-dev/yatta/issues"
+    "url": "https://github.com/psrockstar098/yatta.js/issues"
   },
-  "homepage": "https://github.com/yatta-dev/yatta#readme",
+  "homepage": "https://github.com/psrockstar098/yatta.js#readme",
   "engines": {
     "bun": ">=1.4.0"
   },
@@ -132,7 +132,7 @@
     "tdigest": "^0.1.3",
     "zod": "^4.6.5"
   },
-  "private": true,
+  
   "peerDependenciesMeta": {
     "react": {
       "optional": true
