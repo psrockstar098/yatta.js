@@ -46,11 +46,14 @@ jobs:
           TUNING_EXIT=$?
           bun run src/test/workload_benchmark.ts > /tmp/bench/workload.txt 2>&1
           WORKLOAD_EXIT=$?
+          bun run src/test/comparison_benchmark.ts > /tmp/bench/comparison.txt 2>&1
+          COMPARISON_EXIT=$?
           set -e
-          echo "Benchmarks finished (exits: runtime=$RUNTIME_EXIT tuning=$TUNING_EXIT workload=$WORKLOAD_EXIT)"
+          echo "Benchmarks finished (exits: runtime=$RUNTIME_EXIT tuning=$TUNING_EXIT workload=$WORKLOAD_EXIT comparison=$COMPARISON_EXIT)"
           echo "RUNTIME_EXIT=$RUNTIME_EXIT" >> "$GITHUB_ENV"
           echo "TUNING_EXIT=$TUNING_EXIT" >> "$GITHUB_ENV"
           echo "WORKLOAD_EXIT=$WORKLOAD_EXIT" >> "$GITHUB_ENV"
+          echo "COMPARISON_EXIT=$COMPARISON_EXIT" >> "$GITHUB_ENV"
 
     - name: Fail on benchmark errors
       if: always()
@@ -59,6 +62,7 @@ jobs:
         if [ "${RUNTIME_EXIT:-1}" -ne 0 ]; then echo "::error::runtime benchmark failed (exit ${RUNTIME_EXIT:-unknown})"; fail=1; fi
         if [ "${TUNING_EXIT:-1}" -ne 0 ]; then echo "::error::tuning benchmark failed (exit ${TUNING_EXIT:-unknown})"; fail=1; fi
         if [ "${WORKLOAD_EXIT:-1}" -ne 0 ]; then echo "::error::workload benchmark failed (exit ${WORKLOAD_EXIT:-unknown})"; fail=1; fi
+        if [ "${COMPARISON_EXIT:-1}" -ne 0 ]; then echo "::error::comparison benchmark failed (exit ${COMPARISON_EXIT:-unknown})"; fail=1; fi
         exit $fail
 
       - name: Render BENCHMARKS.md
@@ -70,9 +74,9 @@ jobs:
       - name: Publish results to repo
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add BENCHMARKS.md
+          git config user.name "psrockstar098"
+          git config user.email "psrockstar098@users.noreply.github.com"
+          git add BENCHMARKS.md README.md
           if git diff --cached --quiet; then
             echo "No benchmark changes to publish."
           else
