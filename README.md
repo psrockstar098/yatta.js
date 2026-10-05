@@ -19,6 +19,7 @@ bun install
 bun run dev
 ```
 
+
 ---
 
 ## Why Bun
@@ -31,6 +32,7 @@ no build step for application code — TypeScript runs directly.
 
 - [Architecture](#architecture)
 - [The worker runtime](#the-worker-runtime)
+- [Benchmarks](#benchmarks)
 - [Feature engines](#feature-engines)
 - [Observability](#observability)
 - [Routing](#routing)
@@ -88,6 +90,20 @@ const receipt = await runtime.execute(graphId, "computeReceipt", payload);
 Subsystems mount as isolated module graphs. On ≤2 cores, I/O workers start with
 Bun's `smol` heap. Queued tasks are micro-batched — up to 32 per IPC message
 (64 under heavy backlog) — to cut thread-hop overhead.
+
+## Benchmarks
+
+<!-- BENCHMARKS:START -->
+| Framework | Requests/sec | vs Yatta |
+|-----------|-------------:|---------:|
+| Yatta     |      15,883 | 1.00x |
+| Express   |       7,446 | 0.47x |
+| Fastify   |      11,058 | 0.70x |
+| Hono      |      12,258 | 0.77x |
+<!-- BENCHMARKS:END -->
+
+`GET /json` head-to-head, 20,000 requests at 100 concurrent connections.
+Full results, throughput ladders and workload profiles: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Feature engines
 
