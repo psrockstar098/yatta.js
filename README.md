@@ -1,4 +1,5 @@
 <p align="center">
+  
   <img src="./logo.png" alt="Yatta" width="640" />
 </p>
 
@@ -9,6 +10,9 @@
 Zero-config routing, a type-safe SQLite ORM, auth, background jobs, caching,
 object storage, transactional mail, and realtime — plus a hardware-aware
 worker runtime that keeps CPU work off your I/O event loop.
+[![CI](https://github.com/psrockstar098/yatta.js/actions/workflows/ci.yml/badge.svg)](https://github.com/psrockstar098/yatta.js/actions/workflows/ci.yml)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-view_results-blue)](./BENCHMARKS.md)
+[![npm](https://img.shields.io/npm/v/yatta.js)](https://www.npmjs.com/package/yatta.js)
 
 ```bash
 bun install
