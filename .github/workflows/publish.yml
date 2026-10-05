@@ -1,0 +1,117 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Build and verify the tarball without publishing"
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Never ship a broken build: the same gate CI enforces runs here too.
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+      - name: Build runtime bundle
+        run: bun run build:runtime
+
+      # Release publishing must use the tag from the release event; manual
+      # runs fall back to package.json.
+      - name: Resolve version
+        id: version
+        if: github.event_name == 'release'
+        run: echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync version from release tag
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.value }}"
+          VERSION="${TAG#v}"
+          if [ "$TAG" = "$VERSION" ]; then
+            echo "::error::release tag '$TAG' must be prefixed with 'v' (e.g. v1.0.0)"
+            exit 1
+          fi
+          CURRENT="$(node -p "require('./package.json').version")"
+          if [ "$VERSION" != "$CURRENT" ]; then
+            echo "::error::tag $VERSION does not match package.json $CURRENT"
+            exit 1
+          fi
+
+      - name: Publish (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry-run
+        run: |
+          set -euo pipefail
+          npm pack --dry-run
+          npm publish --dry-run --access public
+
+      - name: Publish to npm
+        if: github.event_name == 'release' || !inputs.dry-run
+        run: npm publish --access public --provenance
+        env:
+          # Prefer OIDC trusted publishing; fall back to an explicit token.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
+
+  github-release:
+    name: Attach tarball to GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: publish
+    if: github.event_name == 'release'
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - run: bun install --frozen-lockfile
+
+      - name: Build tarball
+        run: npm pack
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.release.tag_name }}"
+          gh release upload "$TAG" yatta-*.tgz --clobber

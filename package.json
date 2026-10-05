@@ -1,0 +1,141 @@
+{
+  "name": "yatta",
+  "version": "1.0.0",
+  "description": "Production-grade backend framework for Bun: hardware-aware worker runtime, type-safe SQLite ORM, auth, jobs, cache, storage, mail, and realtime.",
+  "keywords": [
+    "bun",
+    "framework",
+    "backend",
+    "sqlite",
+    "orm",
+    "auth",
+    "websocket",
+    "sse",
+    "job-queue",
+    "serverless",
+    "edge"
+  ],
+  "license": "MIT",
+  "author": "Yatta Contributors",
+  "type": "module",
+  "module": "src/main.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yatta-dev/yatta.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yatta-dev/yatta/issues"
+  },
+  "homepage": "https://github.com/yatta-dev/yatta#readme",
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "exports": {
+    ".": "./src/main.ts",
+    "./runtime": {
+      "types": "./core_runtime/index.ts",
+      "default": "./core_runtime/index.ts"
+    },
+    "./cluster": {
+      "types": "./core_runtime/cluster.ts",
+      "default": "./core_runtime/cluster.ts"
+    },
+    "./api": "./src/types/api.ts",
+    "./universal": "./src/types/universal.ts",
+    "./binding": "./src/types/binding.ts",
+    "./path": "./src/types/path.ts",
+    "./batcher": "./src/types/batcher.ts",
+    "./frameworks": "./src/frameworks/index.ts",
+    "./frontend": "./src/types/frontend.ts",
+    "./react": "./src/react/universal-hooks.tsx",
+    "./next": "./src/react/next.ts",
+    "./client": "./src/types/client.ts",
+    "./rpc": "./src/types/rpc.ts",
+    "./db": "./src/types/db.ts",
+    "./auth": "./src/types/auth.ts",
+    "./jobs": "./src/types/job.ts",
+    "./cache": "./src/types/cache_queue.ts",
+    "./storage": "./src/types/storage.ts",
+    "./mail": "./src/types/mail.ts",
+    "./realtime": "./src/types/realtime.ts",
+    "./observe": "./src/types/observe.ts",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "yatta": "./src/cli.ts"
+  },
+  "files": [
+    "src/main.ts",
+    "src/cli.ts",
+    "src/func",
+    "src/types",
+    "src/backend",
+    "core_runtime",
+    "tsconfig.json",
+    "README.md",
+    "LICENSE",
+    "logo.png",
+    "!src/test",
+    "!**/*.test.ts",
+    "!**/fixtures"
+  ],
+  "scripts": {
+    "dev": "bun --watch src/main.ts",
+    "start": "bun src/main.ts",
+    "cluster": "bun run core_runtime/cluster.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun test",
+    "benchmark": "bun run src/test/benchmark.ts",
+    "tbenchmark": "bun run src/test/tuning_benchmark.ts",
+    "bench:workloads": "bun run src/test/workload_benchmark.ts",
+    "build:runtime": "bun build core_runtime/index.ts --outdir dist/runtime --target bun",
+    "prepublishOnly": "bun run typecheck && bun test",
+    "prepack": "bun run build:runtime"
+  },
+  "devDependencies": {
+    "@angular/core": "^22.2.1",
+    "@builder.io/qwik": "^1.20.1",
+    "@types/bun": "latest",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vue/server-renderer": "^3.5.43",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "solid-js": "^1.9.15",
+    "svelte": "^5.57.1",
+    "vue": "^3.5.43"
+  },
+  "peerDependencies": {
+    "typescript": "^7",
+    "react": ">=18"
+  },
+  "dependencies": {
+    "@onesignal/node-onesignal": "^5.18.0",
+    "@opentelemetry/api": "^1.9.1",
+    "@simplewebauthn/server": "^14.0.2",
+    "@types/smtp-server": "^3.5.13",
+    "@types/webrtc": "^0.0.47",
+    "ably": "^2.28.0",
+    "accesscontrol": "^3.1.0",
+    "cacheable": "^2.5.0",
+    "d": "^1.0.2",
+    "eventemitter3": "^5.0.4",
+    "helmet": "^8.3.0",
+    "minio": "^8.0.7",
+    "nodemailer": "^10.0.10",
+    "oauth": "^0.10.2",
+    "otplib": "12",
+    "rate-limiter-flexible": "^11.2.1",
+    "resend": "^6.28.1",
+    "smtp-server": "^3.19.13",
+    "tdigest": "^0.1.3",
+    "zod": "^4.6.5"
+  },
+  "private": true,
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  }
+}

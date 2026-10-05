@@ -1,0 +1,17 @@
+node_modules
+dist
+out
+coverage
+*.log
+
+# Runtime data — mounted as a volume in production, never baked into the image.
+Database
+storage/uploads
+
+# Local env files
+.env
+.env.*.local
+
+.DS_Store
+.idea
+.vscode
