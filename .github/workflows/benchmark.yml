@@ -76,7 +76,114 @@ jobs:
           set -euo pipefail
           git config user.name "psrockstar098"
           git config user.email "psrockstar098@users.noreply.github.com"
+          git add BENCHMARKS.md README.md benchmarks.jsonname: Benchmarks
+
+# Runs the performance suite and publishes the results to BENCHMARKS.md
+# so they are visible right on the repo front page.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly refresh — catches performance drift from dependency updates.
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    name: Run benchmarks & publish results
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run benchmark suite
+        run: |
+          set +e
+          mkdir -p /tmp/bench
+          bun run src/test/benchmark.ts > /tmp/bench/runtime.txt 2>&1
+          RUNTIME_EXIT=$?
+          bun run src/test/tuning_benchmark.ts > /tmp/bench/tuning.txt 2>&1
+          TUNING_EXIT=$?
+          bun run src/test/workload_benchmark.ts > /tmp/bench/workload.txt 2>&1
+          WORKLOAD_EXIT=$?
+          BENCH_JSON_OUT=/tmp/bench/comparison.json COMMIT_SHA=${{ github.sha }} bun run src/test/comparison_benchmark.ts > /tmp/bench/comparison.txt 2>&1
+          COMPARISON_EXIT=$?
+          set -e
+          echo "Benchmarks finished (exits: runtime=$RUNTIME_EXIT tuning=$TUNING_EXIT workload=$WORKLOAD_EXIT comparison=$COMPARISON_EXIT)"
+          echo "RUNTIME_EXIT=$RUNTIME_EXIT" >> "$GITHUB_ENV"
+          echo "TUNING_EXIT=$TUNING_EXIT" >> "$GITHUB_ENV"
+          echo "WORKLOAD_EXIT=$WORKLOAD_EXIT" >> "$GITHUB_ENV"
+          echo "COMPARISON_EXIT=$COMPARISON_EXIT" >> "$GITHUB_ENV"
+
+      - name: Fail on benchmark errors
+        if: always()
+        run: |
+          echo "=== Runtime benchmark output ==="
+          cat /tmp/bench/runtime.txt || echo "No runtime output"
+          echo "=== Tuning benchmark output ==="
+          cat /tmp/bench/tuning.txt || echo "No tuning output"
+          echo "=== Workload benchmark output ==="
+          cat /tmp/bench/workload.txt || echo "No workload output"
+          echo "=== Comparison benchmark output ==="
+          cat /tmp/bench/comparison.txt || echo "No comparison output"
+          fail=0
+          if [ "${RUNTIME_EXIT:-1}" -ne 0 ]; then echo "::error::runtime benchmark failed (exit ${RUNTIME_EXIT:-unknown})"; fail=1; fi
+          if [ "${TUNING_EXIT:-1}" -ne 0 ]; then echo "::error::tuning benchmark failed (exit ${TUNING_EXIT:-unknown})"; fail=1; fi
+          if [ "${WORKLOAD_EXIT:-1}" -ne 0 ]; then echo "::error::workload benchmark failed (exit ${WORKLOAD_EXIT:-unknown})"; fail=1; fi
+          if [ "${COMPARISON_EXIT:-1}" -ne 0 ]; then echo "::error::comparison benchmark failed (exit ${COMPARISON_EXIT:-unknown})"; fail=1; fi
+          exit $fail
+
+      - name: Render BENCHMARKS.md
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_DATE: ${{ github.event.head_commit.timestamp }}
+        run: bash .github/scripts/render-benchmarks.sh
+
+      - name: Publish results to repo
+        run: |
+          set -euo pipefail
+          git config user.name "psrockstar098"
+          git config user.email "psrockstar098@users.noreply.github.com"
           git add BENCHMARKS.md README.md benchmarks.json
+          if git diff --cached --quiet; then
+            echo "No benchmark changes to publish."
+          else
+            git commit -m "docs: refresh benchmark results [skip ci]"
+            git push
+          fi
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Benchmark run — ${{ github.sha }}"
+            echo ""
+            echo "Full results published to [BENCHMARKS.md](https://github.com/${{ github.repository }}/blob/main/BENCHMARKS.md)"
+            echo ""
+            echo "### Headlines"
+            echo '```'
+            grep -h "• Raw Worker IPC Round-Trip\|• End-to-End Runtime Task Cost\|• Worker Fleet Event Loop Lag\|• RSS Heap Memory\|• 25,000 Tasks Completed in\|• Peak RSS Memory" /tmp/bench/*.txt 2>/dev/null | sort -u || echo "(benchmark output unavailable)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
           if git diff --cached --quiet; then
             echo "No benchmark changes to publish."
           else
