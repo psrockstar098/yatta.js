@@ -519,6 +519,7 @@ export class MemoryAuthStore implements AuthStore {
   async createSession(session: AuthSession) {
     this.sessions.set(session.id, session);
     return session;
+  }
   async findSessionById(id: string) {
     const s = this.sessions.get(id);
     if (!s) return null;
