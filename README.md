@@ -94,12 +94,14 @@ Bun's `smol` heap. Queued tasks are micro-batched — up to 32 per IPC message
 ## Benchmarks
 
 <!-- BENCHMARKS:START -->
-| Framework | Requests/sec | vs Yatta |
-|-----------|-------------:|---------:|
-| Yatta     |      15,883 | 1.00x |
-| Express   |       7,446 | 0.47x |
-| Fastify   |      11,058 | 0.70x |
-| Hono      |      12,258 | 0.77x |
+| Framework | Requests/sec | vs Yatta | Avg latency | p50 | p95 | p99 |
+|-----------|-------------:|---------:|------------:|----:|----:|----:|
+| Yatta     |      16,180 | 1.00x |      6.17ms | 4.68ms | 17.82ms | 26.74ms |
+| Express   |       8,457 | 0.52x |     11.81ms | 9.37ms | 28.83ms | 43.54ms |
+| Fastify   |      11,291 | 0.70x |      8.85ms | 6.95ms | 22.33ms | 36.09ms |
+| Hono      |      16,042 | 0.99x |      6.23ms | 4.45ms | 19.70ms | 26.77ms | 
+| Elysia    |      17,595 | 1.09x |      5.65ms | 4.07ms | 18.52ms | 27.48ms | 
+| Koa       |       7,093 | 0.44x |     14.08ms | 10.40ms | 33.59ms | 76.93ms |
 <!-- BENCHMARKS:END -->
 
 `GET /json` head-to-head, 20,000 requests at 100 concurrent connections.
