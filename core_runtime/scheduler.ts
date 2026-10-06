@@ -207,7 +207,10 @@ export class HardwareAwareScheduler {
   private graphTimeouts = new Map<string, number>();
   private defaultTaskTimeoutMs: number;
   /** Bumped by `terminateAll`; stale workers/respawn loops see a mismatch and stand down. */
-  private epoch = 0;
+    private epoch = 0;
+
+  /** Round-robin cursor per graph for fast dispatch. */
+  private roundRobinCursor = new Map<string, number>();
 
   constructor(options?: SchedulerOptions) {
     this.topology = this.computeTopology(options);
@@ -738,7 +741,89 @@ export class HardwareAwareScheduler {
   }
 
   /** Sends a single task. A non-cloneable payload fails only that task. */
-  private startOne(worker: ManagedWorker, t: QueuedTask): void {
+    /**
+   * Fast dispatch path: skips per-task timeout timers and uses round-robin
+   * worker selection instead of least-loaded scan. For high-throughput
+   * scenarios where tasks are short-lived and timeouts are handled at a
+   * higher level.
+   */
+  public dispatchFast<T = unknown>(
+    graphId: string,
+    handler: string,
+    payload: unknown,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      if (this.isWorkPaused) {
+        return reject(new WorkPausedError(graphId));
+      }
+
+      const candidates = this.graphWorkers.get(graphId);
+      if (!candidates || candidates.length === 0) {
+        return reject(new Error(`No worker found hosting graphId: ${graphId}`));
+      }
+
+      // Round-robin: O(1) instead of O(n) least-loaded scan.
+      let cursor = this.roundRobinCursor.get(graphId) ?? 0;
+      let worker: ManagedWorker | undefined;
+      for (let i = 0; i < candidates.length; i++) {
+        const w = candidates[(cursor + i) % candidates.length]!;
+        if (!w.crashed) {
+          worker = w;
+          this.roundRobinCursor.set(graphId, (cursor + i + 1) % candidates.length);
+          break;
+        }
+      }
+      if (!worker) {
+        return reject(
+          new Error(`No healthy worker currently hosting graphId: ${graphId}`),
+        );
+      }
+
+      const id = ++this.reqCounter;
+
+      const task: QueuedTask = {
+        id,
+        graphId,
+        handler,
+        payload,
+        resolve: resolve as (value: unknown) => void,
+        reject,
+        timer: undefined,
+      };
+
+      if (worker.activeTasks < worker.maxConcurrency) {
+        this.startOneFast(worker, task);
+      } else {
+        worker.queue.push(task);
+      }
+    });
+  }
+
+  /** Fast version of startOne: skips timer bookkeeping. */
+  private startOneFast(worker: ManagedWorker, t: QueuedTask): void {
+    worker.activeTasks++;
+    worker.pendingRequests.set(t.id, {
+      resolve: t.resolve,
+      reject: t.reject,
+      timer: undefined,
+      countsAsActive: true,
+    });
+    try {
+      worker.worker.postMessage({
+        id: t.id,
+        action: "EXECUTE_GRAPH",
+        graphId: t.graphId,
+        handler: t.handler,
+        payload: t.payload,
+      } satisfies IPCRequest);
+    } catch (err) {
+      worker.pendingRequests.delete(t.id);
+      worker.activeTasks--;
+      t.reject(err);
+    }
+  }
+
+  /** Sends a single task. A non-cloneable payload fails only that task. */
     worker.activeTasks++;
     worker.pendingRequests.set(t.id, {
       resolve: t.resolve,
