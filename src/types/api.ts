@@ -1626,11 +1626,18 @@ export class Context<TParams extends RouteParams = RouteParams> {
     schema?: Validator<T>,
     options?: { maxBytes?: number },
   ): Promise<T> {
-    this.checkBodySize(options?.maxBytes);
+    const maxBytes = options?.maxBytes ?? 10 * 1024 * 1024;
+    this.checkBodySize(maxBytes);
     if (!this.rawBodyParsed) {
       try {
         this.rawBodyData = await this.req.json();
         this.rawBodyParsed = true;
+        // Verify actual size after parsing (Content-Length can be spoofed or omitted
+        // with chunked encoding). This prevents OOM from oversized bodies.
+        const bodySize = JSON.stringify(this.rawBodyData).length;
+        if (bodySize > maxBytes) { throw new HttpError(413); }
+          throw new HttpError(413, `Payload Too Large: exceeded ${maxBytes} bytes`);
+        }
       } catch (err) {
         throw new ValidationError(err);
       }
