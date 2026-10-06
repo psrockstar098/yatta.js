@@ -120,3 +120,35 @@ PYEOF
     echo "Skipped README refresh (no comparison data)"
   fi
 fi
+
+# Build benchmarks.json for the website (yatta.js.org/benchmarks).
+python3 - <<'PYEOF'
+import json, os
+
+out = "benchmarks.json"
+date = os.environ.get("RUN_DATE") or __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+sha = os.environ.get("COMMIT_SHA", "")
+short = sha[:7] if sha else ""
+
+data = {
+    "generated_at": date,
+    "commit": sha,
+    "commit_short": short,
+    "commit_url": f"https://github.com/psrockstar098/yatta.js/commit/{sha}" if sha else None,
+    "runner": "ubuntu-latest",
+    "runtime": "Bun 1.4.2",
+    "comparison": None,
+}
+
+cmp_path = "/tmp/bench/comparison.json"
+if os.path.exists(cmp_path):
+    try:
+        with open(cmp_path) as f:
+            data["comparison"] = json.load(f)
+    except Exception as e:
+        print(f"Warning: could not parse comparison.json: {e}")
+
+with open(out, "w") as f:
+    json.dump(data, f, indent=2)
+print(f"Wrote {out}")
+PYEOF
