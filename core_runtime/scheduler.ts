@@ -740,7 +740,7 @@ export class HardwareAwareScheduler {
     });
   }
 
-  /** Sends a single task. A non-cloneable payload fails only that task. */
+      /** Sends a single task. A non-cloneable payload fails only that task. */
     /**
    * Fast dispatch path: skips per-task timeout timers and uses round-robin
    * worker selection instead of least-loaded scan. For high-throughput
@@ -823,7 +823,7 @@ export class HardwareAwareScheduler {
     
   }
   
-  /** Sends a single task. A non-cloneable payload fails only that task. */
+      /** Sends a single task. A non-cloneable payload fails only that task. */
 private startOne(worker: ManagedWorker, t: QueuedTask): void {
     worker.activeTasks++;
     worker.pendingRequests.set(t.id, {
@@ -849,7 +849,7 @@ private startOne(worker: ManagedWorker, t: QueuedTask): void {
         false,
         undefined,
         err instanceof Error ? err.message : String(err),
-      );
+        );
     }
   }
 
