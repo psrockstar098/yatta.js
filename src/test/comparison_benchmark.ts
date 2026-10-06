@@ -17,7 +17,6 @@ const PAYLOAD = { id: "1", name: "Ada", active: true };
 const WARMUP = 2_000;
 const TOTAL = 20_000;
 const CONCURRENCY = 100;
-
 type Server = { name: string; url: string; close: () => Promise<void> | void };
 type Result = { name: string; rps: number; avg: number; p50: number; p95: number; p99: number };
 
@@ -135,3 +134,26 @@ for (const r of results) {
 }
 console.log("\n   COMPARISON BENCHMARK COMPLETE");
 console.log("=======================================================\n");
+
+// Write machine-readable JSON for the website CI/CD pipeline.
+const jsonOut = process.env.BENCH_JSON_OUT ?? "/tmp/bench/comparison.json";
+const payload = {
+  generated_at: new Date().toISOString(),
+  commit: process.env.COMMIT_SHA ?? null,
+  route: "GET /json",
+  load: { requests: TOTAL, concurrency: CONCURRENCY, keep_alive: true },
+  frameworks: results.map((r) => ({
+    name: r.name,
+    requests_per_sec: Math.round(r.rps),
+    vs_yatta: +(r.rps / yatta.rps).toFixed(3),
+    latency_ms: {
+      avg: +r.avg.toFixed(2),
+      p50: +r.p50.toFixed(2),
+      p95: +r.p95.toFixed(2),
+      p99: +r.p99.toFixed(2),
+    },
+  })),
+};
+await Bun.write(jsonOut, JSON.stringify(payload, null, 2));
+console.log(`Wrote ${jsonOut}`);
+
