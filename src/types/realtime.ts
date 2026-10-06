@@ -1609,7 +1609,16 @@ export interface RealtimeConfig<TData = Record<string, unknown>> {
       client: SocketClient<TData>,
       event: string,
       data: unknown,
-    ) => boolean | Promise<boolean>;
+    ) => boolean | Promise<boolean>;  /** Custom structured logger. Defaults to `console`-based output. */
+  logger?: Logger;
+  /**
+   * Allowed WebSocket origins for CSRF protection.
+   * If set, the `Origin` header is validated during the upgrade handshake.
+   * Requests from disallowed origins are rejected (prevents Cross-Site WebSocket Hijacking).
+   */
+  allowedOrigins?: string[];
+  /**
+   * Enable WebSocket `permessage-deflate` compression.
   };
   /**
    * Global inbound message payload validator.
@@ -1817,7 +1826,33 @@ export class RealtimeServer<TData = Record<string, unknown>> {
     }
 
     bucket.count++;
-    return bucket.count > messages;
+    return bucket.count > messages;  ): Promise<boolean> {
+    this.bindServer(server);
+
+    // CSRF protection: Validate Origin header if allowedOrigins is configured.
+    if (this.config.allowedOrigins?.length) {
+      const origin = req.headers.get("origin");
+      if (origin) {
+        try {
+          const originUrl = new URL(origin);
+          const isAllowed = this.config.allowedOrigins.some((allowed) => {
+            try {
+              return new URL(allowed).origin === originUrl.origin;
+            } catch {
+              return allowed === originUrl.origin;
+            }
+          });
+          if (!isAllowed) {
+            return false;
+          }
+        } catch {
+          return false;
+        }
+      }
+    }
+
+    let authData: TData = {} as TData;
+    if (this.config.authenticate) {
   }
 
   /**
