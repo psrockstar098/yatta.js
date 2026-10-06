@@ -1,5 +1,6 @@
 import { createRuntime, defineSubsystem } from "yatta.js/runtime";
 import { loadEnv } from "./func/env";
+import crypto from "node:crypto";
 
 // Validate configuration before any subsystem, database, or socket is created.
 export const env = loadEnv();
@@ -38,13 +39,10 @@ let registerWorkers: WorkerRegistration = () => {};
  * the length of a token is not the secret.
  */
 function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-
-  let difference = 0;
-  for (let i = 0; i < a.length; i++) {
-    difference |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return difference === 0;
+  // Hash both values first to avoid leaking length via early return.
+  const hashA = crypto.createHash("sha256").update(a).digest();
+  const hashB = crypto.createHash("sha256").update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
 }
 
 const isCluster = typeof process.env.CLUSTER_WORKER_ID !== "undefined";
@@ -234,9 +232,17 @@ async function bootstrap() {
         }
 
         if (token) {
-          const supplied =
-            req.headers.get("x-yatta-observe-token") ??
-            url.searchParams.get("token");
+          const headerToken = req.headers.get("x-yatta-observe-token");
+          const queryToken = url.searchParams.get("token");
+          const supplied = headerToken ?? queryToken;
+
+          if (queryToken && !headerToken) {
+            console.warn(
+              "[observe] WARNING: Observe token supplied via URL query parameter. " +
+                "This exposes the token in server logs, proxies, and browser history. " +
+                "Use the x-yatta-observe-token header instead.",
+            );
+          }
 
           // Compared in constant time. A length-independent `!==` leaks the token
           // one byte at a time to anyone willing to measure it.
