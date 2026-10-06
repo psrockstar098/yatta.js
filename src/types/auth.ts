@@ -475,6 +475,16 @@ export class MemoryAuthStore implements AuthStore {
   private passkeys = new Map<string, AuthPasskeyCredential>();
   private apiKeys = new Map<string, AuthApiKey>();
 
+  constructor() {
+    // Clean up expired sessions every 60s to prevent memory leaks.
+    setInterval(() => {
+      const now = new Date();
+      for (const [key, s] of this.sessions.entries()) {
+        if (s.expiresAt < now) this.sessions.delete(key);
+      }
+    }, 60000).unref?.();
+  }
+
   async findUserById(id: string) {
     return this.users.get(id) ?? null;
   }
@@ -509,20 +519,33 @@ export class MemoryAuthStore implements AuthStore {
   async createSession(session: AuthSession) {
     this.sessions.set(session.id, session);
     return session;
-  }
   async findSessionById(id: string) {
     const s = this.sessions.get(id);
-    if (!s || s.expiresAt < new Date()) return null;
+    if (!s) return null;
+    if (s.expiresAt < new Date()) {
+      this.sessions.delete(id);
+      return null;
+    }
     return s;
   }
   async findSessionByTokenHash(tokenHash: string) {
-    const s = [...this.sessions.values()].find(
-      (sess) => sess.sessionTokenHash === tokenHash,
+    const entry = [...this.sessions.entries()].find(
+      ([, sess]) => sess.sessionTokenHash === tokenHash,
     );
-    if (!s || s.expiresAt < new Date()) return null;
+    if (!entry) return null;
+    const [id, s] = entry;
+    if (s.expiresAt < new Date()) {
+      this.sessions.delete(id);
+      return null;
+    }
     return s;
   }
-  async listSessionsByUserId(userId: string) {
+  function timingSafeEqual(a: string, b: string): boolean {
+  // Hash both values first to avoid leaking length via early return.
+  const hashA = crypto.createHash("sha256").update(a).digest();
+  const hashB = crypto.createHash("sha256").update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}async listSessionsByUserId(userId: string) {
     const now = new Date();
     return [...this.sessions.values()].filter(
       (s) => s.userId === userId && s.expiresAt > now,
@@ -822,7 +845,7 @@ export class AuthCrypto {
   decrypt(cipherPayload: string): string {
     const parts = cipherPayload.split(":");
     if (parts.length !== 3)
-      throw new AuthError("Invalid encrypted payload envelope", 400);
+      throw new AuthError("Invalid encrypted payload", 400);
     const [ivHex, tagHex, contentHex] = parts as [string, string, string];
     try {
       const decipher = crypto.createDecipheriv(
@@ -837,11 +860,8 @@ export class AuthCrypto {
       ]);
       return decrypted.toString("utf8");
     } catch {
-      throw new AuthError(
-        "Decryption failed: corrupted or tampered payload",
-        400,
-      );
-    }
+            throw new AuthError("Invalid encrypted payload", 400);
+
   }
 
   async hashPassword(password: string): Promise<string> {
