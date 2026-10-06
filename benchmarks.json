@@ -1,0 +1,86 @@
+{
+  "generated_at": "2026-10-06T14:55:00Z",
+  "commit": "f3bd84cc8612991910ea7608a9ae036bd09696b9",
+  "commit_short": "f3bd84c",
+  "commit_url": "https://github.com/psrockstar098/yatta.js/commit/f3bd84cc8612991910ea7608a9ae036bd09696b9",
+  "runner": "ubuntu-latest",
+  "runtime": "Bun 1.4.2",
+  "comparison": {
+    "generated_at": "2026-10-06T14:55:20.805Z",
+    "commit": "f3bd84cc8612991910ea7608a9ae036bd09696b9",
+    "route": "GET /json",
+    "load": {
+      "requests": 20000,
+      "concurrency": 100,
+      "keep_alive": true
+    },
+    "frameworks": [
+      {
+        "name": "Yatta",
+        "requests_per_sec": 62827,
+        "vs_yatta": 1,
+        "latency_ms": {
+          "avg": 1.59,
+          "p50": 1.54,
+          "p95": 2.82,
+          "p99": 4.09
+        }
+      },
+      {
+        "name": "Express",
+        "requests_per_sec": 29732,
+        "vs_yatta": 0.473,
+        "latency_ms": {
+          "avg": 3.36,
+          "p50": 3.22,
+          "p95": 6.1,
+          "p99": 7.94
+        }
+      },
+      {
+        "name": "Fastify",
+        "requests_per_sec": 36435,
+        "vs_yatta": 0.58,
+        "latency_ms": {
+          "avg": 2.74,
+          "p50": 2.59,
+          "p95": 4.88,
+          "p99": 5.76
+        }
+      },
+      {
+        "name": "Hono",
+        "requests_per_sec": 70348,
+        "vs_yatta": 1.12,
+        "latency_ms": {
+          "avg": 1.42,
+          "p50": 1.41,
+          "p95": 2.32,
+          "p99": 3.2
+        }
+      },
+      {
+        "name": "Elysia",
+        "requests_per_sec": 72684,
+        "vs_yatta": 1.157,
+        "latency_ms": {
+          "avg": 1.37,
+          "p50": 1.29,
+          "p95": 2.34,
+          "p99": 3.05
+        }
+      },
+      {
+        "name": "Koa",
+        "requests_per_sec": 27789,
+        "vs_yatta": 0.442,
+        "latency_ms": {
+          "avg": 3.59,
+          "p50": 3.31,
+          "p95": 6.32,
+          "p99": 7.72
+        }
+      }
+    ]
+  }
+}
