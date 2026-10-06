@@ -80,6 +80,21 @@ export class FrameworkRuntime {
     return this.scheduler.dispatchTask<TResult>(graphId, handler, payload);
   }
 
+    /**
+   * Fast execute path: skips per-task timeout timers, uses round-robin.
+   * For high-throughput, short-lived tasks.
+   */
+  public executeFast<TResult = unknown, TPayload = unknown>(
+    graphId: string,
+    handler: string,
+    payload: TPayload,
+  ): Promise<TResult> {
+    if (!this.isInitialized) {
+      return Promise.reject(new Error("Runtime is not running."));
+    }
+    return this.scheduler.dispatchFast<TResult>(graphId, handler, payload);
+  }
+
   /** Configured topology (what was asked for). See {@link getHealth} for reality. */
   public getTopology(): HardwareTopology {
     return this.scheduler.getTopology();
