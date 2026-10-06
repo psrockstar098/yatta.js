@@ -91,6 +91,14 @@
     "bench:workloads": "bun run src/test/workload_benchmark.ts",
     "build:runtime": "bun build core_runtime/index.ts --outdir dist/runtime --target bun",
     "prepublishOnly": "bun run typecheck && bun test",
+
+
+
+
+
+
+
+
     "prepack": "bun run build:runtime"
   },
   "devDependencies": {
@@ -104,13 +112,22 @@
     "react-dom": "^19.3.0",
     "solid-js": "^1.9.15",
     "svelte": "^5.57.1",
-    "vue": "^3.5.43"
+    "vue": "^3.5.43", "express": "^4.21.2", "fastify": "^5.2.0", "hono": "^4.6.0", "elysia": "^1.1.0", "koa": "^2.15.0", "@koa/router": "^12.0.0", "@types/express": "^5.0.0", "@types/koa": "^2.15.0"
   },
   "peerDependencies": {
     "typescript": "^7",
     "react": ">=18"
   },
   "dependencies": {
+
+
+
+
+
+
+
+
+
     "@onesignal/node-onesignal": "^5.18.0",
     "@opentelemetry/api": "^1.9.1",
     "@simplewebauthn/server": "^14.0.2",
