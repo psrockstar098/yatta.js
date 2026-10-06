@@ -1636,7 +1636,6 @@ export class Context<TParams extends RouteParams = RouteParams> {
         // with chunked encoding). This prevents OOM from oversized bodies.
         const bodySize = JSON.stringify(this.rawBodyData).length;
         if (bodySize > maxBytes) { throw new HttpError(413, `Payload Too Large: exceeded ${maxBytes} bytes`); }  
-        }
       } catch (err) {
         throw new ValidationError(err);
       }
