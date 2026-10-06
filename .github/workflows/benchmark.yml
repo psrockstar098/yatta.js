@@ -46,7 +46,7 @@ jobs:
           TUNING_EXIT=$?
           bun run src/test/workload_benchmark.ts > /tmp/bench/workload.txt 2>&1
           WORKLOAD_EXIT=$?
-          bun run src/test/comparison_benchmark.ts > /tmp/bench/comparison.txt 2>&1
+          BENCH_JSON_OUT=/tmp/bench/comparison.json COMMIT_SHA=${{ github.sha }} bun run src/test/comparison_benchmark.ts > /tmp/bench/comparison.txt 2>&1
           COMPARISON_EXIT=$?
           set -e
           echo "Benchmarks finished (exits: runtime=$RUNTIME_EXIT tuning=$TUNING_EXIT workload=$WORKLOAD_EXIT comparison=$COMPARISON_EXIT)"
@@ -76,7 +76,7 @@ jobs:
           set -euo pipefail
           git config user.name "psrockstar098"
           git config user.email "psrockstar098@users.noreply.github.com"
-          git add BENCHMARKS.md README.md
+          git add BENCHMARKS.md README.md benchmarks.json
           if git diff --cached --quiet; then
             echo "No benchmark changes to publish."
           else
