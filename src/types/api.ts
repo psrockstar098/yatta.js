@@ -1460,10 +1460,21 @@ export type Handler<TParams extends RouteParams = RouteParams> = (
   ctx: Context<TParams>,
 ) => HandlerResult | Promise<HandlerResult>;
 
+/**
+ * A middleware wraps the rest of the chain.
+ *
+ * Returning a value answers the request and skips everything below — that is how a
+ * cache short-circuits. Returning nothing and not calling `next` continues the chain,
+ * which is what a guard does: throw to deny, fall through to allow.
+ *
+ * The return type says `void` is allowed because that guard is the common case, and a
+ * type that rejects it pushes people into `return next()` for no reason. Both shapes
+ * are honoured at runtime; see `runMiddleware`.
+ */
 export type Middleware<TParams extends RouteParams = RouteParams> = (
   ctx: Context<TParams>,
   next: () => Response | Promise<Response>,
-) => Response | Promise<Response>;
+) => Response | void | Promise<Response | void>;
 
 export type ErrorHandler<TParams extends RouteParams = RouteParams> = (
   error: unknown,
@@ -2558,6 +2569,19 @@ export class API<TParams extends RouteParams = RouteParams> {
     ctx: Context<TParams>,
     handler: Handler<TParams>,
   ): Promise<Response> {
+    /*
+     * With nothing registered, skip the chain entirely.
+     *
+     * The dispatch below builds a closure, walks a position counter and adds an await
+     * per step. With an empty stack that is all cost and no behaviour: position 0 is
+     * already the end, so the only thing the loop does is call the handler. A router
+     * with no middleware is the common case, and this is the hottest path in the
+     * framework, so it is worth the three lines to skip.
+     */
+    if (this.middlewareStack.length === 0) {
+      return this.coerceResponse(await handler(ctx), "handler");
+    }
+
     let index = -1;
 
     const dispatch = async (position: number): Promise<Response> => {
@@ -2573,7 +2597,46 @@ export class API<TParams extends RouteParams = RouteParams> {
       }
 
       const middleware = this.middlewareStack[position]!;
-      return middleware(ctx, () => dispatch(position + 1));
+
+      let advanced = false;
+      let downstream: Response | undefined;
+
+      const next = async (): Promise<Response> => {
+        advanced = true;
+        downstream = await dispatch(position + 1);
+        return downstream;
+      };
+
+      const returned = await middleware(ctx, next);
+
+      /*
+       * A middleware that neither answered nor advanced does not get to swallow the
+       * request.
+       *
+       * The guard shape is the common one:
+       *
+       *   api.use((ctx) => { if (!ctx.req.headers.get("cookie")) throw new HttpError(401); })
+       *
+       * It throws to deny and returns nothing to allow — and returning nothing used to
+       * end the chain, so `handle` resolved to `undefined`, Bun fell back to its
+       * default welcome page, and an authenticated request got HTML with a 200. No
+       * error anywhere, and the middleware that was supposed to allow the request was
+       * the thing that stopped it.
+       *
+       * So: a middleware that returned nothing and never called `next` continues the
+       * chain. Returning a value still short-circuits, which is how a cache answers.
+       */
+      if (returned === undefined) {
+        /*
+         * Advanced but returned nothing: `await next()` without `return next()`. Hand
+         * back what the rest of the chain produced, which is what the author meant.
+         */
+        if (advanced && downstream) return downstream;
+
+        return dispatch(position + 1);
+      }
+
+      return returned;
     };
 
     return dispatch(0);

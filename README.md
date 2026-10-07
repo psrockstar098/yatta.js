@@ -136,59 +136,63 @@ declare module "yatta.js/jobs" {
 }
 ```
 
-## Write a route once
+## Routing
 
-A route is a schema plus a function. Define it once, then call it directly on
-the server or reach it over HTTP — same validators, same types.
+One router, and it is the only one. A route is a path and a function; `ctx` carries
+everything the request has.
 
 ```ts
-import { defineRoute, createApp, mount, createClient } from "yatta.js/api";
+import { createAPI, API, HttpError } from "yatta.js/api";
 
-export const api = createApp({
-  getUser: defineRoute(
-    { method: "get", path: "/users/:id", params: z.object({ id: z.string() }), response: User },
-    async ({ params, services }) => {
-      const user = await services.db.users.findById(params.id);
-      if (!user) throw new HttpError(404, "No such user");
-      return user;
-    },
-  ),
-}, { services: { db, auth, realtime } });
+const api = createAPI("/api");
+
+api.get("/users/:id", async (ctx) => {
+  const user = await db.users.findById(ctx.params.id);
+  if (!user) throw new HttpError(404, "No such user");
+  return API.json(user);
+});
+
+api.post("/users", async (ctx) => {
+  // Validated on the way in. A transformer applies, so the handler sees the
+  // coerced value rather than the raw body.
+  const body = await ctx.json(z.object({ email: z.string().email(), age: z.coerce.number() }));
+  return API.json(await db.users.create(body), { status: 201 });
+});
+
+export default api;
 ```
 
-**On the server, call it directly.** `await api.getUser({ params: { id } })` — no HTTP,
-no round trip, no second definition.
+Mount it and serve:
 
 ```ts
-Bun.serve({ fetch: mount(api) });            // HTTP, from the same table
-const client = createClient(api, { baseUrl: "/api" });  // typed client, same names
+import api from "./backend/routes";
+
+Bun.serve({ port: 4000, fetch: (req) => api.handle(req, {}) });
 ```
 
-**Checks run on both paths.** Middleware belongs to the app, not to the transport,
-so an authorisation check cannot be bypassed by calling a route directly.
+**Middleware runs before the handler and can deny it.** Throw to refuse; return nothing
+to let the request through. Returning a value answers the request instead, which is how
+a cache short-circuits.
 
 ```ts
-export const api = createApp(routes, {
-  services: { db, auth },
-  middleware: [async ({ ctx, services }) => {
-    if (!(await services.auth.session(ctx))) throw new HttpError(401, "Not signed in");
-  }],
+api.use((ctx, next) => {
+  if (!ctx.req.headers.get("cookie")) throw new HttpError(401, "Not signed in");
+  return next();
 });
 ```
 
-**Fifty concurrent calls are one query** with DataLoader-style batching:
+**Static routes beat dynamic ones.** `/users/new` resolves to the static route, not to
+the user whose id is the literal string `new` — specificity decides, not declaration
+order.
 
-```ts
-import { withLoaders, loaderFor } from "yatta.js/api";
+Handy context members: `ctx.params`, `ctx.query()`, `ctx.json(schema?)`,
+`ctx.formData()`, `ctx.cookies()`, `ctx.req.signal`, and `ctx.state` for handoff.
 
-await withLoaders(async () => {
-  const loader = loaderFor("users", async (ids) => {
-    const rows = await db.users.findMany({ where: { id: { in: [...ids] } } });
-    return new Map(rows.map((row) => [row.id, row]));
-  });
-  await Promise.all(ids.map((id) => loader.load(id)));
-});
-```
+> This replaces an earlier second routing layer — `defineRoute` / `createApp` /
+> `mount` / `createClient`, with its own path parser, batching and schema modules. Two
+> routers over one codebase is two things to learn and two places for a signature to
+> drift, and the second had no users outside its own tests. It was removed rather than
+> kept as an alternative.
 
 ## Observability
 

@@ -76,9 +76,28 @@ describe("Nothing is declared that nothing imports", () => {
 
         if (!/\.(ts|tsx)$/.test(entry.name)) continue;
 
-        const source = readFileSync(path, "utf8");
+        /*
+         * Comments are stripped before matching.
+         *
+         * Without that, a package named in a doc comment counts as used — which is how
+         * `resend` survived as a dependency for as long as it did, named in a
+         * transport-name union with no SDK behind it.
+         */
+        const raw = readFileSync(path, "utf8");
+        const source = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 
-        for (const match of source.matchAll(/(?:from|import|require\()\s*"([^".][^"]*)"/g)) {
+        /*
+         * Matches a static import, a dynamic one, and a require.
+         *
+         * The dynamic form matters: `await import("express")` has a `(` between the
+         * keyword and the quote, so a pattern that only allows `\s*` after `import`
+         * silently misses it. That is how `comparison_benchmark.ts` stopped counting its
+         * five comparison frameworks as used and the test began reporting them as
+         * dead weight.
+         */
+        const pattern = /(?:from|import|require)\s*\(?\s*["']([^"'][^"']*)["']/g;
+
+        for (const match of source.matchAll(pattern)) {
           const specifier = match[1];
           if (!specifier) continue;
 

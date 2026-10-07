@@ -1,37 +1,19 @@
-// Yatta API — single entry point for the backend API surface.
+// Yatta API — the single entry point for the HTTP surface.
 //
-// This consolidates the previously separate exports:
-//   yatta/api, yatta/universal, yatta/client, yatta/rpc, yatta/path, yatta/batcher
+// One import gives you the router, the request context, and the error types:
 //
-// One import gives you the router, the universal route definitions, the typed
-// client, and the utilities. No more guessing which package has what.
+//   import { createAPI, API, Context, HttpError } from "yatta.js/api";
+//
+// This used to also re-export a second, parallel routing layer — `defineRoute`,
+// `createApp`, `invoke`, `mount`, `createClient`, plus the RPC, path-parser,
+// batching and standard-schema modules that served it. Two routers over one codebase
+// is two things to learn and two places for a signature to drift, and the second one
+// had no users outside its own tests.
+//
+// The router is self-contained: `src/types/api.ts` imports nothing but `node:path`.
+// If you are looking for path matching, validation or response coercion, it is all in
+// there.
 
-// ── Universal API (primary) ──────────────────────────────────────────────
-// The high-level API: define routes once, call directly or over HTTP.
-export {
-  createApp,
-  defineRoute,
-  invoke,
-  mount,
-  createClient,
-  withMiddleware,
-  ENGINE_NAMES,
-  type App,
-  type Route,
-  type RouteTable,
-  type RouteSpec,
-  type ServiceMap,
-  type Services,
-  type Middleware,
-  type Input,
-  type CallArgs,
-  type CallResult,
-  type DirectMethods,
-  type WireRequest,
-} from "./universal";
-
-// ── Core router (low-level) ────────────────────────────────────────────────
-// The underlying HTTP router. Most users won't need this directly.
 export {
   API,
   Context,
@@ -47,41 +29,3 @@ export {
   type CookieOptions,
   type CorsOptions,
 } from "./api";
-
-// ── Route-table RPC ─────────────────────────────────────────────────────────
-// The same table served over HTTP, plus the client that reads it. Kept here rather
-// than behind its own subpath: the package now has one entry for the backend API
-// surface, and this is part of it.
-//
-// It was briefly unreachable — the module existed and was tested, but no `exports`
-// entry and no barrel re-export pointed at it, so nothing outside the test file could
-// import it. `manifest.test.ts` now fails if that happens to any module again.
-export {
-  serverRoute,
-  serve,
-  clientFor,
-  fail,
-  route,
-  type ServerRoute,
-  type ServerInput,
-  type PathParamsOf,
-  type ServeOptions,
-  type ClientFor,
-} from "./rpc";
-
-// ── Path utilities ─────────────────────────────────────────────────────────
-export {
-  parseTemplate,
-  buildPathFrom,
-  matchesPath,
-  extractParams,
-  bySpecificity,
-} from "./path";
-
-// ── Batching ───────────────────────────────────────────────────────────────
-export {
-  DataLoader,
-  batchBy,
-  withLoaders,
-  loaderFor,
-} from "./batcher";
