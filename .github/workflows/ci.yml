@@ -49,6 +49,7 @@ jobs:
             -e STORAGE_SECRET=ci-smoke-test-secret-value \
             -e YATTA_CLUSTER_MODE=false \
             -e APP_URL=https://ci-smoke-test.example.com \
+            -e AUTH_SECRET=ci-smoke-test-auth-secret-min-32-chars-long \
             yatta:ci
 
           # Wait for liveness to come up.
