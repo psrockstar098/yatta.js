@@ -2239,7 +2239,7 @@ export class YattaDB {
           this.stmtCache.delete(oldestKey);
         }
       }
-      stmt = this._sqlite.prepare(sql);
+      stmt = this._sqlite.query(sql);
       this.stmtCache.set(sql, stmt);
     }
 
@@ -2480,7 +2480,7 @@ export class YattaDB {
 
           this._sqlite.run(`CREATE TABLE IF NOT EXISTS "${tableName.replace(/"/g, '""')}" (${columnSqls.join(", ")});`);
 
-          const existingColumns = (this._sqlite.prepare(`PRAGMA table_info("${tableName.replace(/"/g, '""')}")`).all() as any[]).map(
+          const existingColumns = (this._sqlite.query(`PRAGMA table_info("${tableName.replace(/"/g, '""')}")`).all() as any[]).map(
             (c) => c.name,
           );
 
@@ -2492,7 +2492,7 @@ export class YattaDB {
             this._sqlite.run(`ALTER TABLE "${tableName.replace(/"/g, '""')}" ADD COLUMN ${fragment};`);
 
             this._sqlite
-              .prepare(`INSERT OR IGNORE INTO "_yatta_migrations" (name, hash) VALUES (?, ?)`)
+              .query(`INSERT OR IGNORE INTO "_yatta_migrations" (name, hash) VALUES (?, ?)`)
               .run(`alter:${tableName}.${colName}`, schemaHash);
 
             if (def.unique) {
@@ -2511,7 +2511,7 @@ export class YattaDB {
           for (const idx of indexSqls) this._sqlite.run(idx);
         }
 
-        const violations = this._sqlite.prepare("PRAGMA foreign_key_check;").all();
+        const violations = this._sqlite.query("PRAGMA foreign_key_check;").all();
         if (violations.length > 0) {
           throw new YattaError(`Foreign key integrity check failed after schema sync: ${JSON.stringify(violations)}`);
         }
@@ -2534,7 +2534,7 @@ export class YattaDB {
       );
     `);
 
-    const appliedRows = this._sqlite.prepare("SELECT name FROM _yatta_migrations").all() as { name: string }[];
+    const appliedRows = this._sqlite.query("SELECT name FROM _yatta_migrations").all() as { name: string }[];
     const appliedSet = new Set(appliedRows.map((r) => r.name));
     const newlyApplied: string[] = [];
 
@@ -2571,13 +2571,13 @@ export class YattaDB {
         await m.up(this);
 
         this._sqlite
-          .prepare("INSERT INTO _yatta_migrations (name, hash) VALUES (?, ?)")
+          .query("INSERT INTO _yatta_migrations (name, hash) VALUES (?, ?)")
           .run(m.name, "migration");
       } else {
         this._sqlite.transaction(() => {
           m.up(this);
           this._sqlite
-            .prepare("INSERT INTO _yatta_migrations (name, hash) VALUES (?, ?)")
+            .query("INSERT INTO _yatta_migrations (name, hash) VALUES (?, ?)")
             .run(m.name, "migration");
         })();
       }

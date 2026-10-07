@@ -1183,7 +1183,7 @@ export class SQLiteL2CacheStore implements L2CacheStore {
   async get<T>(key: string): Promise<L2CacheRecord<T> | null> {
     const now = Date.now();
     const row = this.db
-      .prepare(
+      .query(
         `
       SELECT value, expires_at FROM "_yatta_cache" WHERE key = ?
     `,
@@ -1222,7 +1222,7 @@ export class SQLiteL2CacheStore implements L2CacheStore {
 
     this.db.transaction(() => {
       this.db
-        .prepare(
+        .query(
           `
         INSERT INTO "_yatta_cache" (key, value, expires_at)
         VALUES (?, ?, ?)
@@ -1235,9 +1235,9 @@ export class SQLiteL2CacheStore implements L2CacheStore {
 
       if (tags && tags.length > 0) {
         this.db
-          .prepare(`DELETE FROM "_yatta_cache_tags" WHERE cache_key = ?`)
+          .query(`DELETE FROM "_yatta_cache_tags" WHERE cache_key = ?`)
           .run(key);
-        const insertTag = this.db.prepare(
+        const insertTag = this.db.query(
           `INSERT OR IGNORE INTO "_yatta_cache_tags" (tag, cache_key) VALUES (?, ?)`,
         );
         for (const t of tags) insertTag.run(t, key);
@@ -1252,7 +1252,7 @@ export class SQLiteL2CacheStore implements L2CacheStore {
    * @param key Cache key to delete.
    */
   async delete(key: string): Promise<void> {
-    this.db.prepare(`DELETE FROM "_yatta_cache" WHERE key = ?`).run(key);
+    this.db.query(`DELETE FROM "_yatta_cache" WHERE key = ?`).run(key);
   }
 
   /**
@@ -1266,7 +1266,7 @@ export class SQLiteL2CacheStore implements L2CacheStore {
     const placeholders = tags.map(() => "?").join(",");
 
     const res = this.db
-      .prepare(
+      .query(
         `
       DELETE FROM "_yatta_cache"
       WHERE key IN (
@@ -1287,7 +1287,7 @@ export class SQLiteL2CacheStore implements L2CacheStore {
   async cleanupExpired(): Promise<number> {
     const now = Date.now();
     const res = this.db
-      .prepare(
+      .query(
         `
       DELETE FROM "_yatta_cache"
       WHERE expires_at IS NOT NULL AND expires_at <= ?

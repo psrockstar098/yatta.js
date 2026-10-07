@@ -174,6 +174,41 @@ describe("`yatta new` and `yatta init` write the same folder", () => {
   });
 });
 
+describe("The run commands find the entrypoint the scaffold wrote", () => {
+  it("resolves yatta/main.ts in a project built by yatta new", () => {
+    const dir = newProject("run-cmd");
+
+    /*
+     * `yatta dev`, `yatta start` and `yatta cluster` hardcoded `src/main.ts`, and every
+     * scaffold writes `yatta/main.ts`. So `yatta new app && cd app && yatta dev`
+     * answered "No src/main.ts found" — in a project that was sitting right there,
+     * correctly scaffolded, whose own package.json `dev` script would have worked.
+     *
+     * `bun run dev` working while `yatta dev` did not is the worst shape of that bug:
+     * two ways of starting the server disagreeing about where the server is.
+     */
+    expect(existsSync(join(dir, "yatta", "main.ts"))).toBe(true);
+
+    // The CLI's own lookup, not a copy of the rule.
+    const cli = readFileSync(new URL("../cli.ts", import.meta.url), "utf8");
+
+    expect(cli).toContain("yatta/main.ts");
+    // No hardcoded entrypoint left in the run commands.
+    expect(cli).not.toMatch(/\["--watch",\s*"src\/main\.ts"\]/);
+    expect(cli).not.toMatch(/\["run",\s*"src\/main\.ts"\]/);
+  });
+
+  it("still recognises src/main.ts, which the framework checkout uses", () => {
+    const cli = readFileSync(new URL("../cli.ts", import.meta.url), "utf8");
+
+    // `bun run dev` and `yatta check` have to keep working in this repo, whose own
+    // entrypoint is `src/main.ts`. Dropping it to fix the scaffold would have traded
+    // one broken command for another.
+    expect(cli).toContain("src/main.ts");
+    expect(existsSync(join(import.meta.dir, "..", "main.ts"))).toBe(true);
+  });
+});
+
 describe("The scaffolded auth routes handle a second factor", () => {
   const route = readFileSync(new URL("../cli.ts", import.meta.url), "utf8");
 

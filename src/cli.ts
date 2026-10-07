@@ -12,7 +12,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { cmdDoctor } from "./cli_doctor";
 import { cmdMigrate, cmdMigrateMake, cmdMigrateStatus } from "./cli_migrate";
@@ -1523,20 +1523,50 @@ const TEMPLATE_TSCONFIG = `{
 `;
 
 /**
+ * Where a project's entrypoint is, in the order they are looked for.
+ *
+ * `yatta/main.ts` first, because that is what `yatta new` and `yatta init` both
+ * write and what the generated package.json points its scripts at.
+ *
+ * `src/main.ts` second, and not because it is preferred: it is what the framework's
+ * own checkout uses, and what a project scaffolded before the layout was unified used.
+ * Leaving it out means `yatta dev` fails inside the framework checkout, and leaving
+ * it first means a new project cannot start.
+ *
+ * The two run commands used to hardcode `src/main.ts`, so `yatta new app && cd app &&
+ * yatta dev` reported "No src/main.ts found" — in a project that was sitting right
+ * there, correctly scaffolded, with a package.json whose own `dev` script would have
+ * worked. `bun run dev` worked and `yatta dev` did not, which is the worst version of
+ * that bug: the two ways of starting the server disagreeing about where the server is.
+ */
+const ENTRYPOINTS = ["yatta/main.ts", "src/main.ts"] as const;
+
+/** The entrypoint in `dir`, or `null`. */
+function findEntrypoint(dir: string): string | null {
+  for (const candidate of ENTRYPOINTS) {
+    if (existsSync(join(dir, candidate))) return candidate;
+  }
+
+  return null;
+}
+
+/**
  * Guards `dev`/`start`/`cluster` against being run outside a project.
  *
- * Without this, Bun resolves `src/main.ts` relative to the framework
- * checkout, silently boots the framework itself on port 4000, and reports a
- * confusing EADDRINUSE instead of "you are in the wrong directory".
+ * Without this, Bun resolves the entrypoint relative to the framework checkout,
+ * silently boots the framework itself on port 4000, and reports a confusing
+ * EADDRINUSE instead of "you are in the wrong directory".
+ *
+ * Returns the path to run rather than a boolean, so the caller cannot go on to
+ * hardcode a different one — the whole bug was two places each naming a path.
  */
-function requireProject(command: string): boolean {
+function requireProject(command: string): string | null {
   const cwd = process.cwd();
-  const entry = join(cwd, "src", "main.ts");
+  const entry = findEntrypoint(cwd);
 
-  if (existsSync(entry)) return true;
+  if (entry) return join(cwd, entry);
 
-  // Only the entrypoint is required; cluster mode also needs the launcher.
-  fail(`No src/main.ts found in ${cwd}`);
+  fail(`No ${ENTRYPOINTS.join(" or ")} found in ${cwd}`);
   log("");
   log(`  \`yatta ${command}\` must run from inside your project, not the`);
   log(`  framework checkout.`);
@@ -1544,7 +1574,7 @@ function requireProject(command: string): boolean {
   log(`  If you just created a project, enter it first:`);
   log("");
   const nested = join(cwd, "app");
-  if (existsSync(join(nested, "src", "main.ts"))) {
+  if (findEntrypoint(nested)) {
     log(`${c.dim}    cd app${c.reset}`);
     log("");
   }
@@ -1552,7 +1582,7 @@ function requireProject(command: string): boolean {
   log("");
   log(`${c.dim}    yatta new my-project${c.reset}`);
   log("");
-  return false;
+  return null;
 }
 
 function cmdNew(name?: string): number {
@@ -2088,15 +2118,18 @@ export async function main(argv: string[]): Promise<number> {
       return cmdLink();
     case "unlink":
       return cmdUnlink();
-    case "dev":
-      if (!requireProject("dev")) return 1;
-      return run("bun", ["--watch", "src/main.ts"]);
-    case "start":
-      if (!requireProject("start")) return 1;
-      return run("bun", ["run", "src/main.ts"]);
-    case "cluster":
-      if (!requireProject("cluster")) return 1;
-      return run("bun", ["run", "core_runtime/cluster.ts"]);
+    case "dev": {
+      const entry = requireProject("dev");
+      return entry ? run("bun", ["--watch", entry]) : 1;
+    }
+    case "start": {
+      const entry = requireProject("start");
+      return entry ? run("bun", ["run", entry]) : 1;
+    }
+    case "cluster": {
+      const entry = requireProject("cluster");
+      return entry ? run("bun", ["run", join(dirname(entry), "..", "core_runtime", "cluster.ts")]) : 1;
+    }
     case "check":
       return run("bunx", ["tsc", "--noEmit"]) || run("bun", ["test"]);
     case "info":
