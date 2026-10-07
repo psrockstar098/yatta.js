@@ -63,7 +63,10 @@ details() {
   echo "## Framework comparison"
   echo ""
   echo "Head-to-head HTTP throughput: one \`GET /json\` route per framework,"
-  echo "20,000 requests at 100 concurrent connections (keep-alive):"
+  echo "20,000 requests at 100 concurrent connections (keep-alive)."
+  echo "Each framework is measured in its own process, three times, and the median is"
+  echo "reported. \`Spread\` is how far apart a framework's own runs were — if two"
+  echo "frameworks are within each other's spread, the data does not separate them."
   echo ""
   CMP="$(comparison_table)"
   if [ -n "$CMP" ]; then echo "$CMP"; else echo "_No comparison data captured._"; fi
