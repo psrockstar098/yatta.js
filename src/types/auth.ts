@@ -146,6 +146,22 @@ export interface AuthApiKey {
   createdAt: Date;
 }
 
+/**
+ * A verified API key, with its scopes attached as behaviour rather than as data.
+ *
+ * `scopes` alone is easy to ignore: a check written once and missed in one route is an
+ * authorisation bug that no type checker reports. `requireScope` puts the check in the
+ * type, so using the key without considering it is the awkward path.
+ */
+export interface ApiKeyPrincipal {
+  user: PublicUser;
+  apiKey: AuthApiKey;
+  scopes: string[];
+  hasScope: (scope: string) => boolean;
+  /** @throws {ForbiddenError} when the key does not carry `scope`. */
+  requireScope: (scope: string) => void;
+}
+
 export interface AuthOrganization {
   id: string;
   name: string;
@@ -1903,12 +1919,39 @@ export class Auth {
 
     const incomingHash = this.crypto.hash(refreshToken);
 
-    // Replay detection with a 30s concurrent grace window
+    const client = this.extractClient(req);
+
+    /*
+     * Replay detection, with a short grace window for concurrent refreshes.
+     *
+     * The window exists because a client that fires two refreshes at once — a page load
+     * racing a background poll, a retry over a slow link — legitimately presents the
+     * same token twice, and revoking on that logs the user out for a race they did not
+     * cause. It is bounded to one extra use, because each rotation moves the previous
+     * slot along.
+     *
+     * What it must not do is accept a replay from *anybody*. A stolen token presented
+     * within the window was previously enough: the check compared hashes and nothing
+     * else, so an attacker who stole a token and used it 2 seconds after the victim's
+     * own refresh got a session. The window now also requires the same client — same
+     * address and same user agent — because the case it exists for is the same client
+     * retrying, and an attacker's retry is not.
+     */
     if (
       session.refreshTokenHash &&
       !this.crypto.timingSafeEqual(session.refreshTokenHash, incomingHash)
     ) {
+      const sameClient =
+        // Both unknown is treated as matching: behind a proxy that strips the address,
+        // a strict check would reject every legitimate concurrent refresh. When both
+        // are known, they must agree.
+        (client.ip === undefined || session.ip === undefined || client.ip === session.ip) &&
+        (client.userAgent === undefined ||
+          session.userAgent === undefined ||
+          client.userAgent === session.userAgent);
+
       const isWithinGraceWindow =
+        sameClient &&
         session.previousRefreshTokenHash &&
         this.crypto.timingSafeEqual(
           session.previousRefreshTokenHash,
@@ -1932,8 +1975,6 @@ export class Auth {
 
     const user = await this.store.findUserById(session.userId);
     if (!user) throw new UnauthorizedError("User no longer exists");
-
-    const client = this.extractClient(req);
 
     const nextVersion = session.refreshVersion + 1;
     const newRefreshJwt = this.jwt.sign({
@@ -3494,7 +3535,8 @@ export class AuthApiKeys {
 
   async verify(
     rawKey: string,
-  ): Promise<{ user: PublicUser; apiKey: AuthApiKey } | null> {
+    options: { requireScope?: string } = {},
+  ): Promise<ApiKeyPrincipal | null> {
     if (!rawKey.startsWith("yk_live_")) return null;
     const keyHash = this.auth.crypto.hash(rawKey);
     const record = await this.auth.store.findApiKeyByHash(keyHash);
@@ -3513,7 +3555,36 @@ export class AuthApiKeys {
       await this.auth.store.updateApiKey(record.id, { lastUsedAt: new Date() });
     }
 
-    return { user: this.auth.toPublicUser(user), apiKey: record };
+    /*
+     * Scope enforcement.
+     *
+     * `scopes` were written at creation and read back here, and nothing in between ever
+     * looked at them — so a key minted with `scopes: ["read:data"]` was as good as one
+     * minted with `["write:data"]`, and the only way to tell was to read
+     * `principal.apiKey.scopes` yourself and hope you remembered everywhere.
+     *
+     * `*` is the wildcard, matching the convention API keys are issued under: a key with
+     * `["*"]` passes any check. There is no implicit grant — a key with no scopes has
+     * none, so denying is the default rather than allowing.
+     */
+    if (options.requireScope && !record.scopes.includes(options.requireScope)) {
+      if (!record.scopes.includes("*")) return null;
+    }
+
+    return {
+      user: this.auth.toPublicUser(user),
+      apiKey: record,
+      scopes: record.scopes,
+      hasScope: (scope: string) => record.scopes.includes(scope) || record.scopes.includes("*"),
+      requireScope: (scope: string) => {
+        if (record.scopes.includes(scope) || record.scopes.includes("*")) return;
+        throw new ForbiddenError(
+          `This API key does not carry the "${scope}" scope. It has: ${
+            record.scopes.length ? record.scopes.join(", ") : "none"
+          }.`,
+        );
+      },
+    };
   }
 
   async list(userId: string) {
