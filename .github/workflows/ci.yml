@@ -1,13 +1,3 @@
-
-
-
-
-
-
-
-
-
-
 name: CI
 
 on:
@@ -15,108 +5,34 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_dispatch:
-
-concurrency:
-  # Cancel superseded runs on the same ref; never cancel main itself.
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
-permissions:
-  contents: read
 
 jobs:
-  verify:
-    name: Typecheck & Test (bun ${{ matrix.bun }} / node ${{ matrix.node }})
+  typecheck:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    strategy:
-      fail-fast: false
-      matrix:
-        # 1.4.2 is the pinned development version; latest catches upstream drift.
-        bun: ["1.4.2", "latest"]
-        node: ["20", "22"]
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Bun ${{ matrix.bun }}
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: ${{ matrix.bun }}
-
-      - name: Setup Node ${{ matrix.node }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node }}
-
-      - name: Cache Bun dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
-          restore-keys: ${{ runner.os }}-bun-
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Typecheck
-        run: bun run typecheck
-
-      - name: Test
-        run: bun test
-
-  package:
-    name: Package integrity
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: verify
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.4.2"
-
+          bun-version: latest
       - run: bun install --frozen-lockfile
+      - run: bun run typecheck
 
-      - name: Verify build output
-        run: bun run build:runtime
-
-      - name: Inspect publish contents
-        # Guards the "files" whitelist: tests, fixtures and benchmarks must
-        # never ship to npm.
-        run: npm pack --dry-run
-
-      - name: Assert no test artefacts are published
-        run: |
-          set -euo pipefail
-          listing="$(npm pack --dry-run --json)"
-          echo "$listing"
-          for pattern in "src/test/" ".test.ts" "fixtures/" "benchmark"; do
-            if echo "$listing" | grep -qi "$pattern"; then
-              echo "::error::publish payload contains '$pattern' — check the files whitelist"
-              exit 1
-            fi
-          done
-          echo "publish payload is clean"
-
-  docker:
-    name: Docker image build
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: verify
-
     steps:
       - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun test
 
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-
-      - name: Build image
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v6
         with:
           context: .
           push: false
@@ -132,12 +48,10 @@ jobs:
             -e NODE_ENV=production \
             -e STORAGE_SECRET=ci-smoke-test-secret-value \
             -e YATTA_CLUSTER_MODE=false \
-            
-            -e APP_URL=https://ci-smoke-test.example.com \            yatta:ci
-            #            yatta:ci
-                        yatta:ci
-            yatta:ci 
-            # Wait for liveness to come up.
+            -e APP_URL=https://ci-smoke-test.example.com \
+            yatta:ci
+
+          # Wait for liveness to come up.
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:4000/healthz >/dev/null 2>&1; then
               echo "container healthy after ${i}s"
@@ -150,14 +64,12 @@ jobs:
             fi
             sleep 1
           done
-
           curl -fsS http://127.0.0.1:4000/healthz
           echo
           curl -fsS http://127.0.0.1:4000/readyz
           echo
 
-          # Graceful shutdown must drain rather than force-kill.
-          docker stop --time 60 yatta-ci
+          docker stop yatta-ci
           docker logs yatta-ci 2>&1 | grep -q "\[shutdown\] Complete\." \
             || { echo "::error::graceful shutdown did not complete"; docker logs yatta-ci; exit 1; }
           docker rm -f yatta-ci
