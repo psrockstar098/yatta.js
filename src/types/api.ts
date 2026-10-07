@@ -1731,6 +1731,18 @@ export class API<TParams extends RouteParams = RouteParams> {
   private errorHandler?: ErrorHandler<TParams>;
   private corsOptions?: CorsOptions;
 
+  // Cache: request method -> pre-filtered (incl. HEAD->GET fallback) and
+  // pre-sorted (specificity descending) sub-routes. Rebuilt lazily after
+  // any route registration; avoids re-filtering/re-sorting per request.
+  private routeCache = new Map<Method, typeof this.subRoutes>();
+  // Cache: request method -> exact request path -> the handler the matching
+  // loop would select, with its params. O(1) hit for static-path requests.
+  // Built lazily from the sorted candidates; invalidated on registration.
+  private exactRouteCache = new Map<
+    Method,
+    Map<string, { handler: Handler<any>; params: Record<string, string>; routePath: string }>
+  >();
+
   constructor(path = "") {
     this.declaredPath = path === "/" ? "" : path.replace(/\/$/, "");
   }
@@ -1748,6 +1760,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
       });
+      this.invalidateRouteCache();
     } else {
       this.routes.set("GET", pathOrHandler);
     }
@@ -1767,6 +1780,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
       });
+      this.invalidateRouteCache();
     } else {
       this.routes.set("POST", pathOrHandler);
     }
@@ -1786,6 +1800,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
       });
+      this.invalidateRouteCache();
     } else {
       this.routes.set("PUT", pathOrHandler);
     }
@@ -1805,6 +1820,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
       });
+      this.invalidateRouteCache();
     } else {
       this.routes.set("PATCH", pathOrHandler);
     }
@@ -1824,6 +1840,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
       });
+      this.invalidateRouteCache();
     } else {
       this.routes.set("DELETE", pathOrHandler);
     }
@@ -1843,6 +1860,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
       });
+      this.invalidateRouteCache();
     } else {
       this.routes.set("HEAD", pathOrHandler);
     }
@@ -1862,6 +1880,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
       });
+      this.invalidateRouteCache();
     } else {
       this.routes.set("OPTIONS", pathOrHandler);
     }
@@ -1883,6 +1902,82 @@ export class API<TParams extends RouteParams = RouteParams> {
     this.mounts.push({ prefix: clean, router });
     this.mounts.sort((a, b) => b.prefix.length - a.prefix.length);
     return this;
+  }
+
+  /**
+   * Drop the precomputed route caches. Called on every route registration;
+   * the caches are rebuilt lazily on the next request.
+   */
+  private invalidateRouteCache(): void {
+    this.routeCache.clear();
+    this.exactRouteCache.clear();
+  }
+
+  /**
+   * Sub-routes eligible for `method` (HEAD also sees GET routes),
+   * pre-sorted by specificity descending — the exact order the matching
+   * loop iterates. Cached per method; invalidated on registration.
+   */
+  private getCandidates(method: Method): typeof this.subRoutes {
+    let list = this.routeCache.get(method);
+    if (!list) {
+      list = this.subRoutes
+        .filter(
+          (r) =>
+            r.method === method || (method === "HEAD" && r.method === "GET"),
+        )
+        .sort((a, b) => b.specificity - a.specificity);
+      this.routeCache.set(method, list);
+    }
+    return list;
+  }
+
+  /**
+   * Exact-path winners for `method`: request path -> the handler (plus
+   * params) the matching loop would select for that exact path. The winner
+   * is resolved by simulating the original first-match-wins scan over the
+   * specificity-sorted candidates, so parameterized and wildcard routes
+   * that outrank a static route keep their precedence.
+   */
+  private getExactCache(
+    method: Method,
+  ): Map<string, { handler: Handler<any>; params: Record<string, string>; routePath: string }> {
+    let map = this.exactRouteCache.get(method);
+    if (!map) {
+      map = new Map();
+      const candidates = this.getCandidates(method);
+      const seen = new Set<string>();
+      for (const cand of candidates) {
+        if (!isStaticPath(cand.path)) continue;
+        // Mirror the "/" special case in the matching loop.
+        const keys = cand.path === "/" ? ["/", ""] : [cand.path];
+        for (const key of keys) {
+          if (seen.has(key)) continue;
+          seen.add(key);
+          for (const w of candidates) {
+            let params: Record<string, string> | null;
+            if (
+              w.path === key ||
+              (w.path === "/" && (key === "" || key === "/"))
+            ) {
+              params = {};
+            } else {
+              params = matchPattern(w.path, key);
+            }
+            if (params !== null) {
+              map.set(key, {
+                handler: w.handler,
+                params,
+                routePath: w.path,
+              });
+              break;
+            }
+          }
+        }
+      }
+      this.exactRouteCache.set(method, map);
+    }
+    return map;
   }
 
   cors(options: CorsOptions = {}): this {
@@ -2190,15 +2285,33 @@ export class API<TParams extends RouteParams = RouteParams> {
           );
         }
 
-        // B. Check sub-routes
-        if (this.subRoutes.length > 0) {
-          const candidates = this.subRoutes
-            .filter(
-              (r) =>
-                r.method === method ||
-                (method === "HEAD" && r.method === "GET"),
-            )
-            .sort((a, b) => b.specificity - a.specificity);
+        // B. Check sub-routes. Candidates are pre-filtered by method and
+        // pre-sorted by specificity (cached; see getCandidates).
+        const candidates = this.getCandidates(method);
+        if (candidates.length > 0) {
+          // Fast path: O(1) exact-path lookup. The cached hit is the exact
+          // winner the scan below would select (same specificity order, same
+          // match condition), so middleware, params, HEAD handling, CORS and
+          // error dispatch all behave identically.
+          const hit = this.getExactCache(method).get(path);
+          if (hit) {
+            Object.assign(c.params, hit.params);
+            // Coerce first: reading `.body` on a plain object is undefined,
+            // so the HEAD branch below tested vacuously and produced a
+            // Response with an undefined status.
+            const hitRes = this.coerceResponse(
+              await hit.handler(c),
+              `${method} ${hit.routePath}`,
+            );
+            if (method === "HEAD" && hitRes.body !== null) {
+              return new Response(null, {
+                status: hitRes.status,
+                statusText: hitRes.statusText,
+                headers: hitRes.headers,
+              });
+            }
+            return hitRes;
+          }
 
           for (const cand of candidates) {
             let matchedParams: Record<string, string> | null = null;
@@ -2333,6 +2446,21 @@ export class API<TParams extends RouteParams = RouteParams> {
 // ──────────────────────────────────────────────────────────────────────────
 // Route matching and specificity
 // ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * True when a route pattern contains no parameters or wildcards, so it can
+ * only match one exact request path. Mirrors the segment kinds ranked in
+ * `specificityOf` (static = 3, param = 2, wildcard = 1).
+ */
+function isStaticPath(pattern: string): boolean {
+  const segments = pattern.split("/").filter(Boolean);
+  return segments.every(
+    (s) =>
+      s !== "**" &&
+      !s.startsWith(":") &&
+      !(s.startsWith("[") && s.endsWith("]")),
+  );
+}
 
 function specificityOf(pattern: string): number {
   const segments = pattern.split("/").filter(Boolean);
