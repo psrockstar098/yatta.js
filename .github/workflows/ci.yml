@@ -1,3 +1,13 @@
+
+
+
+
+
+
+
+
+
+
 name: CI
 
 on:
@@ -122,9 +132,12 @@ jobs:
             -e NODE_ENV=production \
             -e STORAGE_SECRET=ci-smoke-test-secret-value \
             -e YATTA_CLUSTER_MODE=false \
-            yatta:ci
-
-          # Wait for liveness to come up.
+            
+            -e APP_URL=https://ci-smoke-test.example.com \            yatta:ci
+            #            yatta:ci
+                        yatta:ci
+            yatta:ci 
+            # Wait for liveness to come up.
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:4000/healthz >/dev/null 2>&1; then
               echo "container healthy after ${i}s"
