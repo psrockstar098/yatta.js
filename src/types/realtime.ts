@@ -1609,16 +1609,7 @@ export interface RealtimeConfig<TData = Record<string, unknown>> {
       client: SocketClient<TData>,
       event: string,
       data: unknown,
-    ) => boolean | Promise<boolean>;  /** Custom structured logger. Defaults to `console`-based output. */
-  logger?: Logger;
-  /**
-   * Allowed WebSocket origins for CSRF protection.
-   * If set, the `Origin` header is validated during the upgrade handshake.
-   * Requests from disallowed origins are rejected (prevents Cross-Site WebSocket Hijacking).
-   */
-  allowedOrigins?: string[];
-  /**
-   * Enable WebSocket `permessage-deflate` compression.
+    ) => boolean | Promise<boolean>;
   };
   /**
    * Global inbound message payload validator.
@@ -1639,6 +1630,12 @@ export interface RealtimeConfig<TData = Record<string, unknown>> {
   adapter?: PubSubAdapter;
   /** Custom structured logger. Defaults to `console`-based output. */
   logger?: Logger;
+  /**
+   * Allowed WebSocket origins for CSRF protection.
+   * If set, the `Origin` header is validated during the upgrade handshake.
+   * Requests from disallowed origins are rejected (prevents Cross-Site WebSocket Hijacking).
+   */
+  allowedOrigins?: string[];
   /**
    * Enable WebSocket `permessage-deflate` compression.
    * @default true
@@ -1826,7 +1823,25 @@ export class RealtimeServer<TData = Record<string, unknown>> {
     }
 
     bucket.count++;
-    return bucket.count > messages;  ): Promise<boolean> {
+    return bucket.count > messages;
+  }
+
+  /**
+   * Attempts to upgrade an incoming HTTP request to a WebSocket connection.
+   * Runs authentication, merges session data, and delegates to `server.upgrade()`.
+   *
+   * Prefer {@link connect} for a unified handler that auto-selects between WebSocket and SSE.
+   *
+   * @param req Incoming HTTP `Request`.
+   * @param server The `Bun.Server` instance.
+   * @param customData Optional extra data merged into the session after authentication.
+   * @returns `true` if the upgrade was successful, `false` if authentication failed or upgrade was refused.
+   */
+  async upgrade(
+    req: Request,
+    server: Server<unknown>,
+    customData?: Partial<TData>,
+  ): Promise<boolean> {
     this.bindServer(server);
 
     // CSRF protection: Validate Origin header if allowedOrigins is configured.
@@ -1850,28 +1865,6 @@ export class RealtimeServer<TData = Record<string, unknown>> {
         }
       }
     }
-
-    let authData: TData = {} as TData;
-    if (this.config.authenticate) {
-  }
-
-  /**
-   * Attempts to upgrade an incoming HTTP request to a WebSocket connection.
-   * Runs authentication, merges session data, and delegates to `server.upgrade()`.
-   *
-   * Prefer {@link connect} for a unified handler that auto-selects between WebSocket and SSE.
-   *
-   * @param req Incoming HTTP `Request`.
-   * @param server The `Bun.Server` instance.
-   * @param customData Optional extra data merged into the session after authentication.
-   * @returns `true` if the upgrade was successful, `false` if authentication failed or upgrade was refused.
-   */
-  async upgrade(
-    req: Request,
-    server: Server<unknown>,
-    customData?: Partial<TData>,
-  ): Promise<boolean> {
-    this.bindServer(server);
 
     let authData: TData = {} as TData;
     if (this.config.authenticate) {

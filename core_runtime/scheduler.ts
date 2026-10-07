@@ -820,9 +820,9 @@ export class HardwareAwareScheduler {
       worker.pendingRequests.delete(t.id);
       worker.activeTasks--;
       t.reject(err);
-    
+    }
   }
-  
+
   /** Sends a single task. A non-cloneable payload fails only that task. */
   private startOne(worker: ManagedWorker, t: QueuedTask): void {
     worker.activeTasks++;

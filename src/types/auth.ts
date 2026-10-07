@@ -541,12 +541,14 @@ export class MemoryAuthStore implements AuthStore {
     }
     return s;
   }
-  function timingSafeEqual(a: string, b: string): boolean {
-  // Hash both values first to avoid leaking length via early return.
-  const hashA = crypto.createHash("sha256").update(a).digest();
-  const hashB = crypto.createHash("sha256").update(b).digest();
-  return crypto.timingSafeEqual(hashA, hashB);
-}async listSessionsByUserId(userId: string) {
+  private timingSafeEqual(a: string, b: string): boolean {
+    // Hash both values first to avoid leaking length via early return.
+    const hashA = crypto.createHash("sha256").update(a).digest();
+    const hashB = crypto.createHash("sha256").update(b).digest();
+    return crypto.timingSafeEqual(hashA, hashB);
+  }
+
+  async listSessionsByUserId(userId: string) {
     const now = new Date();
     return [...this.sessions.values()].filter(
       (s) => s.userId === userId && s.expiresAt > now,
@@ -861,8 +863,10 @@ export class AuthCrypto {
       ]);
       return decrypted.toString("utf8");
     } catch {
-            throw new AuthError("Invalid encrypted payload", 400);
-
+      // Use the same generic message to avoid giving attackers an oracle
+      // that distinguishes malformed envelopes from decryption failures.
+      throw new AuthError("Invalid encrypted payload", 400);
+    }
   }
 
   async hashPassword(password: string): Promise<string> {
