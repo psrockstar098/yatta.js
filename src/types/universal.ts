@@ -649,10 +649,10 @@ export function createApp<const R extends RouteTable, S extends ServiceMap = Ser
      * Named after its route, deliberately.
      *
      * These are assigned to a computed key, so an anonymous arrow keeps `name`
-     * as "". Anything that identifies a call by its function — the React layer
-     * builds a cache key out of it — would then see every route as the same one
-     * and serve one route's cached value under another's key. Naming them makes
-     * the identity real rather than positional.
+     * as "". Anything that identifies a call by its function — a cache keyed on
+     * the method, a devtools label, a log line — would then see every route as
+     * the same one and report one route's result under another's name. Naming
+     * them makes the identity real rather than positional.
      */
     Object.defineProperty(call, "name", { value: name, configurable: true });
     surface[name] = call;

@@ -48,6 +48,27 @@ export {
   type CorsOptions,
 } from "./api";
 
+// ── Route-table RPC ─────────────────────────────────────────────────────────
+// The same table served over HTTP, plus the client that reads it. Kept here rather
+// than behind its own subpath: the package now has one entry for the backend API
+// surface, and this is part of it.
+//
+// It was briefly unreachable — the module existed and was tested, but no `exports`
+// entry and no barrel re-export pointed at it, so nothing outside the test file could
+// import it. `manifest.test.ts` now fails if that happens to any module again.
+export {
+  serverRoute,
+  serve,
+  clientFor,
+  fail,
+  route,
+  type ServerRoute,
+  type ServerInput,
+  type PathParamsOf,
+  type ServeOptions,
+  type ClientFor,
+} from "./rpc";
+
 // ── Path utilities ─────────────────────────────────────────────────────────
 export {
   parseTemplate,

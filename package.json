@@ -80,32 +80,21 @@
     "benchmark": "bun run src/test/benchmark.ts",
     "tbenchmark": "bun run src/test/tuning_benchmark.ts",
     "bench:workloads": "bun run src/test/workload_benchmark.ts",
-    "prepublishOnly": "bun run typecheck && bun test",
+    "prepublishOnly": "bun run typecheck && bun test"
   },
   "devDependencies": {
-    "@angular/core": "^22.2.1",
-    "@builder.io/qwik": "^1.20.1",
     "@koa/router": "^12.0.0",
     "@types/bun": "latest",
     "@types/express": "^5.0.0",
     "@types/koa": "^2.15.0",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
-    "@vue/server-renderer": "^3.5.43",
     "elysia": "^1.1.0",
     "express": "^4.21.2",
     "fastify": "^5.2.0",
     "hono": "^4.6.0",
-    "koa": "^2.15.0",
-    "react": "^19.3.0",
-    "react-dom": "^19.3.0",
-    "solid-js": "^1.9.15",
-    "svelte": "^5.57.1",
-    "vue": "^3.5.43"
+    "koa": "^2.15.0"
   },
   "peerDependencies": {
-    "typescript": "^7",
-    "react": ">=18"
+    "typescript": "^7"
   },
   "dependencies": {
     "@onesignal/node-onesignal": "^5.18.0",
@@ -128,10 +117,5 @@
     "smtp-server": "^3.19.13",
     "tdigest": "^0.1.3",
     "zod": "^4.6.5"
-  },
-  "peerDependenciesMeta": {
-    "react": {
-      "optional": true
-    }
   }
 }
