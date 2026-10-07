@@ -179,3 +179,77 @@ describe("db:restore", () => {
     expect(existsSync(join(dir, "Database", safety[0]!))).toBe(true);
   });
 });
+
+describe("The backup targets the database the server uses", () => {
+  const original = { url: process.env.DATABASE_URL, path: process.env.DATABASE_PATH };
+
+  afterEach(() => {
+    if (original.url === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = original.url;
+
+    if (original.path === undefined) delete process.env.DATABASE_PATH;
+    else process.env.DATABASE_PATH = original.path;
+  });
+
+  function seedAt(path: string, email: string): void {
+    mkdirSync(join(path, ".."), { recursive: true });
+    const db = new Database(path, { create: true });
+    db.run("PRAGMA journal_mode = WAL");
+    db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)");
+    db.run("INSERT INTO users (email) VALUES (?)", [email]);
+    db.close();
+  }
+
+  it("follows DATABASE_URL, which is what the server reads", () => {
+    const target = join(dir, "app.db");
+    seedAt(target, "the-real-one@t.dev");
+
+    process.env.DATABASE_URL = target;
+    delete process.env.DATABASE_PATH;
+
+    /*
+     * `db:backup` only read `DATABASE_PATH`. A project pointing its server at
+     * `Database/app.db` therefore had the backup command looking at
+     * `Database/yatta.db` — a file that does not exist, so it failed, or one left over
+     * from an older layout, so it succeeded while archiving the wrong database. A
+     * backup of the wrong file is worse than none, because it is reported as one.
+     */
+    expect(cmdDbBackup(dir)).toBe(0);
+
+    const backup = readdirSync(join(dir, "backups")).find((f) => f.endsWith(".db"))!;
+    const snap = new Database(join(dir, "backups", backup), { readonly: true });
+    const rows = snap.query("SELECT email FROM users").all();
+    snap.close();
+
+    expect(rows).toEqual([{ email: "the-real-one@t.dev" }]);
+  });
+
+  it("still accepts DATABASE_PATH as an alias", () => {
+    const target = join(dir, "aliased.db");
+    seedAt(target, "aliased@t.dev");
+
+    delete process.env.DATABASE_URL;
+    process.env.DATABASE_PATH = target;
+
+    expect(cmdDbBackup(dir)).toBe(0);
+  });
+
+  it("prefers DATABASE_URL when both are set", () => {
+    const real = join(dir, "real.db");
+    const decoy = join(dir, "decoy.db");
+    seedAt(real, "real@t.dev");
+    seedAt(decoy, "decoy@t.dev");
+
+    process.env.DATABASE_URL = real;
+    process.env.DATABASE_PATH = decoy;
+
+    expect(cmdDbBackup(dir)).toBe(0);
+
+    const backup = readdirSync(join(dir, "backups")).find((f) => f.endsWith(".db"))!;
+    const snap = new Database(join(dir, "backups", backup), { readonly: true });
+    const rows = snap.query("SELECT email FROM users").all();
+    snap.close();
+
+    expect(rows).toEqual([{ email: "real@t.dev" }]);
+  });
+});

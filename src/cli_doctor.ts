@@ -45,7 +45,11 @@ export function cmdDoctor(projectRoot: string = process.cwd()): number {
   }
 
   // Database file
-  const dbPath = process.env.DATABASE_PATH || join(projectRoot, "Database", "yatta.db");
+  // Same precedence as the server: `DATABASE_URL`, then the `DATABASE_PATH` alias.
+  const dbPath =
+    process.env.DATABASE_URL ||
+    process.env.DATABASE_PATH ||
+    join(projectRoot, "Database", "yatta.db");
   if (existsSync(dbPath)) {
     try {
       const stat = statSync(dbPath);

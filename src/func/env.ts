@@ -37,7 +37,17 @@ export interface Env {
   NODE_ENV: NodeEnv;
   /** Signing/encryption secret. Always set by the time subsystems mount. */
   STORAGE_SECRET: string;
-  /** Optional SQLite file path. Falls back to "Database/app.db". */
+  /**
+   * Optional SQLite file path. Falls back to "Database/app.db".
+   *
+   * Named `DATABASE_URL` but it is a filesystem path, not a connection string — there is
+   * no server to connect to. And it is *not* interchangeable with `DATABASE_PATH`, which
+   * the CLI commands (`doctor`, `migrate`, `db:backup`) read instead. Setting
+   * `DATABASE_PATH` therefore configures the tools and silently does nothing to the
+   * server, which goes on using `Database/app.db` in the working directory.
+   *
+   * `DATABASE_PATH` is accepted below as an alias, so the two agree from here on.
+   */
   DATABASE_URL?: string;
   /** True when STORAGE_SECRET was generated rather than supplied. */
   isEphemeralSecret: boolean;
@@ -201,7 +211,17 @@ export function loadEnv(): Env {
     );
   }
 
-  const databaseUrl = process.env.DATABASE_URL;
+  /*
+   * `DATABASE_PATH` is an alias, not a separate setting.
+   *
+   * The CLI reads `DATABASE_PATH` and the server reads `DATABASE_URL`, which meant a
+   * project could point its tools at one database and serve another without any error.
+   * A test set `DATABASE_PATH`, asserted it had kept the server out of the working
+   * tree, and the server wrote `Database/app.db` into the repository regardless.
+   *
+   * `DATABASE_URL` wins when both are set, since that is the one the server reads.
+   */
+  const databaseUrl = process.env.DATABASE_URL ?? process.env.DATABASE_PATH;
   if (databaseUrl !== undefined && databaseUrl.trim() === "") {
     issues.push('DATABASE_URL must not be empty when provided');
   }

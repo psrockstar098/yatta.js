@@ -24,8 +24,23 @@ const c = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
 };
 
+/**
+ * The database this project is actually using.
+ *
+ * `DATABASE_URL` first, then the `DATABASE_PATH` alias, then the default.
+ *
+ * This only read `DATABASE_PATH`, while the server reads `DATABASE_URL`. A project
+ * pointing the server at `Database/app.db` therefore had `yatta db:backup` looking at
+ * `Database/yatta.db` — a file that does not exist, so the backup failed; or worse, one
+ * left over from an older layout, so it succeeded while archiving the wrong database.
+ * A backup of the wrong file is worse than no backup, because it is reported as one.
+ */
 function dbPath(projectRoot: string): string {
-  return process.env.DATABASE_PATH || join(projectRoot, "Database", "yatta.db");
+  return (
+    process.env.DATABASE_URL ||
+    process.env.DATABASE_PATH ||
+    join(projectRoot, "Database", "yatta.db")
+  );
 }
 
 function backupDir(projectRoot: string): string {

@@ -163,3 +163,74 @@ afterEach(() => {
   }
   Object.assign(process.env, ORIGINAL);
 });
+
+describe("DATABASE_PATH is an alias for DATABASE_URL, not a second setting", () => {
+  /*
+   * The CLI commands — `doctor`, `migrate`, `db:backup` — read `DATABASE_PATH`. The
+   * server reads `DATABASE_URL`. A project could therefore point its tools at one
+   * database and serve another, with no error anywhere.
+   *
+   * Caught by a test that set `DATABASE_PATH`, asserted the server had kept its database
+   * out of the working tree, and watched `Database/app.db` appear in the repository.
+   */
+  const withEnv = (vars: Record<string, string | undefined>): string | undefined => {
+    const previous: Record<string, string | undefined> = {};
+    for (const [key, value] of Object.entries(vars)) {
+      previous[key] = process.env[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    return JSON.stringify(previous);
+  };
+
+  const restore = (snapshot: string): void => {
+    for (const [key, value] of Object.entries(JSON.parse(snapshot) as Record<string, string>)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+
+  it("reads DATABASE_PATH when DATABASE_URL is absent", () => {
+    const snapshot = withEnv({
+      DATABASE_PATH: "/tmp/from-database-path.db",
+      DATABASE_URL: undefined,
+      STORAGE_SECRET: "env-alias-test-secret-value-long-enough",
+    });
+
+    try {
+      expect(loadEnv().DATABASE_URL).toBe("/tmp/from-database-path.db");
+    } finally {
+      restore(snapshot!);
+    }
+  });
+
+  it("prefers DATABASE_URL when both are set", () => {
+    const snapshot = withEnv({
+      DATABASE_PATH: "/tmp/from-database-path.db",
+      DATABASE_URL: "/tmp/from-database-url.db",
+      STORAGE_SECRET: "env-alias-test-secret-value-long-enough",
+    });
+
+    try {
+      // URL wins, because that is the one the server has always read.
+      expect(loadEnv().DATABASE_URL).toBe("/tmp/from-database-url.db");
+    } finally {
+      restore(snapshot!);
+    }
+  });
+
+  it("leaves it undefined when neither is set", () => {
+    const snapshot = withEnv({
+      DATABASE_PATH: undefined,
+      DATABASE_URL: undefined,
+      STORAGE_SECRET: "env-alias-test-secret-value-long-enough",
+    });
+
+    try {
+      // The engine falls back to Database/app.db.
+      expect(loadEnv().DATABASE_URL).toBeUndefined();
+    } finally {
+      restore(snapshot!);
+    }
+  });
+});
