@@ -30,7 +30,8 @@
     "paths": {
       "yatta.js/runtime": ["./core_runtime/index.ts"],
       "yatta.js/cluster": ["./core_runtime/cluster.ts"],
-      "yatta.js/api": ["./src/types/index.ts"]
+      "yatta.js/api": ["./src/types/index.ts"],
+      "yatta.js/otel": ["./src/types/otel.ts"]
     }
   },
   // Scope typechecking to the framework's own source. Scratch projects created

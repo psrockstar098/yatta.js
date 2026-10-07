@@ -49,6 +49,7 @@
     "./mail": "./src/types/mail.ts",
     "./realtime": "./src/types/realtime.ts",
     "./observe": "./src/types/observe.ts",
+    "./otel": "./src/types/otel.ts",
     "./package.json": "./package.json"
   },
   "bin": {
