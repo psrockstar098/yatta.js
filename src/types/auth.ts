@@ -2477,8 +2477,22 @@ export class Auth {
     return cookie;
   }
 
+  /**
+   * Cookies from a `Cookie:` header.
+   *
+   * Built on a null-prototype object, for the same reason `Context.query()` is: a plain
+   * `{}` inherits from `Object.prototype`, so a read of a key nobody sent returns the
+   * inherited value rather than nothing.
+   *
+   * The default cookie names are namespaced — `yatta_session`, `yatta_refresh`,
+   * `yatta_csrf` — so no inherited key can collide with them and this is not reachable
+   * out of the box. But the names are configurable, and `csrfCookieName: "constructor"`
+   * or any other Object.prototype member hands back a function where a token belongs.
+   * That value is then compared against a header, which is a check that quietly stops
+   * checking.
+   */
   parseCookies(header: string): Record<string, string> {
-    const out: Record<string, string> = {};
+    const out: Record<string, string> = Object.create(null);
     for (const pair of header.split(";")) {
       const trimmed = pair.trim();
       if (!trimmed) continue;

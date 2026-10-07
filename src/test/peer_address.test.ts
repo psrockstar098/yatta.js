@@ -3,6 +3,12 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { peerAddress, rememberPeerAddress } from "../func/peer";
+import {
+  createAuth,
+  MemoryAuthStore,
+  MemoryChallengeStore,
+  MemoryRateLimitStore,
+} from "../types/auth";
 
 /*
  * The client address, and why auth is the reason it exists.
@@ -66,6 +72,67 @@ describe("The peer address holder", () => {
      */
     expect(source).toContain("new WeakMap<Request, string>()");
     expect(source).not.toMatch(/new Map<Request/);
+  });
+});
+
+describe("The cookie parser does not inherit from Object.prototype", () => {
+  /*
+   * `api.ts` was hardened after `?constructor=1` turned out to be a 500 on every
+   * route: a plain `{}` returns the inherited value for a key nobody sent. The auth
+   * parser is a separate implementation and had the same shape.
+   *
+   * Not reachable with the default cookie names, which are namespaced. Reachable when
+   * an app configures one to an Object.prototype member — `csrfCookieName:
+   * "constructor"` hands back a function where a token belongs, and that value is then
+   * compared against a header, which is a check that quietly stops checking.
+   */
+  const SECRET = "super-secret-cryptographic-signing-key-32-chars-minimum";
+
+  function authWith(cookieName: string) {
+    return createAuth({
+      secret: SECRET,
+      store: new MemoryAuthStore(),
+      challengeStore: new MemoryChallengeStore(),
+      rateLimitStore: new MemoryRateLimitStore(),
+      cookies: { csrfCookieName: cookieName },
+    });
+  }
+
+  it("returns nothing for a cookie nobody sent", () => {
+    const auth = authWith("constructor");
+
+    // Bracket access deliberately: the declared type is `Record<string, string>`, so
+    // `parsed.constructor` type-checks as a function and never reaches the index
+    // signature. The index access is what the parser actually does.
+    const parsed = auth.parseCookies("a=1");
+
+    expect(parsed["constructor"]).toBeUndefined();
+    expect(parsed["hasOwnProperty"]).toBeUndefined();
+    expect(parsed["toString"]).toBeUndefined();
+    expect(parsed["__proto__"]).toBeUndefined();
+  });
+
+  it("still reads a cookie whose name shadows an Object.prototype member", () => {
+    const auth = authWith("constructor");
+
+    // Sent for real, it must win over the inherited one — that is the whole point of
+    // the null prototype.
+    expect(auth.parseCookies("constructor=real")["constructor"]).toBe("real");
+  });
+
+  it("keeps reading the default names unchanged", () => {
+    const auth = createAuth({
+      secret: SECRET,
+      store: new MemoryAuthStore(),
+      challengeStore: new MemoryChallengeStore(),
+      rateLimitStore: new MemoryRateLimitStore(),
+    });
+
+    const parsed = auth.parseCookies("yatta_session=abc; yatta_csrf=xyz");
+
+    expect(parsed.yatta_session).toBe("abc");
+    expect(parsed.yatta_csrf).toBe("xyz");
+    expect(Object.keys(parsed).sort()).toEqual(["yatta_csrf", "yatta_session"]);
   });
 });
 
