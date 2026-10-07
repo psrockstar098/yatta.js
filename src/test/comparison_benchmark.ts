@@ -308,27 +308,39 @@ if (yatta && yatta.spread > 15) {
   );
 }
 
+/*
+ * The shape here is load-bearing.
+ *
+ * `render-benchmarks.sh` assigns this file straight into `benchmarks.json` under a
+ * `comparison` key, and the website reads it. So this must be the object itself — not
+ * wrapped in another `comparison` — and each framework must carry `latency_ms` as a
+ * nested object. Wrapping it double-nests and the page reads `undefined`.
+ */
 const jsonOut = process.env.BENCH_JSON_OUT ?? "/tmp/bench/comparison.json";
+
 await Bun.write(
   jsonOut,
   JSON.stringify(
     {
-      comparison: {
-        route: "GET /json",
-        load: { requests: TOTAL, concurrency: CONCURRENCY, keep_alive: true },
-        method: `one process per framework, ${REPEATS} repetitions, median`,
-        frameworks: results.map((r) => ({
-          name: r.name,
-          requests_per_sec: Math.round(r.median),
-          vs_yatta: yatta ? Number((r.median / yatta.median).toFixed(2)) : null,
-          spread_pct: Number(r.spread.toFixed(1)),
-          samples: r.samples.map((s) => Math.round(s)),
-          avg_ms: Number(r.avg.toFixed(2)),
-          p50_ms: Number(r.p50.toFixed(2)),
-          p95_ms: Number(r.p95.toFixed(2)),
-          p99_ms: Number(r.p99.toFixed(2)),
-        })),
-      },
+      generated_at: new Date().toISOString(),
+      route: "GET /json",
+      method: `one process per framework, ${REPEATS} repetitions, median of ${REPEATS * 1} samples`,
+      load: { requests: TOTAL, concurrency: CONCURRENCY, keep_alive: true },
+      frameworks: results.map((r) => ({
+        name: r.name,
+        requests_per_sec: Math.round(r.median),
+        vs_yatta: yatta ? Number((r.median / yatta.median).toFixed(2)) : null,
+        // How far apart this framework's own runs were. A difference smaller than this
+        // is not a difference.
+        spread_pct: Number(r.spread.toFixed(1)),
+        samples: r.samples.map((v) => Math.round(v)),
+        latency_ms: {
+          avg: Number(r.avg.toFixed(2)),
+          p50: Number(r.p50.toFixed(2)),
+          p95: Number(r.p95.toFixed(2)),
+          p99: Number(r.p99.toFixed(2)),
+        },
+      })),
     },
     null,
     2,
