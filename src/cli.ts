@@ -14,6 +14,9 @@ import {
 } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { cmdDoctor } from "./cli_doctor";
+import { cmdMigrate, cmdMigrateMake, cmdMigrateStatus } from "./cli_migrate";
+import { cmdDbBackup, cmdDbRestore } from "./cli_backup";
 
 const VERSION = "1.0.0";
 
@@ -2009,6 +2012,14 @@ function cmdUsage(): number {
   log(`  ${c.cyan}yatta cluster${c.reset}      Run one process per core`);
   log(`  ${c.cyan}yatta check${c.reset}        Typecheck and run tests`);
   log(`  ${c.cyan}yatta info${c.reset}         Show paths and versions`);
+  log(`  ${c.cyan}yatta doctor${c.reset}       Diagnose project health and configuration`);
+  log("");
+  log(`${c.bold}Database${c.reset}`);
+  log(`  ${c.cyan}yatta migrate${c.reset}      Run pending migrations`);
+  log(`  ${c.cyan}yatta migrate:make <name>${c.reset}  Create a new migration file`);
+  log(`  ${c.cyan}yatta migrate:status${c.reset}  Show migration status`);
+  log(`  ${c.cyan}yatta db:backup${c.reset}    Backup the SQLite database`);
+  log(`  ${c.cyan}yatta db:restore <file>${c.reset}  Restore from backup`);
   log("");
   log(`${c.bold}Using it in your own project${c.reset}`);
   log(`  ${c.dim}1.${c.reset} yatta link                 ${c.dim}register this checkout${c.reset}`);
@@ -2065,7 +2076,7 @@ function runCapture(cmd: string, args: string[]): string | null {
 
 // ── Entry ─────────────────────────────────────────────────────────────────
 
-export function main(argv: string[]): number {
+export async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
 
   switch (command) {
@@ -2090,6 +2101,18 @@ export function main(argv: string[]): number {
       return run("bunx", ["tsc", "--noEmit"]) || run("bun", ["test"]);
     case "info":
       return cmdInfo();
+    case "doctor":
+      return cmdDoctor();
+    case "migrate":
+      return await cmdMigrate();
+    case "migrate:make":
+      return cmdMigrateMake(rest[0] ?? "");
+    case "migrate:status":
+      return await cmdMigrateStatus();
+    case "db:backup":
+      return cmdDbBackup();
+    case "db:restore":
+      return cmdDbRestore(rest[0] ?? "");
     case "version":
     case "--version":
     case "-v":
@@ -2114,5 +2137,5 @@ export function main(argv: string[]): number {
  * what every new project contains was the one file nothing could check.
  */
 if (import.meta.main) {
-  process.exit(main(process.argv.slice(2)));
+  process.exit(await main(process.argv.slice(2)));
 }
