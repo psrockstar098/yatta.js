@@ -133,6 +133,23 @@ describe("Nothing is declared that nothing imports", () => {
     expect(unused(Object.keys(manifest.devDependencies), used, tsconfigTypes())).toEqual([]);
   });
 
+  it("declares no dependency the source never reaches", () => {
+    const used = importedPackages();
+
+    /*
+     * Fifteen of the twenty declared dependencies were imported nowhere.
+     *
+     * `oauth` and `resend` read as used if you grep loosely — auth.ts implements OAuth
+     * itself, and `resend` appears only as a member of a transport-name union. So the
+     * scan strips comments before matching, or a dependency named in prose counts as a
+     * dependency in use.
+     *
+     * Every one of these is installed on every machine that installs Yatta, whether or
+     * not the feature behind it is ever used.
+     */
+    expect(unused(Object.keys(manifest.dependencies ?? {}), used, tsconfigTypes())).toEqual([]);
+  });
+
   it("declares no peerDependency the source never reaches", () => {
     const used = importedPackages();
 
