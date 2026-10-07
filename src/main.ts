@@ -1,5 +1,6 @@
 import { createRuntime, defineSubsystem } from "yatta.js/runtime";
 import { loadEnv } from "./func/env";
+import { rememberPeerAddress } from "./func/peer";
 import crypto from "node:crypto";
 
 // Validate configuration before any subsystem, database, or socket is created.
@@ -170,6 +171,12 @@ async function bootstrap() {
 
     async fetch(req, server) {
       const url = new URL(req.url);
+
+      /*
+       * The peer address exists only here, and auth's per-IP rate limits need it.
+       * Recorded before anything else touches the request.
+       */
+      rememberPeerAddress(req, server.requestIP(req)?.address);
 
       // ── Orchestrator health probes ───────────────────────────────────────
       // Liveness: the process is up. Never touches the runtime, so a

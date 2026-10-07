@@ -10,6 +10,7 @@ import {
 } from "../types/auth";
 import { db } from "./db";
 import { mailer } from "./mail";
+import { peerAddress } from "./peer";
 
 // ── Persistent SQLite Auth Store ──────────────────────────────────────────
 
@@ -320,5 +321,17 @@ export const auth = createAuth({
     rpName: "Yatta App",
     rpID: process.env.RP_ID || "localhost",
     origin: process.env.APP_URL || "http://localhost:4000",
+  },
+  security: {
+    /*
+     * Without this every request is seen as 127.0.0.1, so the per-IP rate limits
+     * become one global limit and a single attacker guessing passwords locks every
+     * legitimate user out. The warning was firing on this project's own production
+     * boot, which is how it was noticed.
+     *
+     * Bun keeps the peer address on the server rather than on the Request, so it is
+     * recorded in main.ts at the edge and read from here. See func/peer.ts.
+     */
+    getClientIp: (req) => peerAddress(req),
   },
 });
