@@ -345,6 +345,18 @@ describe("Yatta Auth — Enterprise Security & Authentication Engine", () => {
   // 6. Performance & Concurrency Tests
   // ──────────────────────────────────────────────────────────────────────────
   describe("Performance & Concurrency Tests", () => {
+    /*
+     * 30 seconds, not Bun's 5s default.
+     *
+     * Ten concurrent logins means ten Argon2id hashes, and Argon2id is slow on
+     * purpose — that is the property being paid for. Measured idle on a 2-core box,
+     * those ten take 1,664ms, so the 5s default leaves a 3x margin, and a shared CI
+     * runner running four jobs in parallel spends it. The failure is a timeout, with no
+     * output pointing at anything: it reads as "the auth engine hung" rather than "the
+     * machine was busy".
+     *
+     * The timeout is sized to the work, not to how fast the machine feels.
+     */
     it("should handle parallel logins concurrently without race conditions", async () => {
       const totalUsers = 10;
       const users = await Promise.all(
@@ -365,7 +377,7 @@ describe("Yatta Auth — Enterprise Security & Authentication Engine", () => {
         expect(res.user.email).toBe(users[i]!.email);
         expect(res.tokens.accessToken).toBeDefined();
       });
-    });
+    }, 30_000);
   });
 });
 
@@ -480,7 +492,7 @@ describe("Yatta Auth — signup rate limiting", () => {
 
     // Keyed as rl:signup:ip:<ip>. Ten successes must leave no hits at all.
     expect(await rateLimitStore.get("rl:signup:ip:127.0.0.1")).toBeNull();
-  });
+  }, 30_000);
 
   it("still counts repeated attempts at an address that already exists", async () => {
     const rateLimitStore = new MemoryRateLimitStore();

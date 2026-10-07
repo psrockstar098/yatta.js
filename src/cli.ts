@@ -79,6 +79,7 @@ import routers from "./func/routerHelper";
 import api from "./backend/routes";
 import { realtime, sseResponse } from "./func/realtime";
 import { observer } from "./func/observe";
+import { rememberPeerAddress } from "./func/peer";
 
 const port = Number(process.env.PORT) || 4000;
 
@@ -138,6 +139,11 @@ const server = Bun.serve({
 
   fetch(req, srv) {
     serverRef = srv;
+
+    // The peer address exists only here, and auth's per-IP rate limits need it.
+    // Recorded before anything else touches the request.
+    rememberPeerAddress(req, srv.requestIP(req)?.address);
+
     return instrumented(req);
   },
 
@@ -1016,6 +1022,42 @@ export const defaultWorker = jobs.worker("default", {
 });
 `;
 
+const TEMPLATE_FUNC_PEER = `// yatta/func/peer.ts
+//
+// The client's real address, captured at the edge.
+//
+// Bun does not put the peer address on Request — it lives on the server, as
+// server.requestIP(req). Anything downstream that needs it (auth's per-IP rate
+// limits, most obviously) has only the Request, and a Request does not carry it.
+//
+// So the address is recorded here on the way in, keyed by the Request itself. A
+// WeakMap, so an entry disappears with the request rather than accumulating for
+// the life of the process, and no header is injected and no Request is cloned —
+// either of those would cost something on every single request to solve a
+// problem only auth has.
+
+const addresses = new WeakMap<Request, string>();
+
+/**
+ * Records the peer address for one request. Called from fetch(), which is the
+ * only place the server is available.
+ */
+export function rememberPeerAddress(req: Request, address: string | undefined): void {
+  if (address) addresses.set(req, address);
+}
+
+/**
+ * The peer address of a request, or undefined when it was not recorded.
+ *
+ * Undefined is a real possibility and not a bug: a request that never passed
+ * through fetch() — a test calling a handler directly, or a route invoked in
+ * process — has no peer. Callers must treat it as "unknown", never as "local".
+ */
+export function peerAddress(req: Request): string | undefined {
+  return addresses.get(req);
+}
+`;
+
 const TEMPLATE_FUNC_AUTH = `// yatta/func/auth.ts
 //
 // Auth persisted through your own SQLite database. Handles Argon2id
@@ -1032,6 +1074,7 @@ import {
 } from "yatta.js/auth";
 import { db } from "./db";
 import { mailer } from "./mail";
+import { peerAddress } from "./peer";
 
 export class SQLiteAuthStore implements AuthStore {
   async findUserById(id: string): Promise<AuthUser | null> {
@@ -1295,6 +1338,17 @@ export const auth = createAuth({
     // email goes nowhere because the mailer has no real transport. Turn it on
     // in production once you have a working mailer.
     allowUnverifiedSession: process.env.NODE_ENV === "production" ? false : true,
+
+    /*
+     * Without this every request is seen as 127.0.0.1 and the per-IP rate limits
+     * become one global limit — so one attacker guessing passwords locks out every
+     * legitimate user at once. The framework warns at boot when it is missing, but a
+     * warning is not a default, and this file is what a new project ships with.
+     *
+     * The address is captured in main.ts at the edge, because that is the only place
+     * Bun exposes it. See func/peer.ts.
+     */
+    getClientIp: (req) => peerAddress(req),
   },
 });
 `;
@@ -1664,6 +1718,7 @@ export function writeYattaFolder(yattaDir: string): void {
   writeFileSync(join(yattaDir, "func", "cron.ts"), TEMPLATE_FUNC_CRON);
   writeFileSync(join(yattaDir, "func", "workers.ts"), TEMPLATE_FUNC_WORKERS);
   writeFileSync(join(yattaDir, "func", "auth.ts"), TEMPLATE_FUNC_AUTH);
+  writeFileSync(join(yattaDir, "func", "peer.ts"), TEMPLATE_FUNC_PEER);
   writeFileSync(join(yattaDir, "func", "realtime.ts"), TEMPLATE_FUNC_REALTIME);
   writeFileSync(join(yattaDir, "func", "observe.ts"), TEMPLATE_FUNC_OBSERVE);
   writeFileSync(join(yattaDir, "func", "routerHelper.ts"), TEMPLATE_FUNC_ROUTER);
@@ -2043,6 +2098,8 @@ function cmdUsage(): number {
   log(`  ${c.cyan}yatta check${c.reset}        Typecheck and run tests`);
   log(`  ${c.cyan}yatta info${c.reset}         Show paths and versions`);
   log(`  ${c.cyan}yatta doctor${c.reset}       Diagnose project health and configuration`);
+  log(`  ${c.cyan}yatta version${c.reset}      Print the version`);
+  log(`  ${c.cyan}yatta help${c.reset}         Show this`);
   log("");
   log(`${c.bold}Database${c.reset}`);
   log(`  ${c.cyan}yatta migrate${c.reset}      Run pending migrations`);

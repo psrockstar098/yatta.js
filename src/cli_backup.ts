@@ -1,10 +1,20 @@
 // yatta db:backup / yatta db:restore — SQLite backup commands.
 //
-// Uses SQLite's atomic snapshot via file copy with WAL checkpoint.
-// For production use with high write load, consider the SQLite backup API.
+// The backup is taken with `VACUUM INTO`, not by copying the file.
+//
+// Copying was wrong. In WAL mode — the default Yatta opens every database with — the
+// most recent writes live in the `-wal` sidecar, and `copyFileSync` on a database with
+// active writers can capture a torn main file. The header comment used to claim this
+// was "file copy with WAL checkpoint" while there was no checkpoint in it.
+//
+// `VACUUM INTO` writes a fresh, self-contained database in one transaction and includes
+// everything still in the WAL, so the snapshot is consistent by construction and needs
+// no `-wal` or `-shm` beside it. The file copy remains as a fallback for a database
+// that is not actually SQLite, so the command still produces something to look at.
 
 import { existsSync, mkdirSync, copyFileSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
+import { Database } from "bun:sqlite";
 
 const c = {
   green: (s: string) => `\x1b[32m${s}\x1b[0m`,
@@ -38,18 +48,56 @@ export function cmdDbBackup(projectRoot: string = process.cwd()): number {
   const filename = `yatta_${timestamp}.db`;
   const dest = join(dir, filename);
 
-  // Also copy WAL and SHM files if they exist (for WAL mode databases)
-  copyFileSync(src, dest);
-  for (const ext of ["-wal", "-shm"]) {
-    const walSrc = src + ext;
-    if (existsSync(walSrc)) {
-      copyFileSync(walSrc, dest + ext);
+  let method = "";
+
+  try {
+    /*
+     * Read-write, because SQLite refuses `VACUUM INTO` on a read-only connection. The
+     * statement itself only reads the source and writes the destination.
+     *
+     * `{ create: true }` is required, not incidental: in Bun 1.4.2
+     * `new Database(existingPath)` throws "bad parameter or other API misuse" for *any*
+     * existing file, WAL or not. Only `create: true` and `readonly: true` open one.
+     * Passing `create: false` to mean "do not create" is the same error — the option
+     * only accepts `true`.
+     *
+     * Existence is checked above, so `create: true` cannot manufacture an empty
+     * database for a path that is not there.
+     */
+    const db = new Database(src, { create: true });
+
+    try {
+      db.run("VACUUM INTO ?", [dest]);
+      method = "consistent snapshot via VACUUM INTO";
+    } finally {
+      db.close();
     }
+  } catch (error) {
+    /*
+     * Fall back to a plain copy, so a corrupt or non-SQLite file still produces
+     * something rather than nothing — but say so loudly.
+     *
+     * A quiet fallback is worse than a failure here. A copy of the main file in WAL
+     * mode can be torn, so a backup that silently became a copy would be reported as a
+     * success and be unrestorable, discovered at the moment it was needed.
+     */
+    copyFileSync(src, dest);
+    for (const ext of ["-wal", "-shm"]) {
+      if (existsSync(src + ext)) copyFileSync(src + ext, dest + ext);
+    }
+
+    method = "UNSAFE COPY — could not take a consistent snapshot";
+    console.log(
+      `  ${c.yellow("!")} ${method}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    console.log(
+      `  ${c.dim("  A copied file in WAL mode can be torn. Verify this backup before relying on it.")}`,
+    );
   }
 
   const stat = statSync(dest);
   console.log(`  ${c.green("✓")} Backup created: ${c.dim(dest)}`);
-  console.log(`  ${c.dim(`Size: ${(stat.size / 1024).toFixed(1)} KB`)}`);
+  console.log(`  ${c.dim(`Size: ${(stat.size / 1024).toFixed(1)} KB · ${method}`)}`);
   return 0;
 }
 

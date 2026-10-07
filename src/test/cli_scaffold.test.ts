@@ -118,6 +118,7 @@ describe("A scaffolded project is complete", () => {
       "yatta/backend/health.ts",
       "yatta/backend/index.ts",
       "yatta/backend/_router.ts",
+      "yatta/func/peer.ts",
       "yatta/func/routerHelper.ts",
       "yatta/func/db.ts",
       "yatta/func/auth.ts",
@@ -133,6 +134,35 @@ describe("A scaffolded project is complete", () => {
     ]) {
       expect(existsSync(join(dir, file))).toBe(true);
     }
+  });
+
+  it("ships a working per-client address, so rate limits are per-IP", () => {
+    const dir = newProject("peer");
+
+    const main = readFileSync(join(dir, "yatta", "main.ts"), "utf8");
+    const auth = readFileSync(join(dir, "yatta", "func", "auth.ts"), "utf8");
+    const peer = readFileSync(join(dir, "yatta", "func", "peer.ts"), "utf8");
+
+    /*
+     * Without this every request is seen as 127.0.0.1 and the per-IP rate limits
+     * collapse into one global limit — so one attacker guessing passwords locks out
+     * every legitimate user at once. The framework warns at boot, and the production
+     * Docker image logs that warning on every boot. A warning is not a default.
+     *
+     * The address has to be captured at the edge, because Bun keeps it on the server
+     * rather than on the Request, and everything downstream only has the Request.
+     */
+    expect(auth).toContain("getClientIp: (req) => peerAddress(req)");
+    expect(main).toContain("rememberPeerAddress(req, srv.requestIP(req)?.address)");
+
+    // A WeakMap, so entries die with the request instead of accumulating.
+    expect(peer).toContain("new WeakMap<Request, string>()");
+
+    // And it must be silent when the address is unknown, rather than inventing one:
+    // a route called in process has no peer, and reporting "local" would put every
+    // such call in one bucket.
+    expect(peer).toMatch(/return addresses\.get\(req\)/);
+    expect(peer).not.toContain('?? "127.0.0.1"');
   });
 
   it("leaves no placeholder behind", () => {
