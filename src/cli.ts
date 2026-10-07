@@ -2008,7 +2008,6 @@ function cmdUsage(): number {
   log(`  ${c.cyan}yatta start${c.reset}        Run the server`);
   log(`  ${c.cyan}yatta cluster${c.reset}      Run one process per core`);
   log(`  ${c.cyan}yatta check${c.reset}        Typecheck and run tests`);
-  log(`  ${c.cyan}yatta build${c.reset}        Bundle the worker runtime to dist/`);
   log(`  ${c.cyan}yatta info${c.reset}         Show paths and versions`);
   log("");
   log(`${c.bold}Using it in your own project${c.reset}`);
@@ -2089,15 +2088,6 @@ export function main(argv: string[]): number {
       return run("bun", ["run", "core_runtime/cluster.ts"]);
     case "check":
       return run("bunx", ["tsc", "--noEmit"]) || run("bun", ["test"]);
-    case "build":
-      return run("bun", [
-        "build",
-        "core_runtime/index.ts",
-        "--outdir",
-        "dist/runtime",
-        "--target",
-        "bun",
-      ]);
     case "info":
       return cmdInfo();
     case "version":

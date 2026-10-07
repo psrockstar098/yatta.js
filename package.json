@@ -40,17 +40,7 @@
       "types": "./core_runtime/cluster.ts",
       "default": "./core_runtime/cluster.ts"
     },
-    "./api": "./src/types/api.ts",
-    "./universal": "./src/types/universal.ts",
-    "./binding": "./src/types/binding.ts",
-    "./path": "./src/types/path.ts",
-    "./batcher": "./src/types/batcher.ts",
-    "./frameworks": "./src/frameworks/index.ts",
-    "./frontend": "./src/types/frontend.ts",
-    "./react": "./src/react/universal-hooks.tsx",
-    "./next": "./src/react/next.ts",
-    "./client": "./src/types/client.ts",
-    "./rpc": "./src/types/rpc.ts",
+    "./api": "./src/types/index.ts",
     "./db": "./src/types/db.ts",
     "./auth": "./src/types/auth.ts",
     "./jobs": "./src/types/job.ts",
@@ -89,9 +79,7 @@
     "benchmark": "bun run src/test/benchmark.ts",
     "tbenchmark": "bun run src/test/tuning_benchmark.ts",
     "bench:workloads": "bun run src/test/workload_benchmark.ts",
-    "build:runtime": "bun build core_runtime/index.ts --outdir dist/runtime --target bun",
     "prepublishOnly": "bun run typecheck && bun test",
-    "prepack": "bun run build:runtime"
   },
   "devDependencies": {
     "@angular/core": "^22.2.1",

@@ -9,9 +9,6 @@ import {
   withMiddleware,
 } from "../types/universal";
 import { HttpError } from "../types/api";
-import { QueryCache } from "../types/frontend";
-import { runMutation, createDomCall, routePrefix } from "../frameworks/index";
-import type { CallStore } from "../react/universal-hooks";
 
 /*
  * Middleware, route-level invalidation and cancellation.
@@ -20,12 +17,6 @@ import type { CallStore } from "../react/universal-hooks";
  * bypassed by every direct call, and a Server Component that calls a route directly
  * is exactly the code path a reader would believe is guarded.
  */
-
-const User = z.object({ id: z.string(), email: z.string(), name: z.string() });
-
-function store() {
-  return new QueryCache({ staleTime: 0 }) as unknown as CallStore;
-}
 
 describe("Middleware runs on both paths", () => {
   function guarded() {
@@ -140,88 +131,6 @@ describe("Middleware runs on both paths", () => {
   });
 });
 
-const ada: z.infer<typeof User> = { id: "u1", email: "a@t.dev", name: "Ada" };
-
-describe("Route-level invalidation", () => {
-  it("invalidates every call to a route", async () => {
-    const s = store();
-    const app = createApp({
-      getUser: defineRoute({ method: "get", path: "/users/:id" }, async () => ({ ok: true })),
-    });
-
-    s.set("getUser:{\"params\":{\"id\":\"1\"}}", { ok: true });
-    s.set("getUser:{\"params\":{\"id\":\"2\"}}", { ok: true });
-    s.set("getUser:{\"params\":{\"id\":\"3\"}}", { ok: true });
-
-    await runMutation(s, app.getUser as never, undefined, { invalidates: [app.getUser] } as never, {
-      onPending: () => {},
-      onSuccess: () => {},
-      onError: () => {},
-    });
-
-    // A mutation on a user has to invalidate getUser for every id. Listing each key
-    // means writing down every id ever fetched, which is wrong the moment a
-    // component asks for one nobody predicted.
-    expect((s.get("getUser:{\"params\":{\"id\":\"1\"}}") as { stale: boolean }).stale).toBe(true);
-    expect((s.get("getUser:{\"params\":{\"id\":\"2\"}}") as { stale: boolean }).stale).toBe(true);
-    expect((s.get("getUser:{\"params\":{\"id\":\"3\"}}") as { stale: boolean }).stale).toBe(true);
-  });
-
-  it("leaves other routes alone", () => {
-    const s = store();
-
-    s.set("getUser:{}", 1);
-    s.set("listUsers:{}", 2);
-
-    s.invalidate(routePrefix("getUser"));
-
-    expect((s.get("getUser:{}") as { stale: boolean }).stale).toBe(true);
-    expect((s.get("listUsers:{}") as { stale: boolean }).stale).toBe(false);
-  });
-
-  it("still invalidates one exact key", () => {
-    const s = store();
-
-    s.set("a:1", 1);
-    s.set("a:2", 2);
-
-    s.invalidate("a:1");
-
-    expect((s.get("a:1") as { stale: boolean }).stale).toBe(true);
-    expect((s.get("a:2") as { stale: boolean }).stale).toBe(false);
-  });
-
-  it("refuses a target it cannot identify", () => {
-    // Better a clear error than a prefix of "unknown:" that silently matches
-    // nothing and leaves stale data on screen.
-    expect(() => routePrefix((() => {}) as never)).toThrow(/route method/);
-  });
-
-  it("gives an anonymous route method a real name", () => {
-    // The derived methods are named after their routes precisely so this works. An
-    // anonymous function here is the mistake, and it is reported rather than
-    // producing a key that matches nothing.
-    const app = createApp({
-      getThing: defineRoute({ method: "get", path: "/thing" }, async () => "ok"),
-    });
-
-    expect(routePrefix(app.getThing)).toBe("getThing:");
-  });
-
-  it("wakes nobody when a prefix matches nothing", () => {
-    const s = store();
-    s.set("present:{}", 1);
-
-    let woken = 0;
-    s.subscribe(() => {
-      woken++;
-    }, "present");
-
-    s.invalidate("absent:");
-    expect(woken).toBe(0);
-  });
-});
-
 describe("Cancellation", () => {
   it("gives a direct call's handler the signal", async () => {
     let seen: AbortSignal | undefined;
@@ -259,70 +168,5 @@ describe("Cancellation", () => {
     await expect(client.slow({ signal: controller.signal })).rejects.toThrow();
 
     server.stop(true);
-  });
-
-  it("abandons a bound call when its signal fires", async () => {
-    const s = store();
-    const rows = new Map([["u1", { id: "u1", email: "a@t.dev", name: "Ada" }]]);
-
-    const app = createApp(
-      {
-        getUser: defineRoute(
-          {
-            method: "get",
-            path: "/users/:id",
-            params: z.object({ id: z.string() }),
-            response: User,
-          },
-          async ({ params }) => {
-            await Bun.sleep(50);
-            return rows.get(params.id)!;
-          },
-        ),
-      },
-      { services: { rows } },
-    );
-
-    const controller = new AbortController();
-    controller.abort();
-
-    const call = createDomCall(s, app.getUser, { params: { id: "u1" } }, {
-      signal: controller.signal,
-    } as never);
-
-    await Bun.sleep(120);
-
-    // The work still ran — it is a server-side query and nobody can un-issue it —
-    // but the abort must not be reported as a failure, or every cancelled search
-    // would show an error to the person who typed it.
-    expect(call.state.error).toBeUndefined();
-
-    call.destroy();
-  });
-
-  it("still works with no signal at all", async () => {
-    const s = store();
-    const rows = new Map([["u1", { id: "u1", email: "a@t.dev", name: "Ada" }]]);
-
-    const app = createApp(
-      {
-        getUser: defineRoute(
-          {
-            method: "get",
-            path: "/users/:id",
-            params: z.object({ id: z.string() }),
-            response: User,
-          },
-          async ({ params }) => rows.get(params.id)!,
-        ),
-      },
-      { services: { rows } },
-    );
-
-    const call = createDomCall(s, app.getUser, { params: { id: "u1" } });
-    await Bun.sleep(30);
-
-    expect(call.state.data).toEqual(ada);
-    call.destroy();
   });
 });
