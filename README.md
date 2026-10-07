@@ -34,10 +34,9 @@ no build step for application code — TypeScript runs directly.
 - [The worker runtime](#the-worker-runtime)
 - [Benchmarks](#benchmarks)
 - [Feature engines](#feature-engines)
+- [Write a route once](#write-a-route-once)
 - [Observability](#observability)
 - [Routing](#routing)
-- [Frontend](#frontend)
-- [Write a route once](#write-a-route-once)
 - [Environment variables](#environment-variables)
 - [Health probes](#health-probes)
 - [Cluster mode](#cluster-mode)
@@ -114,7 +113,7 @@ persistent stores, and supports TypeScript module augmentation for typed keys.
 
 | Module | What it does |
 |--------|--------------|
-| `yatta/api` | Router with onion middleware, typed params, schema validation (Zod/Valibot/ArkType), CORS, cookies, streaming |
+| `yatta/api` | Unified API: router with onion middleware, typed params, schema validation (Zod/Valibot/ArkType), CORS, cookies, streaming, typed client, universal routes (define once, call directly or over HTTP), path utilities, DataLoader batching |
 | `yatta/db` | `bun:sqlite` ORM — column builder, relations, transactions with savepoints, pagination, cursor pagination, backup/restore |
 | `yatta/auth` | Argon2id, rotating access/refresh JWTs, AES-256-GCM sessions, TOTP 2FA, WebAuthn passkeys, hashed API keys, RBAC, rate-limit lockouts |
 | `yatta/jobs` | Job queue, worker pools, cron (Vixie semantics, tz-aware), event bus, atomic leases, DLQ, backoff + jitter |
@@ -123,13 +122,7 @@ persistent stores, and supports TypeScript module augmentation for typed keys.
 | `yatta/mail` | SMTP/Resend/Postmark/SendGrid/SES/Gmail, layouts, pipe templating, md→html, RFC 8058 unsubscribe |
 | `yatta/realtime` | Unified SSE + WebSocket, topic pub/sub, AI token streaming, job tracking, backpressure |
 | `yatta/observe` | Tracing, metrics, logs, issue grouping, incident correlation, adaptive baselines, SLOs, N+1 detection, golden traces |
-| `yatta/client` | A typed client built from your route table — no hand-written fetch calls, no generated files |
-| `yatta/rpc` | Serves the same route table on the server, so both sides come from one list |
-| `yatta/universal` | One route definition used two ways: called in process on the server, over HTTP in the browser |
-| `yatta/path` | One path-template parser, shared by the client, the router and the handler |
-| `yatta/batcher` | DataLoader batching, so fifty concurrent calls are one query |
-| `yatta/frameworks` | Bindings for Vue, Solid, Svelte, Angular, Qwik, React and plain pages |
-| `yatta/next` | Route handlers and request-scoped fetching for Next.js |
+| `yatta/otel` | OpenTelemetry bridge — Yatta spans flow to any OTel backend (Jaeger, Tempo, Datadog) |
 
 ### Typed keys
 
@@ -143,12 +136,13 @@ declare module "yatta.js/jobs" {
 }
 ```
 
-## Frontend
+## Write a route once
 
-A route is a plain function. The framework derives everything else from it.
+A route is a schema plus a function. Define it once, then call it directly on
+the server or reach it over HTTP — same validators, same types.
 
 ```ts
-import { defineRoute, createApp } from "yatta.js/universal";
+import { defineRoute, createApp, mount, createClient } from "yatta.js/api";
 
 export const api = createApp({
   getUser: defineRoute(
@@ -162,32 +156,16 @@ export const api = createApp({
 }, { services: { db, auth, realtime } });
 ```
 
-**On the server, call it.** `await api.getUser({ params: { id } })` — no HTTP, no
-round trip, no second definition.
+**On the server, call it directly.** `await api.getUser({ params: { id } })` — no HTTP,
+no round trip, no second definition.
 
 ```ts
-import { mount, createClient } from "yatta.js/universal";
-
 Bun.serve({ fetch: mount(api) });            // HTTP, from the same table
-const client = createClient(api, { baseUrl: "/api" });  // browser, same names
+const client = createClient(api, { baseUrl: "/api" });  // typed client, same names
 ```
-
-Both paths run the same validators, so a value one refuses cannot be accepted by
-the other.
-
-**In a component,** the method and its arguments are the whole API:
-
-```ts
-const { data, error } = useCall(api.getUser, { params: { id } });   // React
-```
-
-Bindings ship for React, Vue, Solid, Angular, Svelte, Qwik and plain pages. The
-caching, de-duplication and rollback live in one place, so they behave the same
-everywhere. Next.js gets a catch-all route file from the same table.
 
 **Checks run on both paths.** Middleware belongs to the app, not to the transport,
-so an authorisation check cannot be bypassed by calling a route directly — which is
-what a Server Component does.
+so an authorisation check cannot be bypassed by calling a route directly.
 
 ```ts
 export const api = createApp(routes, {
@@ -198,9 +176,11 @@ export const api = createApp(routes, {
 });
 ```
 
-**Fifty concurrent calls are one query.**
+**Fifty concurrent calls are one query** with DataLoader-style batching:
 
 ```ts
+import { withLoaders, loaderFor } from "yatta.js/api";
+
 await withLoaders(async () => {
   const loader = loaderFor("users", async (ids) => {
     const rows = await db.users.findMany({ where: { id: { in: [...ids] } } });
@@ -364,114 +344,6 @@ export default api;
 Handy context members: `ctx.params`, `ctx.query()`, `ctx.json(schema?)`,
 `ctx.formData()`, `ctx.cookies()`, and `ctx.state` for middleware handoff.
 
-## Write a route once
-
-`yatta/rpc` and `yatta/client` take the same table of routes. The server reads it
-to make endpoints. The client reads it to make typed methods. Both read the same
-schema objects, so you write the shape of a request and a response one time.
-
-Put the table in its own file with no handlers in it. That file is safe to import
-from a browser, which is the point — a table with handlers attached would drag
-your database code into the client bundle.
-
-```ts
-// api-contract.ts — paths and shapes only. Nothing server-side lives here.
-import { z } from "zod";
-import { route } from "yatta.js/rpc";
-
-export const User = z.object({ id: z.string(), email: z.string(), name: z.string() });
-
-export const routes = {
-  getUser: route({
-    method: "get",
-    path: "/users/:id",
-    params: z.object({ id: z.string() }),
-    response: User,
-  }),
-
-  createUser: route({
-    method: "post",
-    path: "/users",
-    body: z.object({ email: z.string(), name: z.string() }),
-    response: User,
-  }),
-};
-```
-
-The server adds the handlers:
-
-```ts
-// api-server.ts
-import { serve, fail } from "yatta.js/rpc";
-import { routes } from "./api-contract";
-import { db } from "./db";
-
-export const api = serve(routes, {
-  prefix: "/api",
-  handlers: {
-    getUser: async ({ params }) => db.users.findById(params.id) ?? fail(404, "No such user"),
-    createUser: async ({ body }) => db.users.insert(body),
-  },
-});
-```
-
-The browser imports the same contract and gets typed calls:
-
-```ts
-// api-client.ts
-import { clientFor } from "yatta.js/rpc";
-import { routes } from "./api-contract";
-
-const api = clientFor(routes, { baseUrl: "/api" });
-
-// The type comes from `User`. There is no interface to write and keep in step.
-const user = await api.getUser({ params: { id: "42" } });
-const name: string = user.name;
-
-// A wrong type is a compile error, not a runtime surprise.
-await api.createUser({ body: { email: 1, name: "Ada" } }); // ✗ does not compile
-```
-
-What this saves you:
-
-- No copy of each response type. Change the schema and both sides change.
-- No list of URLs to update. Rename a path and the client stops compiling.
-- No `await fetch(...)` with a hand-written body and a cast on the result.
-- No build step and no generated file to commit.
-
-If a route is short enough to sit next to its handler, `serverRoute(...)` attaches
-it in place. Serve that table the same way. Use whichever reads better.
-
-`yatta/client` is the lower half, for routes that are plain router calls rather
-than a shared table: it takes a list of method and path with no handlers, and
-gives you the same typed methods.
-
-### Any validator, not just Zod
-
-The client and `yatta/rpc` work with any library that follows
-[Standard Schema](https://standardschema.dev) — Zod, Valibot, ArkType. Yatta does
-not depend on any of them:
-
-```ts
-import * as v from "valibot";
-
-const User = v.object({ id: v.string(), email: v.string(), name: v.string() });
-// Everything above still works, unchanged.
-```
-
-### Catch a server that drifts
-
-Turn this on while you build. It checks what a handler returns against the
-response schema, so a mismatch is an error naming the field — instead of an
-empty value in the browser:
-
-```ts
-serve(routes, { prefix: "/api", validateResponses: true });
-```
-
-It costs one check per request, which is why it is off by default. Leave it on in
-development.
-
 ## Environment variables
 
 Validated at boot — the server refuses to start on malformed configuration.
@@ -553,7 +425,17 @@ Security headers (`X-Content-Type-Options`, `X-Frame-Options`,
 | `bun run typecheck` | `tsc --noEmit` |
 | `bun run check` | Typecheck + tests |
 | `bun run benchmark` | Scheduler/IPC microbenchmarks |
-| `bun run build:runtime` | Bundle the runtime to `dist/` |
+
+### CLI
+
+| Command | Does |
+|---------|------|
+| `yatta doctor` | Diagnose project health |
+| `yatta migrate` | Run pending migrations |
+| `yatta migrate:make <name>` | Create migration file |
+| `yatta migrate:status` | Show migration status |
+| `yatta db:backup` | Backup SQLite database |
+| `yatta db:restore <file>` | Restore from backup |
 
 ## Contributing
 
