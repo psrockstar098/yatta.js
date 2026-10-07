@@ -167,6 +167,15 @@ export function loadEnv(): Env {
     issues.push("STORAGE_SECRET is required when NODE_ENV=production");
   }
 
+  const authSecret = process.env.AUTH_SECRET;
+  if (!authSecret && nodeEnv.value === "production") {
+    issues.push(
+      "AUTH_SECRET is required when NODE_ENV=production. " +
+      "Without it, JWTs can be forged and encrypted 2FA secrets decrypted. " +
+      "Generate one with: openssl rand -base64 32"
+    );
+  }
+
   /*
    * An ephemeral secret in production, or in a cluster, is refused rather than
    * warned about.

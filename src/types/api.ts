@@ -1630,13 +1630,14 @@ export class Context<TParams extends RouteParams = RouteParams> {
     this.checkBodySize(maxBytes);
     if (!this.rawBodyParsed) {
       try {
-        this.rawBodyData = await this.req.json();
+        // Stream the body with a byte cap BEFORE parsing to prevent OOM.
+        // The old code parsed the entire body first, then checked size —
+        // a chunked multi-GB payload would OOM the process before the 413.
+        const bodyText = await this.readCappedText(maxBytes);
+        this.rawBodyData = JSON.parse(bodyText);
         this.rawBodyParsed = true;
-        // Verify actual size after parsing (Content-Length can be spoofed or omitted
-        // with chunked encoding). This prevents OOM from oversized bodies.
-        const bodySize = JSON.stringify(this.rawBodyData).length;
-        if (bodySize > maxBytes) { throw new HttpError(413, `Payload Too Large: exceeded ${maxBytes} bytes`); }  
       } catch (err) {
+        if (err instanceof HttpError) throw err;
         throw new ValidationError(err);
       }
     }
@@ -1648,15 +1649,85 @@ export class Context<TParams extends RouteParams = RouteParams> {
     }
   }
 
+  /**
+   * Read request body as text, enforcing maxBytes during streaming.
+   * Throws HttpError(413) if the body exceeds the limit.
+   */
+  private async readCappedText(maxBytes: number): Promise<string> {
+    const body = this.req.body;
+    if (!body) return "";
+
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          throw new HttpError(413, `Payload Too Large: exceeded ${maxBytes} bytes`);
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const combined = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(combined);
+  }
+
   async formData<T = FormData>(
     schema?: Validator<T>,
     options?: { maxBytes?: number },
   ): Promise<T> {
-    this.checkBodySize(options?.maxBytes);
+    const maxBytes = options?.maxBytes ?? 10 * 1024 * 1024;
+    this.checkBodySize(maxBytes);
     if (!this.rawFormData) {
       try {
-        this.rawFormData = await this.req.formData();
+        // Cap the stream before parsing form data to prevent OOM.
+        const cappedBody = this.req.body
+          ? new ReadableStream({
+              start: async (controller) => {
+                const reader = this.req.body!.getReader();
+                let total = 0;
+                try {
+                  while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    total += value.byteLength;
+                    if (total > maxBytes) {
+                      controller.error(new HttpError(413, `Payload Too Large: exceeded ${maxBytes} bytes`));
+                      return;
+                    }
+                    controller.enqueue(value);
+                  }
+                  controller.close();
+                } finally {
+                  reader.releaseLock();
+                }
+              },
+            })
+          : null;
+        const cappedReq = cappedBody
+          ? new Request(this.req.url, {
+              method: this.req.method,
+              headers: this.req.headers,
+              body: cappedBody,
+              // @ts-ignore - duplex required for streaming body
+              duplex: "half",
+            })
+          : this.req;
+        this.rawFormData = await cappedReq.formData();
       } catch (err) {
+        if (err instanceof HttpError) throw err;
         throw new ValidationError(err);
       }
     }
@@ -1889,6 +1960,72 @@ export class API<TParams extends RouteParams = RouteParams> {
 
   use(middleware: Middleware<TParams>): this {
     this.middlewareStack.push(middleware);
+    return this;
+  }
+
+  /**
+   * Add rate limiting middleware to this API.
+   *
+   * Uses a simple in-memory token bucket. For distributed rate limiting
+   * across multiple processes, use Redis/Valkey with the rate-limiter-flexible
+   * package directly.
+   *
+   * @param options.maxRequests Maximum requests per window per key
+   * @param options.windowMs Time window in milliseconds
+   * @param options.getKey Optional function to extract the rate limit key
+   *   (defaults to X-Forwarded-For header, then a global bucket)
+   */
+  rateLimit(options: {
+    maxRequests: number;
+    windowMs: number;
+    getKey?: (ctx: Context<TParams>) => string;
+  }): this {
+    const buckets = new Map<string, { count: number; resetAt: number }>();
+    const { maxRequests, windowMs, getKey } = options;
+
+    const defaultGetKey = (ctx: Context<TParams>): string => {
+      // Try X-Forwarded-For (when behind a proxy), fall back to global bucket
+      const forwarded = ctx.req.headers.get("x-forwarded-for");
+      if (forwarded) return forwarded.split(",")[0]!.trim();
+      return "global";
+    };
+
+    this.use(async (ctx, next) => {
+      const key = getKey ? getKey(ctx) : defaultGetKey(ctx);
+      const now = Date.now();
+
+      let bucket = buckets.get(key);
+      if (!bucket || now > bucket.resetAt) {
+        bucket = { count: 0, resetAt: now + windowMs };
+        buckets.set(key, bucket);
+      }
+
+      bucket.count++;
+
+      if (bucket.count > maxRequests) {
+        const retryAfter = Math.ceil((bucket.resetAt - now) / 1000);
+        return new Response(
+          JSON.stringify({ error: "Too many requests" }),
+          {
+            status: 429,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": String(retryAfter),
+            },
+          }
+        );
+      }
+
+      // Cleanup old buckets periodically (every 1000 requests)
+      if (buckets.size > 10000) {
+        for (const [k, b] of buckets) {
+          if (now > b.resetAt) buckets.delete(k);
+        }
+      }
+
+      return next();
+    });
+
     return this;
   }
 

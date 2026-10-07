@@ -2790,6 +2790,15 @@ export class StorageManager {
       const cfg = config as DriverConfig;
       this.disks.set(this.defaultDiskName, this.createDisk(cfg));
     }
+
+    // Warn if no authorizer is configured — files are world-readable by default.
+    if (!this.authorizer) {
+      console.warn(
+        "[yatta] WARNING: Storage has no 'authorize' callback configured. " +
+        "All stored files are world-readable via GET /storage/files/<key>. " +
+        "Configure an authorizer to restrict access, or set publicReads: true to acknowledge."
+      );
+    }
   }
 
   private createDisk(

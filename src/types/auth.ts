@@ -1290,6 +1290,19 @@ export class Auth {
       }
     }
 
+    // Warn if getClientIp is not configured — without it, all clients appear as
+    // 127.0.0.1 and per-IP rate limits become global (one attacker's failed
+    // logins lock out every legitimate user).
+    if (!config.security?.getClientIp) {
+      const msg =
+        "[yatta] WARNING: AuthConfig.security.getClientIp is not configured. " +
+        "Every client will be seen as 127.0.0.1, making per-IP rate limits global. " +
+        "Configure it as: security: { getClientIp: (req) => server.requestIP(req)?.address }";
+      if (process.env.NODE_ENV === "production") {
+        console.warn(msg);
+      }
+    }
+
     this.config = config;
     /*
      * A default store, but a loud one in production.

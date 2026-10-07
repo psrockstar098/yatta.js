@@ -142,7 +142,12 @@ export class SQLiteAuthStore implements AuthStore {
     const t = db.verificationTokens.findFirst({ where: { tokenHash, type } });
     if (!t || new Date(t.expiresAt) < new Date()) return null;
 
-    db.verificationTokens.deleteById(t.id);
+    // Atomic consume: deleteById returns true only if the row existed.
+    // In cluster mode, two workers might both find the token — only the first
+    // delete succeeds, the second gets false and returns null (no replay).
+    const deleted = db.verificationTokens.deleteById(t.id);
+    if (!deleted) return null;
+
     return this.toToken(t);
   }
 
@@ -290,9 +295,22 @@ export class SQLiteAuthStore implements AuthStore {
 
 // ── Export Initialized Auth Engine ────────────────────────────────────────
 
+const AUTH_SECRET = process.env.AUTH_SECRET;
+if (!AUTH_SECRET) {
+  if (process.env.NODE_ENV === "production") {
+    throw new Error(
+      "AUTH_SECRET environment variable is required in production. " +
+      "Generate one with: openssl rand -base64 32"
+    );
+  }
+  console.warn(
+    "[yatta] WARNING: AUTH_SECRET is not set. Using an insecure development fallback. " +
+    "Set AUTH_SECRET in production — never deploy without it."
+  );
+}
+
 export const auth = createAuth({
-  secret:
-    process.env.AUTH_SECRET || "your-ultra-secure-hmac-secret-min-32-chars",
+  secret: AUTH_SECRET || "dev-only-insecure-fallback-never-use-in-production",
   store: new SQLiteAuthStore(),
   email: {
     mailer,
