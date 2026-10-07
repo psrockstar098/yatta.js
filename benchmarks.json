@@ -1,13 +1,13 @@
 {
-  "generated_at": "2026-10-07T00:27:01Z",
-  "commit": "c8e08622a5d4076895325f165031c6fd648767eb",
-  "commit_short": "c8e0862",
-  "commit_url": "https://github.com/psrockstar098/yatta.js/commit/c8e08622a5d4076895325f165031c6fd648767eb",
+  "generated_at": "2026-10-07T00:32:53Z",
+  "commit": "dd6459fa0b719346676f241908dab07b0eb65041",
+  "commit_short": "dd6459f",
+  "commit_url": "https://github.com/psrockstar098/yatta.js/commit/dd6459fa0b719346676f241908dab07b0eb65041",
   "runner": "ubuntu-latest",
   "runtime": "Bun 1.4.2",
   "comparison": {
-    "generated_at": "2026-10-07T00:27:27.845Z",
-    "commit": "c8e08622a5d4076895325f165031c6fd648767eb",
+    "generated_at": "2026-10-07T00:33:22.283Z",
+    "commit": "dd6459fa0b719346676f241908dab07b0eb65041",
     "route": "GET /json",
     "load": {
       "requests": 20000,
@@ -17,68 +17,68 @@
     "frameworks": [
       {
         "name": "Yatta",
-        "requests_per_sec": 56177,
+        "requests_per_sec": 35229,
         "vs_yatta": 1,
         "latency_ms": {
-          "avg": 1.78,
-          "p50": 1.76,
-          "p95": 2.8,
-          "p99": 3.59
+          "avg": 2.83,
+          "p50": 2.41,
+          "p95": 4.34,
+          "p99": 5.21
         }
       },
       {
         "name": "Express",
-        "requests_per_sec": 25677,
-        "vs_yatta": 0.457,
+        "requests_per_sec": 15650,
+        "vs_yatta": 0.444,
         "latency_ms": {
-          "avg": 3.89,
-          "p50": 3.29,
-          "p95": 6.9,
-          "p99": 8.15
+          "avg": 6.38,
+          "p50": 5.87,
+          "p95": 10.17,
+          "p99": 11.49
         }
       },
       {
         "name": "Fastify",
-        "requests_per_sec": 32740,
-        "vs_yatta": 0.583,
+        "requests_per_sec": 20360,
+        "vs_yatta": 0.578,
         "latency_ms": {
-          "avg": 3.05,
-          "p50": 2.93,
-          "p95": 4.75,
-          "p99": 6.05
+          "avg": 4.9,
+          "p50": 4.43,
+          "p95": 7.99,
+          "p99": 8.63
         }
       },
       {
         "name": "Hono",
-        "requests_per_sec": 56311,
-        "vs_yatta": 1.002,
+        "requests_per_sec": 42123,
+        "vs_yatta": 1.196,
         "latency_ms": {
-          "avg": 1.77,
-          "p50": 1.79,
-          "p95": 2.97,
-          "p99": 4.15
+          "avg": 2.37,
+          "p50": 2.03,
+          "p95": 4.18,
+          "p99": 5.67
         }
       },
       {
         "name": "Elysia",
-        "requests_per_sec": 48558,
-        "vs_yatta": 0.864,
+        "requests_per_sec": 51635,
+        "vs_yatta": 1.466,
         "latency_ms": {
-          "avg": 2.06,
-          "p50": 2.01,
-          "p95": 3.99,
-          "p99": 4.77
+          "avg": 1.93,
+          "p50": 1.8,
+          "p95": 2.98,
+          "p99": 3.69
         }
       },
       {
         "name": "Koa",
-        "requests_per_sec": 24803,
-        "vs_yatta": 0.442,
+        "requests_per_sec": 13722,
+        "vs_yatta": 0.39,
         "latency_ms": {
-          "avg": 4.03,
-          "p50": 3.97,
-          "p95": 6.68,
-          "p99": 8.85
+          "avg": 7.28,
+          "p50": 8.15,
+          "p95": 10.93,
+          "p99": 12.41
         }
       }
     ]
