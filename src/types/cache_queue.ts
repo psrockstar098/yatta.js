@@ -137,7 +137,29 @@ export type Duration =
  */
 export function duration(value?: Duration, fallbackMs = 0): number {
   if (value == null) return fallbackMs;
-  if (typeof value === "number") return value; // numbers are strictly milliseconds
+  if (typeof value === "number") {
+    /*
+     * A duration that is not a duration, rejected the same way a malformed string is.
+     *
+     * The string path below already throws; the number path returned whatever it was
+     * given. Every TTL is consumed by `ttlMs > 0 ? now + ttlMs : null`, and
+     * `NaN > 0` is false, so `ttl: NaN` did not fail the expiry — it set
+     * `expiresAt = null`, which means *never expires*. Measured: an entry stored with
+     * `ttl: NaN` was still readable afterwards, and `defaultTtl: Number(process.env.X)`
+     * with the variable unset pinned every entry to no expiry at all. `-1` behaves the
+     * same way.
+     *
+     * That is the same mistake as `maxSize: NaN` in storage: a limit read out of the
+     * environment silently stops limiting. For a cache it means unbounded staleness and
+     * unbounded memory, which is the failure nobody notices until the process is killed.
+     */
+    if (!Number.isFinite(value) || value < 0) {
+      throw new QueueError(
+        `Invalid duration: expected a finite, non-negative number of milliseconds, got ${value}.`,
+      );
+    }
+    return value; // numbers are strictly milliseconds
+  }
 
   const match = value.trim().match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w)$/i);
   if (!match) throw new QueueError(`Invalid duration format: "${value}"`);
@@ -803,11 +825,17 @@ export class MemoryCacheEngine {
       this.deleteInternal(key);
     }
 
-    // `maxItems: 0` would otherwise spin forever: the condition is true on an
-    // empty list, and evictOldest() has nothing to remove, so no iteration ever
-    // ends. A capacity of zero means "hold nothing", which is a legitimate (if
-    // useless) configuration and must not hang.
-    while (this.list.size >= this.maxItems && this.list.size > 0) {
+    // A capacity of zero means "hold nothing", which is a legitimate (if useless)
+    // configuration. Returning here is also what keeps the loop below from spinning:
+    // with an empty list and maxItems 0 its condition is true and evictOldest() has
+    // nothing to remove, so no iteration ever ends.
+    //
+    // The guard used to sit on the loop alone, which stopped the hang but still stored
+    // the entry — one item past a capacity of zero, never evicted, contradicting the
+    // comment directly above it.
+    if (this.maxItems <= 0) return;
+
+    while (this.list.size >= this.maxItems) {
       this.evictOldest();
     }
 
