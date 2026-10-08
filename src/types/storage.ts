@@ -484,7 +484,20 @@ export function resolveSigningSecret(configuredSecret?: string): string {
  */
 export function parseDuration(val?: HumanTime): number {
   if (val === undefined) return 3600;
-  if (typeof val === "number") return val;
+  if (typeof val === "number") {
+    /*
+     * Same reasoning as parseSize(): `exp = now + NaN` produces the string "NaN",
+     * which verifySignedUrl then rejects because it is not finite. That is safe by
+     * accident rather than by design, and `signedUrl(key, { expiresIn: -5 })` issued
+     * an already-expired token rather than saying the value was wrong.
+     */
+    if (!Number.isFinite(val) || val < 0) {
+      throw new StorageError(
+        `Invalid duration: expected a finite, non-negative number of seconds, got ${val}.`,
+      );
+    }
+    return val;
+  }
 
   // Decimals are allowed by the HumanTime type ("1.5h"), and rejecting them
   // here silently substituted the default: "1.5h" became 1 hour, not 90 minutes.
@@ -525,7 +538,22 @@ export function parseDuration(val?: HumanTime): number {
  */
 export function parseSize(val?: HumanSize): number {
   if (val === undefined) return 100 * 1024 * 1024; // Default: 100MB
-  if (typeof val === "number") return val;
+  if (typeof val === "number") {
+    /*
+     * A non-finite or negative number is not a size, and every comparison built on it
+     * silently passes: `bytes > NaN` is false, so `maxSize: NaN` disabled the cap
+     * entirely and a 2MB body was accepted under a limit of NaN. Same for -1, where
+     * the stream transform compares against -1 and the known-size check rejects
+     * everything instead. Both were reachable from a config value read out of an env
+     * var, where `Number(undefined)` is NaN.
+     */
+    if (!Number.isFinite(val) || val < 0) {
+      throw new StorageError(
+        `Invalid size: expected a finite, non-negative number of bytes, got ${val}.`,
+      );
+    }
+    return val;
+  }
 
   // Decimals are allowed by the HumanSize type ("0.5MB"). Rejecting them fell
   // through to the 100MB default, so "0.5MB" became 100MB rather than 512KB —
