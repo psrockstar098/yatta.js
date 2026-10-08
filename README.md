@@ -41,6 +41,7 @@ no build step for application code — TypeScript runs directly.
 - [Health probes](#health-probes)
 - [Cluster mode](#cluster-mode)
 - [Reliability guarantees](#reliability-guarantees)
+- [Verifying a change](#verifying-a-change)
 - [Deployment](#deployment)
 - [Scripts](#scripts)
 - [License](#license)
@@ -385,6 +386,43 @@ one file safely. For multi-*node* deployments, point `storage` at the S3 driver 
 local disk does not sync across machines.
 
 ## Reliability guarantees
+
+## Verifying a change
+
+A local `bun run check` says nothing about what GitHub Actions did with your push, and
+that gap has already cost five red pushes in a row that were reported as done. So the
+last step is a command, not a habit:
+
+```bash
+bun run check          # typecheck + tests
+git push
+bun run verify:ci      # blocks until CI finishes; exits non-zero if any run failed
+```
+
+`verify:ci` resolves the current commit, waits for every workflow to reach a conclusion,
+prints one line per workflow with its URL, and fails loudly on a red one. It needs the
+`gh` CLI authenticated. The docs site has its own:
+
+```bash
+cd ../yatta-docs && bun run check && git push && bun run verify:ci
+```
+
+In the docs repo `bun run check` is `lint && build`, and the build matters: `check:api`
+only compares the generated `api-surface.json`, so it passes on a page that does not
+compile, and `tsc --noEmit` cannot run on a fresh checkout because Next's global types
+come from the gitignored `next-env.d.ts` that a build generates. There is no quick
+command that replaces it.
+
+Two smaller rules that follow from the same episode:
+
+- **A bug fix needs a test that fails without it.** Several of these were found by
+  probing an untested surface, and each fix was reverted briefly to confirm the new test
+  actually goes red. A test that passes before and after proves nothing.
+- **A guard written as `x > 0 ? apply : skip` fails open on `NaN`.** Four of them did —
+  a size cap, a cache TTL, and a rate limiter each ended up with no limit at all, all
+  reachable from `Number(process.env.SOMETHING)` with the variable unset. Validate at
+  the boundary rather than trusting a downstream comparison.
+
 
 - **Supervision.** A worker that dies has its in-flight and queued tasks rejected
   with `WorkerCrashError`; a replacement is spawned and remounts its graphs.

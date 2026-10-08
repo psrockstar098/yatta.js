@@ -77,6 +77,7 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun test",
+    "verify:ci": "node scripts/verify-ci.mjs",
     "benchmark": "bun run src/test/benchmark.ts",
     "tbenchmark": "bun run src/test/tuning_benchmark.ts",
     "bench:workloads": "bun run src/test/workload_benchmark.ts",
