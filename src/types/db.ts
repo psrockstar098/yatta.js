@@ -2580,8 +2580,30 @@ export class YattaDB {
             if (existingColumns.includes(colName)) continue;
             const def = colBuilder.def;
 
-            const fragment = this.buildColumnDefFragment(colName, def, "alter");
-            this._sqlite.run(`ALTER TABLE "${tableName.replace(/"/g, '""')}" ADD COLUMN ${fragment};`);
+            /*
+             * SQLite refuses `ALTER TABLE ... ADD COLUMN` with a non-constant default
+             * when the table already has rows — "Cannot add a column with non-constant
+             * default" — and `col.createdAt()` / `col.updatedAt()` both default to the
+             * strftime expression. Adding a timestamp to a populated table therefore
+             * threw at boot, which is the first schema change most projects make, and
+             * it threw on every start rather than once.
+             *
+             * SQLite has no way to attach an expression default to an existing column,
+             * so the table is rebuilt instead: the new definition is appended to the
+             * stored CREATE TABLE, the rows are copied, and the old table is swapped
+             * out. Indexes and triggers on the table are saved and recreated, because
+             * dropping a table takes them with it. Verified to preserve the
+             * AUTOINCREMENT counter, so ids do not restart at 1.
+             */
+            if (
+              this.needsExpressionDefault(def) &&
+              this.rowCount(tableName) > 0
+            ) {
+              this.rebuildTableWithColumn(tableName, colName, def);
+            } else {
+              const fragment = this.buildColumnDefFragment(colName, def, "alter");
+              this._sqlite.run(`ALTER TABLE "${tableName.replace(/"/g, '""')}" ADD COLUMN ${fragment};`);
+            }
 
             this._sqlite
               .query(`INSERT OR IGNORE INTO "_yatta_migrations" (name, hash) VALUES (?, ?)`)
@@ -2608,6 +2630,88 @@ export class YattaDB {
           throw new YattaError(`Foreign key integrity check failed after schema sync: ${JSON.stringify(violations)}`);
         }
     }
+  }
+
+  /**
+   * Whether a column's SQL default is an expression rather than a literal.
+   *
+   * `CURRENT_TIMESTAMP` is rendered as a strftime call so the stored format matches
+   * every other write path — see {@link formatDefault} — which makes it the one default
+   * SQLite will not accept on `ALTER TABLE ADD COLUMN` against a non-empty table.
+   */
+  private needsExpressionDefault(def: ColumnDefinition): boolean {
+    return def.defaultValue === "CURRENT_TIMESTAMP";
+  }
+
+  /** Current number of rows in a table, or 0 if it does not exist yet. */
+  private rowCount(tableName: string): number {
+    const row = this._sqlite
+      .query(`SELECT COUNT(*) AS c FROM "${tableName.replace(/"/g, '""')}"`)
+      .get() as { c: number } | null;
+    return row?.c ?? 0;
+  }
+
+  /**
+   * Adds a column to a populated table by rebuilding it.
+   *
+   * Called only for the case `ALTER TABLE ADD COLUMN` cannot express. The original
+   * CREATE TABLE is read back from `sqlite_master` rather than regenerated from the
+   * current schema, so columns that exist in the database but not in the schema — and
+   * constraints declared by hand — survive.
+   *
+   * Runs inside the caller's transaction. `legacy_alter_table` is toggled because
+   * renaming a table with it off makes SQLite rewrite references to that name in every
+   * other table, which would turn other tables' foreign keys into dangling text.
+   */
+  private rebuildTableWithColumn(tableName: string, colName: string, def: ColumnDefinition): void {
+    const quoted = tableName.replace(/"/g, '""');
+    const original = this._sqlite
+      .query(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+      .get(quoted) as { sql: string } | null;
+
+    if (!original?.sql) {
+      throw new YattaError(
+        `Cannot add "${colName}" to "${tableName}": its CREATE TABLE could not be read from sqlite_master, ` +
+          `so the table cannot be rebuilt safely. Add the column with ALTER TABLE by hand.`,
+      );
+    }
+
+    // Indexes and triggers live outside the CREATE TABLE text and are dropped with it.
+    const savedObjects = this._sqlite
+      .query(
+        `SELECT sql FROM sqlite_master WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL`,
+      )
+      .all(quoted) as { sql: string }[];
+
+    // Built in create mode: a rebuilt table can carry PRIMARY KEY and UNIQUE, which
+    // ALTER TABLE cannot add.
+    const fragment = this.buildColumnDefFragment(colName, def, "create");
+    const existingColumnList = (this._sqlite.query(`PRAGMA table_info("${quoted}")`).all() as any[]).map(
+      (c) => c.name,
+    );
+    const insertColumns = existingColumnList
+      .map((n) => `"${n.replace(/"/g, '""')}"`)
+      .join(", ");
+
+    const rebuilt = original.sql.replace(/\)\s*;?\s*$/, `, ${fragment});`);
+
+    this._sqlite.run(`DROP TABLE IF EXISTS "_yatta_rebuild_${quoted}"`);
+    this._sqlite.run(
+      rebuilt.replace(new RegExp(`^CREATE TABLE (IF NOT EXISTS )?"?${quoted.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"?`), `CREATE TABLE "_yatta_rebuild_${quoted}"`),
+    );
+    this._sqlite.run(
+      `INSERT INTO "_yatta_rebuild_${quoted}" (${insertColumns}) SELECT ${insertColumns} FROM "${quoted}";`,
+    );
+    this._sqlite.run(`DROP TABLE "${quoted}";`);
+
+    this._sqlite.run("PRAGMA legacy_alter_table = ON;");
+    try {
+      this._sqlite.run(`ALTER TABLE "_yatta_rebuild_${quoted}" RENAME TO "${quoted}";`);
+    } finally {
+      this._sqlite.run("PRAGMA legacy_alter_table = OFF;");
+    }
+
+    for (const object of savedObjects) this._sqlite.run(object.sql);
   }
 
   /**
@@ -2781,6 +2885,27 @@ export class YattaDB {
       const check = testDb.query("PRAGMA quick_check;").get() as { quick_check: string } | null;
       if (check?.quick_check !== "ok") {
         throw new Error("Backup file failed integrity check (corrupt or invalid SQLite file)");
+      }
+
+      /*
+       * `quick_check` is not sufficient on its own.
+       *
+       * SQLite treats a zero-length file as a valid, empty database, so quick_check
+       * answers "ok" for it. Restoring one therefore reported success and left the
+       * live database empty: every table gone, and checkIntegrity() still saying true
+       * afterwards because the empty file really is a healthy database. A truncated
+       * file is caught ("database disk image is malformed"), but the 0-byte case is
+       * exactly the one a failed `cp`, an interrupted upload or an empty log file
+       * produces — and it is the one that destroys the most.
+       *
+       * So the backup has to contain a schema. Yatta always writes `_yatta_migrations`,
+       * so an empty-but-valid file can be told from one of ours.
+       */
+      const tables = testDb
+        .query("SELECT name FROM sqlite_master WHERE type = 'table';")
+        .all() as { name: string }[];
+      if (tables.length === 0) {
+        throw new Error("backup file is a valid but empty SQLite database — it holds no schema");
       }
     } catch (err: any) {
       throw new YattaError(`Invalid or corrupt backup file: ${err.message}`);
