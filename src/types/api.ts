@@ -1994,6 +1994,36 @@ export class API<TParams extends RouteParams = RouteParams> {
     const buckets = new Map<string, { count: number; resetAt: number }>();
     const { maxRequests, windowMs, getKey } = options;
 
+    /*
+     * Checked here rather than assumed.
+     *
+     * The comparison below is `bucket.count > maxRequests`, and `count > NaN` is
+     * false — so a NaN did not fail the limit, it removed it. Every request was
+     * answered 200 and the limiter never fired, which is the worst direction for a
+     * control whose only job is to refuse some requests.
+     *
+     * The likely source is the obvious one: `maxRequests: Number(process.env.RATE_MAX)`,
+     * where an unset variable gives NaN. The same shape made `maxSize: NaN` disable the
+     * storage cap and `ttl: NaN` mean "never expires" in the cache; this is the fourth
+     * instance of a guard written so that a non-finite value silently selects "no
+     * limit".
+     *
+     * `windowMs: 0` is rejected too: the bucket's resetAt is then `now`, so it resets
+     * on the next millisecond and the limit never accumulates either.
+     */
+    if (!Number.isFinite(maxRequests) || maxRequests < 1) {
+      throw new TypeError(
+        `rateLimit(): maxRequests must be a finite number of at least 1, got ${maxRequests}. ` +
+          `A non-finite value disables the limit entirely rather than failing it.`,
+      );
+    }
+    if (!Number.isFinite(windowMs) || windowMs < 1) {
+      throw new TypeError(
+        `rateLimit(): windowMs must be a finite number of at least 1, got ${windowMs}. ` +
+          `A zero window resets the bucket on every request, so the limit never accumulates.`,
+      );
+    }
+
     const defaultGetKey = (ctx: Context<TParams>): string => {
       // Try X-Forwarded-For (when behind a proxy), fall back to global bucket
       const forwarded = ctx.req.headers.get("x-forwarded-for");

@@ -1245,7 +1245,22 @@ export class SQLiteL2CacheStore implements L2CacheStore {
     ttlMs?: number,
     tags?: string[],
   ): Promise<void> {
-    const expiresAt = ttlMs && ttlMs > 0 ? Date.now() + ttlMs : null;
+    /*
+     * Validated here rather than relying on the caller.
+     *
+     * `ttlMs` is part of the exported `L2CacheStore` interface, so it can arrive from
+     * outside the engine — and `ttlMs && ttlMs > 0` treats NaN as absent, storing
+     * `expires_at = NULL`. In L1 that is one process's memory; here the row is in
+     * SQLite, survives a restart, and the background sweeper only removes rows that
+     * *have* an expiry, so nothing ever collects it.
+     */
+    if (ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs < 0)) {
+      throw new CacheError(
+        `ttlMs must be a finite, non-negative number of milliseconds, got ${ttlMs}.`,
+      );
+    }
+
+    const expiresAt = ttlMs !== undefined && ttlMs > 0 ? Date.now() + ttlMs : null;
     const rawVal = this.serializer.encode(value);
 
     this.db.transaction(() => {
