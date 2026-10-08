@@ -21,6 +21,7 @@ export {
   ValidationError,
   createAPI,
   routeRequest,
+  throttledReload,
   type RouteParams,
   type ExtractRouteParams,
   type Handler,

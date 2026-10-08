@@ -1270,6 +1270,24 @@ export class Logger {
       level === "fatal" || level === "error" ? "error" : "info",
     );
     this.observer.recordLog(record);
+
+    /*
+     * Warn and above also go to stderr.
+     *
+     * The log store is in memory, so a fatal error recorded there is unreachable the
+     * moment the process exits — which is the only moment it matters. A production boot
+     * that failed on `AuthConfig.email.appUrl must be set` printed one line, "Fatal
+     * error policy is 'exit'", and nothing else: the actual reason was in the store
+     * that was about to die with it.
+     *
+     * info and below stay in the store, because those are the high-volume records a
+     * dashboard exists to hold.
+     */
+    if (level === "warn" || level === "error" || level === "fatal") {
+      const line = `[yatta] ${level.toUpperCase()}: ${message}`;
+      if (level === "fatal" || level === "error") console.error(line);
+      else console.warn(line);
+    }
   }
 
   debug(msg: string, ctx?: Record<string, unknown>) {

@@ -64,6 +64,60 @@ function pkg(): Record<string, any> {
   return JSON.parse(readFileSync(join(frameworkRoot(), "package.json"), "utf8"));
 }
 
+/**
+ * The name this package installs under.
+ *
+ * Read from package.json rather than written out by hand, because the instructions used
+ * to say `bun link yatta` while the package is called `yatta.js`. That created
+ * node_modules/yatta while every scaffolded file imports `yatta.js/*`, so following the
+ * documented steps exactly produced a project that could not typecheck — 20+ errors on
+ * a fresh `yatta new`.
+ */
+function pkgName(): string {
+  return pkg().name ?? "yatta.js";
+}
+
+/**
+ * Reloads a `Bun.FileSystemRouter`, at most once per `intervalMs`.
+ *
+ * The original intent — pick up a newly added route file without restarting — was
+ * implemented as `router.reload()` on *every request*. That costs a directory scan per
+ * request, and it is also incorrect under concurrency: `reload()` mutates the route
+ * table while `match()` reads it, and the interleaving produced intermittent 500s.
+ * Measured on a fresh scaffold: 40 of 100 concurrent requests to a file-routed path
+ * failed, while the same handler reached through `/api` was 75/75 clean.
+ *
+ * State is per-router rather than module-level, and a reload already in flight is not
+ * started again, so two concurrent requests cannot race.
+ *
+ * 500ms is far below the gap a person notices when adding a file, and far above the
+ * cost of the scan it replaces.
+ */
+const reloadState = new WeakMap<object, { last: number; running: boolean }>();
+
+export function throttledReload(router: object, intervalMs = 500): void {
+  const reload = (router as { reload?: () => void }).reload;
+  if (typeof reload !== "function") return;
+
+  let state = reloadState.get(router);
+  if (!state) {
+    state = { last: 0, running: false };
+    reloadState.set(router, state);
+  }
+
+  const now = Date.now();
+  if (state.running || now - state.last < intervalMs) return;
+
+  state.running = true;
+  state.last = now;
+  try {
+    reload.call(router);
+  } finally {
+    state.running = false;
+  }
+}
+
+
 // ── Commands ──────────────────────────────────────────────────────────────
 
 /**
@@ -265,7 +319,7 @@ const TEMPLATE_ROUTER = `// yatta/backend/_router.ts
 // You rarely need to edit this — add a file and it is picked up.
 
 import path from "node:path";
-import { API } from "yatta.js/api";
+import { API, throttledReload } from "yatta.js/api";
 
 const fileRouter = new Bun.FileSystemRouter({
   style: "nextjs",
@@ -289,7 +343,7 @@ function resolveApi(module: Record<string, unknown>): any {
 }
 
 export async function routers(req: Request, server: any): Promise<Response> {
-  if (process.env.NODE_ENV !== "production") fileRouter.reload();
+  if (process.env.NODE_ENV !== "production") throttledReload(fileRouter);
 
   let match = fileRouter.match(req);
   let basePath: string | undefined;
@@ -1411,7 +1465,7 @@ const TEMPLATE_FUNC_ROUTER = `// yatta/func/routerHelper.ts
 // You rarely need to edit this.
 import type { Server } from "bun";
 import path from "node:path";
-import { API } from "yatta.js/api";
+import { API, throttledReload } from "yatta.js/api";
 import { realtime } from "./realtime";
 import { storage } from "./storage";
 
@@ -1459,7 +1513,11 @@ export default async function routers(
   }
 
   // 3. Pick up new route files without a restart during development.
-  if (process.env.NODE_ENV !== "production") router.reload();
+  //
+  // A *new* file is picked up; an *edited* one is not, because import() caches the
+  // module. Use "bun run dev" (bun --watch) for edits — the two are not
+  // interchangeable, and the distinction is not otherwise visible.
+  if (process.env.NODE_ENV !== "production") throttledReload(router);
 
   // 4. Match the route.
   let match = router.match(req);
@@ -1682,10 +1740,10 @@ function printNextSteps(name: string): void {
   log("Next steps:");
   if (name !== ".") log(`  cd ${name}`);
   log("  bun install");
-  log(`  bun link yatta      ${c.dim}# connect to this checkout${c.reset}`);
+  log(`  bun link ${pkgName()}      ${c.dim}# connect to this checkout${c.reset}`);
   log("  bun run dev");
   log("");
-  log(`${c.dim}Reconnect after changing the framework: bun link yatta${c.reset}`);
+  log(`${c.dim}Reconnect after changing the framework: bun link ${pkgName()}${c.reset}`);
 }
 
 /**
@@ -1838,7 +1896,7 @@ function cmdInit(): number {
     fail("The framework did not resolve, so `bun run dev` will fail.");
     log("");
     log(`  ${c.dim}cd ${root}${c.reset}`);
-    log(`  ${c.dim}bun install && bun link yatta${c.reset}`);
+    log(`  ${c.dim}bun install && bun link ${pkgName()}${c.reset}`);
     log("");
     log(`${c.dim}  If that still fails, node_modules/yatta is missing or points`);
     log(`  somewhere that does not contain the framework.${c.reset}`);
@@ -2063,7 +2121,7 @@ function cmdLink(): number {
   log(`${c.bold}In any project that should use it:${c.reset}`);
   log("");
   log(`${c.dim}    cd your-project${c.reset}`);
-  log(`${c.dim}    bun link yatta${c.reset}`);
+  log(`${c.dim}    bun link ${pkgName()}${c.reset}`);
   log("");
   log(`${c.dim}Then import it like a normal dependency:${c.reset}`);
   log(`${c.dim}    import { createDatabase } from "yatta.js/db";${c.reset}`);
@@ -2111,7 +2169,7 @@ function cmdUsage(): number {
   log(`${c.bold}Using it in your own project${c.reset}`);
   log(`  ${c.dim}1.${c.reset} yatta link                 ${c.dim}register this checkout${c.reset}`);
   log(`  ${c.dim}2.${c.reset} cd your-project`);
-  log(`  ${c.dim}3.${c.reset} bun link yatta             ${c.dim}connect it${c.reset}`);
+  log(`  ${c.dim}3.${c.reset} bun link ${pkgName()}            ${c.dim}connect it${c.reset}`);
   log(`  ${c.dim}4.${c.reset} yatta init                  ${c.dim}create yatta/main.ts, backend/, func/${c.reset}`);
   log(`  ${c.dim}5.${c.reset} bun run dev`);
   log("");
@@ -2165,6 +2223,26 @@ function runCapture(cmd: string, args: string[]): string | null {
 
 export async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
+
+  /*
+   * A flag is not an argument.
+   *
+   * `yatta new --help` used to take "--help" as the project name and scaffold a
+   * directory called --help, because the subcommand took rest[0] verbatim. Any command
+   * that takes a path or a name would do the same, and the result is a stray directory
+   * rather than a message.
+   *
+   * -h/--help after a command prints that command's usage; anything else starting with
+   * "-" is refused with the usage, because no command in this CLI takes a flag.
+   */
+  const firstArg = rest[0];
+  if (firstArg === "-h" || firstArg === "--help") {
+    return cmdUsage();
+  }
+  if (firstArg !== undefined && firstArg.startsWith("-")) {
+    fail(`Unknown option "${firstArg}".`);
+    return cmdUsage();
+  }
 
   switch (command) {
     case "new":
