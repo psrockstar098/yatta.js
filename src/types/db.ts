@@ -813,7 +813,27 @@ function compileCondNode(node: CondNode): WhereClause<any> {
  * ```
  */
 export function and(...conds: Condition[]): Condition {
-  return new Condition({ kind: "and", items: conds.map((c) => c.node) });
+  return new Condition({ kind: "and", items: condNodes(conds, "and") });
+}
+
+/**
+ * Extracts the AST nodes, rejecting anything that is not a {@link Condition}.
+ *
+ * Without the check, `and({ age: { gt: 1 } }, …)` — the object form `where` takes —
+ * put `undefined` into the tree and failed later with "undefined is not an object
+ * (evaluating 'node.kind')", which names neither the argument nor the alternative.
+ */
+function condNodes(conds: Condition[], fn: string): CondNode[] {
+  return conds.map((c, i) => {
+    if (!(c instanceof Condition)) {
+      throw new YattaError(
+        `${fn}() argument ${i + 1} is ${c === null ? "null" : typeof c}, not a Condition. ` +
+          `Build conditions from the field proxy inside where: ` +
+          `where((f) => ${fn}(f.age.isGreaterThan(18), f.age.isLessThan(65))).`,
+      );
+    }
+    return c.node;
+  });
 }
 
 /**
@@ -828,7 +848,7 @@ export function and(...conds: Condition[]): Condition {
  * ```
  */
 export function or(...conds: Condition[]): Condition {
-  return new Condition({ kind: "or", items: conds.map((c) => c.node) });
+  return new Condition({ kind: "or", items: condNodes(conds, "or") });
 }
 
 /**
@@ -1121,6 +1141,21 @@ function escapeLike(str: string): string {
 }
 
 /**
+ * Clamps a page or limit to a usable positive integer.
+ *
+ * `Math.max(1, NaN)` is `NaN`, so `{ page: Number(req.query.page) }` — the ordinary
+ * shape when the parameter is absent — carried NaN into the offset and surfaced as
+ * SQLite complaining about a column named NaN. A non-finite value now takes the
+ * documented default, and a fractional one is floored instead of becoming a fractional
+ * OFFSET.
+ */
+function pageCount(value: number | undefined, fallback: number): number {
+  return value === undefined || !Number.isFinite(value)
+    ? fallback
+    : Math.max(1, Math.floor(value));
+}
+
+/**
  * Type-safe CRUD table gateway providing querying, insertions, updates, deletions,
  * aggregations, relational joins, and pagination.
  *
@@ -1134,6 +1169,7 @@ function escapeLike(str: string): string {
  * db.users.updateById(user.id, { name: "Alice Smith" });
  * ```
  */
+
 export class Table<T extends Record<string, any> = Record<string, any>, TInsert extends Record<string, any> = Partial<T>> {
   /** Map of column definitions belonging to this table. */
   readonly columns: Map<string, ColumnDefinition> = new Map();
@@ -1338,11 +1374,11 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     const hasSkip = options.skip !== undefined;
     const limitSql =
       options.take !== undefined
-        ? `LIMIT ${Number(options.take)}`
+        ? `LIMIT ${this.rowCount(options.take, "take", true)}`
         : hasSkip
           ? "LIMIT -1"
           : "";
-    const offsetSql = hasSkip ? `OFFSET ${Number(options.skip)}` : "";
+    const offsetSql = hasSkip ? `OFFSET ${this.rowCount(options.skip, "skip", false)}` : "";
 
     let selectedCols = "*";
     if (options.select) {
@@ -1589,8 +1625,8 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * ```
    */
   paginate<R = T>(options: PaginateOptions<T> = {}): PaginatedResult<R> {
-    const page = Math.max(1, options.page ?? 1);
-    const limit = Math.max(1, options.limit ?? 10);
+    const page = pageCount(options.page, 1);
+    const limit = pageCount(options.limit, 10);
     const skip = (page - 1) * limit;
 
     const total = this.count(options.where);
@@ -1723,6 +1759,30 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
   // ── INTERNAL BUILDERS ────────────────────────────────────────────────────
 
   private buildWhere(where?: WhereClause<T>): { clause: string; params: any[] } {
+    /*
+     * A `where` this function cannot read must not compile to "no filter".
+     *
+     * `Object.keys(fn)` is `[]`, so a function filter fell through the empty-object
+     * branch and every row came back. Measured: `findMany({ where: f => f.age.gt(17) })`
+     * returned all three rows where two matched, and `count` reported 3.
+     *
+     * That is the same failure this function already guards against for operators —
+     * "`{ status: { statuss: 'x' } }` silently returned every row" — arriving through a
+     * different door. It reads as a filter and behaves as its absence, which for a
+     * tenant-scoped query is a data leak rather than a wrong count. It is reachable
+     * without `as any` too, via a value typed `any` at the edge of a request handler.
+     *
+     * Rejected rather than supported: `WhereClause` documents the object form, and the
+     * callback form already has a first-class home in `db.<table>.where(f => …)`.
+     */
+    if (where !== undefined && where !== null && (typeof where !== "object" || Array.isArray(where))) {
+      throw new YattaError(
+        `where for "${this.name}" must be an object filter, got ${Array.isArray(where) ? "an array" : typeof where}. ` +
+          `A filter that cannot be read used to match every row. Use ` +
+          `{ where: { status: "active" } }, or db.${this.name}.where((f) => f.status.isEqualTo("active")).all().`,
+      );
+    }
+
     if (!where || Object.keys(where).length === 0) return { clause: "", params: [] };
 
     const clauses: string[] = [];
@@ -1857,6 +1917,38 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     }
 
     return { clause: clauses.join(" AND "), params };
+  }
+
+  /**
+   * Validates a `take`/`skip` value and renders it for direct interpolation.
+   *
+   * These two are spliced into the SQL text rather than bound, and `Number()` will
+   * happily produce `NaN` from the string "abc". Every other spliced value in this
+   * file — column names, sort directions, filter operators — is checked, and these two
+   * were not, so a typo in a query parameter surfaced as SQLite talking about itself:
+   * `{ skip: "abc" }` gave "no such column: NaN" and `{ skip: "1.7" }` gave "datatype
+   * mismatch" plus the full statement.
+   *
+   * `take: -1` stays legal because it is SQLite's own "no upper bound" and is the idiom
+   * for an unbounded read.
+   */
+  private rowCount(value: unknown, field: string, allowUnlimited: boolean): number {
+    const n = typeof value === "number" ? value : Number(value);
+
+    if (typeof value === "boolean" || value === null || value === "" || !Number.isFinite(n)) {
+      throw new YattaError(`${field} on "${this.name}" must be a finite number, got ${n}.`);
+    }
+
+    if (allowUnlimited && n === -1) return -1;
+
+    if (!Number.isInteger(n) || n < 0) {
+      throw new YattaError(
+        `${field} on "${this.name}" must be an integer of 0 or more` +
+          `${allowUnlimited ? " (or -1 for no limit)" : ""}, got ${n}.`,
+      );
+    }
+
+    return n;
   }
 
   private buildOrderBy(orderBy?: OrderBy<T> | OrderBy<T>[]): string {

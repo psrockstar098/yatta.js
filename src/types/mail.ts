@@ -258,6 +258,27 @@ export interface MailerOptions<TTemplates extends Record<string, any> = Register
   port?: number;
   /** Use TLS/SSL (defaults to true if port is 465). */
   secure?: boolean;
+  /**
+   * Transport timeouts, in milliseconds.
+   *
+   * Nodemailer's own defaults are long — a socket that never answers can hold a
+   * connection open for minutes. That matters because mail is usually sent inline:
+   * a signup that emails a verification link is waiting on the relay, so a black-holed
+   * or half-open relay turns into a request that never completes, and a queue of
+   * workers waiting on the same relay turns into a service that is down.
+   *
+   * Defaults below are deliberately short enough to fail inside a typical request
+   * budget. A relay that cannot be reached in five seconds is not going to be reached
+   * in five minutes either.
+   */
+  timeouts?: {
+    /** Establishing the TCP connection. Default 5000. */
+    connection?: number;
+    /** Waiting for the server's greeting after connecting. Default 5000. */
+    greeting?: number;
+    /** Waiting on any single read or write once connected. Default 10000. */
+    socket?: number;
+  };
   /** SMTP Authentication credentials. */
   auth?: {
     /** Username or API key. */
@@ -1889,6 +1910,8 @@ export class YattaMailer<TTemplates extends Record<string, Record<string, unknow
       const user = this.options.auth?.user ?? process.env.YATTA_MAIL_USER ?? process.env.SMTP_USER;
       const pass = this.options.auth?.pass ?? process.env.YATTA_MAIL_PASS ?? process.env.SMTP_PASS;
 
+      const timeouts = this.options.timeouts;
+
       return nodemailer.createTransport({
         host,
         port: port || 587,
@@ -1897,6 +1920,11 @@ export class YattaMailer<TTemplates extends Record<string, Record<string, unknow
         pool: true,
         maxConnections: this.options.rateLimit?.maxConcurrency ?? 5,
         maxMessages: 100,
+        // Set unconditionally rather than passed through, so an operator who has never
+        // heard of this option still gets a request that finishes.
+        connectionTimeout: timeouts?.connection ?? 5000,
+        greetingTimeout: timeouts?.greeting ?? 5000,
+        socketTimeout: timeouts?.socket ?? 10000,
       });
     })();
 
