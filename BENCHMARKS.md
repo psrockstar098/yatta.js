@@ -1,6 +1,6 @@
 # Yatta Benchmarks
 
-> Last run: `2026-10-08T15:26:18Z` · commit [`bb51202`](https://github.com/psrockstar098/yatta.js/commit/bb512028b61425dd9328d03b47327ae40af34ada) · `ubuntu-latest`, Bun 1.4.2
+> Last run: `2026-10-08T16:48:07Z` · commit [`6f69c1e`](https://github.com/psrockstar098/yatta.js/commit/6f69c1edf1e7305f31d7886fd5c172411a9c33c0) · `ubuntu-latest`, Bun 1.4.2
 >
 > Benchmarks run on every push to `main` and weekly via GitHub Actions.
 > Numbers come from shared CI runners, so treat them as relative — the trend matters more than any single value.
@@ -8,14 +8,14 @@
 ## Headline metrics
 
 ```
-  • 25,000 Tasks Completed in  : 80.7 ms
-  • End-to-End Runtime Task Cost    : 0.0414 ms/op
-  • Peak RSS Memory        : 225.6 MB
-  • RSS Heap Memory             : 92.00 MB
-  • Raw Worker IPC Round-Trip      : 0.0242 ms/op
-  • Scheduler + Graph Overhead     : 0.0172 ms/op
-  • Settled Cooldown RSS   : 75.6 MB (Clean GC release)
-  • V8/JSC Heap Used             : 13.76 MB
+  • 25,000 Tasks Completed in  : 105.8 ms
+  • End-to-End Runtime Task Cost    : 0.0529 ms/op
+  • Peak RSS Memory        : 135.6 MB
+  • RSS Heap Memory             : 77.82 MB
+  • Raw Worker IPC Round-Trip      : 0.0393 ms/op
+  • Scheduler + Graph Overhead     : 0.0136 ms/op
+  • Settled Cooldown RSS   : 88.2 MB (Clean GC release)
+  • V8/JSC Heap Used             : 0.75 MB
   • Worker Fleet Event Loop Lag : 10.14 ms (Zero event-loop freezing ⚡)
 ```
 
@@ -29,13 +29,13 @@ frameworks are within each other's spread, the data does not separate them.
 
 | Framework | Requests/sec | vs Yatta | Spread | p50 | p95 | p99 |
 |-----------|-------------:|---------:|-------:|----:|----:|----:|
-| Yatta     |      62,608 |     1.00x |    12% | 1.52ms | 2.97ms | 3.40ms |
-| Raw Bun   |      71,519 |     1.14x |    13% | 1.29ms | 2.25ms | 2.65ms |
-| Hono      |      70,797 |     1.13x |    13% | 1.35ms | 2.45ms | 2.79ms |
-| Elysia    |      77,977 |     1.25x |     3% | 1.21ms | 2.23ms | 2.92ms |
-| Express   |      27,461 |     0.44x |     6% | 3.29ms | 6.25ms | 7.48ms |
-| Fastify   |      35,287 |     0.56x |    15% | 2.54ms | 5.10ms | 6.41ms |
-| Koa       |      27,277 |     0.44x |    15% | 3.38ms | 6.94ms | 9.08ms |
+| Yatta     |      43,227 |     1.00x |    34% | 3.67ms | 4.90ms | 6.88ms |
+| Raw Bun   |      42,434 |     0.98x |    49% | 2.72ms | 5.92ms | 8.90ms |
+| Hono      |      44,258 |     1.02x |     8% | 2.00ms | 3.65ms | 4.55ms |
+| Elysia    |      48,351 |     1.12x |    23% | 2.16ms | 3.13ms | 4.84ms |
+| Express   |      14,842 |     0.34x |     8% | 7.09ms | 10.98ms | 12.23ms |
+| Fastify   |      20,615 |     0.48x |     4% | 4.52ms | 7.81ms | 8.86ms |
+| Koa       |      15,816 |     0.37x |     7% | 5.78ms | 9.72ms | 11.54ms |
 
 ## Throughput ladder (worker runtime)
 
@@ -43,12 +43,12 @@ Fast-ping tasks through the worker fleet, 10 → 10,000 concurrent:
 
 | Concurrency | Total Time |  Throughput (ops/s)  |  p50 (ms)  |  p95 (ms)  |  p99 (ms)  |  Max (ms)  |
 |------------:|-----------:|---------------------:|-----------:|-----------:|-----------:|-----------:|
-|          10 |     0.8 ms |               13,299 |       0.37 |       0.40 |       0.40 |       0.40 |
-|         100 |     0.6 ms |              154,488 |       0.29 |       0.51 |       0.55 |       0.55 |
-|         500 |     1.6 ms |              314,530 |       0.80 |       1.21 |       1.27 |       1.29 |
-|        1000 |     3.2 ms |              313,232 |       1.62 |       2.42 |       2.49 |       2.52 |
-|        5000 |    18.0 ms |              278,075 |      10.00 |      11.97 |      12.22 |      12.24 |
-|       10000 |    41.0 ms |              243,841 |      23.06 |      33.36 |      33.61 |      33.69 |
+|          10 |     0.9 ms |               11,507 |       0.49 |       0.52 |       0.52 |       0.52 |
+|         100 |     1.5 ms |               66,634 |       0.35 |       1.11 |       1.12 |       1.12 |
+|         500 |     2.4 ms |              206,627 |       1.26 |       1.86 |       1.93 |       1.96 |
+|        1000 |     4.3 ms |              234,397 |       2.13 |       3.38 |       3.52 |       3.56 |
+|        5000 |    30.8 ms |              162,261 |      18.40 |      23.19 |      23.25 |      23.27 |
+|       10000 |    49.9 ms |              200,207 |      25.36 |      39.66 |      39.96 |      40.00 |
 
 ## Real-world workloads
 
@@ -56,23 +56,23 @@ JSON payload transformation and micro-compute tasks:
 
 | Concurrency | Duration  | Throughput (ops/s) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Max (ms) |
 |------------:|----------:|-------------------:|---------:|---------:|---------:|-----------:|---------:|
-|        1000 |    7.1 ms |            141,816 |     2.84 |     4.06 |     4.91 |       5.23 |     5.23 |
-|        5000 |   18.8 ms |            266,550 |     9.43 |    12.37 |    12.87 |      12.90 |    12.90 |
-|       10000 |   37.5 ms |            266,716 |    19.13 |    28.53 |    29.05 |      29.08 |    29.08 |
-|       25000 |   84.8 ms |            294,824 |    41.37 |    61.24 |    63.94 |      64.43 |    64.46 |
-|       50000 |  133.9 ms |            373,323 |    67.32 |   101.94 |   106.01 |     106.47 |   106.48 |
+|        1000 |    8.0 ms |            125,671 |     3.62 |     5.13 |     5.94 |       6.26 |     6.26 |
+|        5000 |   20.8 ms |            240,379 |    10.41 |    13.07 |    13.58 |      13.59 |    13.59 |
+|       10000 |   43.1 ms |            232,135 |    21.38 |    31.87 |    34.10 |      34.12 |    34.12 |
+|       25000 |  107.9 ms |            231,646 |    56.07 |    83.13 |    86.21 |      86.30 |    86.32 |
+|       50000 |  194.6 ms |            256,893 |    98.94 |   152.32 |   164.03 |     164.56 |   164.57 |
 | Concurrency | Duration  | Throughput (ops/s) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Max (ms) |
 |------------:|----------:|-------------------:|---------:|---------:|---------:|-----------:|---------:|
-|        1000 |   11.3 ms |             88,697 |     5.50 |     8.02 |     9.18 |       9.55 |     9.55 |
-|        5000 |   45.7 ms |            109,310 |    23.49 |    35.44 |    36.48 |      36.55 |    36.55 |
-|       10000 |  100.2 ms |             99,821 |    52.32 |    84.97 |    88.59 |      88.68 |    88.69 |
-|       25000 |  250.3 ms |             99,898 |   135.17 |   220.00 |   231.19 |     231.66 |   231.70 |
-|       50000 |  416.0 ms |            120,198 |   222.62 |   346.14 |   380.15 |     381.31 |   381.39 |
+|        1000 |   13.5 ms |             73,967 |     6.94 |    10.88 |    11.99 |      12.04 |    12.04 |
+|        5000 |   50.4 ms |             99,254 |    24.47 |    39.18 |    40.18 |      40.24 |    40.25 |
+|       10000 |   99.1 ms |            100,861 |    52.33 |    83.72 |    85.79 |      85.89 |    85.90 |
+|       25000 |  243.2 ms |            102,806 |   131.47 |   214.80 |   225.15 |     225.62 |   225.64 |
+|       50000 |  447.3 ms |            111,781 |   242.16 |   372.18 |   407.61 |     408.59 |   408.67 |
 | Concurrency | Duration  | Throughput (ops/s) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Max (ms) |
 |------------:|----------:|-------------------:|---------:|---------:|---------:|-----------:|---------:|
-|        1000 |   26.6 ms |             37,601 |    15.01 |    23.10 |    25.20 |      25.45 |    25.45 |
-|        5000 |  100.4 ms |             49,799 |    47.48 |    88.75 |    97.33 |      98.58 |    98.68 |
-|       10000 |  191.8 ms |             52,126 |    93.88 |   168.25 |   184.77 |     188.20 |   188.45 |
+|        1000 |   30.9 ms |             32,388 |    16.38 |    27.25 |    29.55 |      29.88 |    29.88 |
+|        5000 |  131.2 ms |             38,117 |    69.07 |   116.47 |   127.36 |     128.55 |   128.69 |
+|       10000 |  271.4 ms |             36,847 |   129.22 |   238.28 |   263.00 |     266.43 |   266.87 |
 
 ## Full logs
 
@@ -94,26 +94,26 @@ JSON payload transformation and micro-compute tasks:
 [ModuleGraph] Bun.ModuleGraph is unavailable: graphs share one module cache and per-tenant globals/env are NOT applied. Not isolated.
 [ModuleGraph] Bun.ModuleGraph is unavailable: graphs share one module cache and per-tenant globals/env are NOT applied. Not isolated.
 [1] Layer Overhead Decomposition (Micro-benchmarking 2,000 calls each):
-  • Raw Worker IPC Round-Trip      : 0.0242 ms/op
-  • End-to-End Runtime Task Cost    : 0.0414 ms/op
-  • Scheduler + Graph Overhead     : 0.0172 ms/op
+  • Raw Worker IPC Round-Trip      : 0.0393 ms/op
+  • End-to-End Runtime Task Cost    : 0.0529 ms/op
+  • Scheduler + Graph Overhead     : 0.0136 ms/op
 
 [2] Concurrency Ladder Stress Test (Zero-delay fastPing throughput):
 | Concurrency | Total Time |  Throughput (ops/s)  |  p50 (ms)  |  p95 (ms)  |  p99 (ms)  |  Max (ms)  |
 |------------:|-----------:|---------------------:|-----------:|-----------:|-----------:|-----------:|
-|          10 |     0.8 ms |               13,299 |       0.37 |       0.40 |       0.40 |       0.40 |
-|         100 |     0.6 ms |              154,488 |       0.29 |       0.51 |       0.55 |       0.55 |
-|         500 |     1.6 ms |              314,530 |       0.80 |       1.21 |       1.27 |       1.29 |
-|        1000 |     3.2 ms |              313,232 |       1.62 |       2.42 |       2.49 |       2.52 |
-|        5000 |    18.0 ms |              278,075 |      10.00 |      11.97 |      12.22 |      12.24 |
-|       10000 |    41.0 ms |              243,841 |      23.06 |      33.36 |      33.61 |      33.69 |
+|          10 |     0.9 ms |               11,507 |       0.49 |       0.52 |       0.52 |       0.52 |
+|         100 |     1.5 ms |               66,634 |       0.35 |       1.11 |       1.12 |       1.12 |
+|         500 |     2.4 ms |              206,627 |       1.26 |       1.86 |       1.93 |       1.96 |
+|        1000 |     4.3 ms |              234,397 |       2.13 |       3.38 |       3.52 |       3.56 |
+|        5000 |    30.8 ms |              162,261 |      18.40 |      23.19 |      23.25 |      23.27 |
+|       10000 |    49.9 ms |              200,207 |      25.36 |      39.66 |      39.96 |      40.00 |
 
 [3] Event Loop Latency Under Heavy Compute Load...
   • Worker Fleet Event Loop Lag : 10.14 ms (Zero event-loop freezing ⚡)
 
 [4] Memory Footprint Post 10,000-Request Burst:
-  • RSS Heap Memory             : 92.00 MB
-  • V8/JSC Heap Used             : 13.76 MB
+  • RSS Heap Memory             : 77.82 MB
+  • V8/JSC Heap Used             : 0.75 MB
 
 =======================================================
    ✅ BENCHMARK COMPLETE
@@ -139,27 +139,27 @@ JSON payload transformation and micro-compute tasks:
   • I/O-Bound Workers : 1 (smol: false)
   • Total OS Threads  : 2
 [ModuleGraph] Bun.ModuleGraph is unavailable: graphs share one module cache and per-tenant globals/env are NOT applied. Not isolated.
-| 1 CPU + 1 IO  |       2 |   39.5 ms |            253,095 |    17.98 |    30.02 |    30.35 |    30.37 |
+| 1 CPU + 1 IO  |       2 |   63.3 ms |            157,914 |    28.31 |    45.81 |    48.57 |    48.89 |
 [Yatta Runtime] Fleet active on 4 CPU cores:
   • CPU-Bound Workers : 1
   • I/O-Bound Workers : 2 (smol: false)
   • Total OS Threads  : 3
 [ModuleGraph] Bun.ModuleGraph is unavailable: graphs share one module cache and per-tenant globals/env are NOT applied. Not isolated.
 [ModuleGraph] Bun.ModuleGraph is unavailable: graphs share one module cache and per-tenant globals/env are NOT applied. Not isolated.
-| 1 CPU + 2 IO  |       3 |   36.4 ms |            274,924 |    19.86 |    25.33 |    25.40 |    25.41 |
+| 1 CPU + 2 IO  |       3 |   43.4 ms |            230,263 |    22.34 |    33.54 |    33.68 |    33.70 |
 [Yatta Runtime] Fleet active on 4 CPU cores:
   • CPU-Bound Workers : 2
   • I/O-Bound Workers : 1 (smol: false)
   • Total OS Threads  : 3
 [ModuleGraph] Bun.ModuleGraph is unavailable: graphs share one module cache and per-tenant globals/env are NOT applied. Not isolated.
-| 2 CPU + 1 IO  |       3 |   29.4 ms |            340,259 |    14.01 |    21.89 |    22.54 |    22.97 |
+| 2 CPU + 1 IO  |       3 |   41.8 ms |            239,467 |    22.38 |    32.57 |    33.67 |    33.94 |
 [Yatta Runtime] Fleet active on 4 CPU cores:
   • CPU-Bound Workers : 2
   • I/O-Bound Workers : 2 (smol: false)
   • Total OS Threads  : 4
 [ModuleGraph] Bun.ModuleGraph is unavailable: graphs share one module cache and per-tenant globals/env are NOT applied. Not isolated.
 [ModuleGraph] Bun.ModuleGraph is unavailable: graphs share one module cache and per-tenant globals/env are NOT applied. Not isolated.
-| 2 CPU + 2 IO  |       4 |   29.8 ms |            335,853 |    14.55 |    22.15 |    22.38 |    22.41 |
+| 2 CPU + 2 IO  |       4 |   39.3 ms |            254,727 |    18.01 |    29.76 |    30.32 |    30.42 |
 
 [2] High-Stress Deep Tail Test (25,000 Tasks):
 [Yatta Runtime] Fleet active on 4 CPU cores:
@@ -168,10 +168,10 @@ JSON payload transformation and micro-compute tasks:
   • Total OS Threads  : 4
 [ModuleGraph] Bun.ModuleGraph is unavailable: graphs share one module cache and per-tenant globals/env are NOT applied. Not isolated.
 [ModuleGraph] Bun.ModuleGraph is unavailable: graphs share one module cache and per-tenant globals/env are NOT applied. Not isolated.
-  • 25,000 Tasks Completed in  : 80.7 ms
-  • Peak Throughput Rate       : 309,622 ops/sec
-  • Latency Distribution       : p50: 36.69ms | p90: 61.46ms | p99: 63.15ms | p99.9: 63.78ms | Max: 63.79ms
-  • Memory (RSS)               : Baseline: 101.8 MB | Peak: 124.0 MB | Cooldown: 83.6 MB
+  • 25,000 Tasks Completed in  : 105.8 ms
+  • Peak Throughput Rate       : 236,362 ops/sec
+  • Latency Distribution       : p50: 54.64ms | p90: 86.90ms | p99: 87.63ms | p99.9: 87.66ms | Max: 87.67ms
+  • Memory (RSS)               : Baseline: 107.6 MB | Peak: 129.4 MB | Cooldown: 102.8 MB
 
 =======================================================
    ✅ TUNING BENCHMARK COMPLETE
@@ -200,31 +200,31 @@ JSON payload transformation and micro-compute tasks:
 📊 [WORKLOAD 1] Zero-Delay FastPing (IPC & Scheduler Baseline):
 | Concurrency | Duration  | Throughput (ops/s) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Max (ms) |
 |------------:|----------:|-------------------:|---------:|---------:|---------:|-----------:|---------:|
-|        1000 |    7.1 ms |            141,816 |     2.84 |     4.06 |     4.91 |       5.23 |     5.23 |
-|        5000 |   18.8 ms |            266,550 |     9.43 |    12.37 |    12.87 |      12.90 |    12.90 |
-|       10000 |   37.5 ms |            266,716 |    19.13 |    28.53 |    29.05 |      29.08 |    29.08 |
-|       25000 |   84.8 ms |            294,824 |    41.37 |    61.24 |    63.94 |      64.43 |    64.46 |
-|       50000 |  133.9 ms |            373,323 |    67.32 |   101.94 |   106.01 |     106.47 |   106.48 |
+|        1000 |    8.0 ms |            125,671 |     3.62 |     5.13 |     5.94 |       6.26 |     6.26 |
+|        5000 |   20.8 ms |            240,379 |    10.41 |    13.07 |    13.58 |      13.59 |    13.59 |
+|       10000 |   43.1 ms |            232,135 |    21.38 |    31.87 |    34.10 |      34.12 |    34.12 |
+|       25000 |  107.9 ms |            231,646 |    56.07 |    83.13 |    86.21 |      86.30 |    86.32 |
+|       50000 |  194.6 ms |            256,893 |    98.94 |   152.32 |   164.03 |     164.56 |   164.57 |
 
 📦 [WORKLOAD 2] Real-World 2KB JSON Payload Transformation:
 | Concurrency | Duration  | Throughput (ops/s) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Max (ms) |
 |------------:|----------:|-------------------:|---------:|---------:|---------:|-----------:|---------:|
-|        1000 |   11.3 ms |             88,697 |     5.50 |     8.02 |     9.18 |       9.55 |     9.55 |
-|        5000 |   45.7 ms |            109,310 |    23.49 |    35.44 |    36.48 |      36.55 |    36.55 |
-|       10000 |  100.2 ms |             99,821 |    52.32 |    84.97 |    88.59 |      88.68 |    88.69 |
-|       25000 |  250.3 ms |             99,898 |   135.17 |   220.00 |   231.19 |     231.66 |   231.70 |
-|       50000 |  416.0 ms |            120,198 |   222.62 |   346.14 |   380.15 |     381.31 |   381.39 |
+|        1000 |   13.5 ms |             73,967 |     6.94 |    10.88 |    11.99 |      12.04 |    12.04 |
+|        5000 |   50.4 ms |             99,254 |    24.47 |    39.18 |    40.18 |      40.24 |    40.25 |
+|       10000 |   99.1 ms |            100,861 |    52.33 |    83.72 |    85.79 |      85.89 |    85.90 |
+|       25000 |  243.2 ms |            102,806 |   131.47 |   214.80 |   225.15 |     225.62 |   225.64 |
+|       50000 |  447.3 ms |            111,781 |   242.16 |   372.18 |   407.61 |     408.59 |   408.67 |
 
 ⚡ [WORKLOAD 3] Micro-Compute Tasks (CPU Pool Scheduling):
 | Concurrency | Duration  | Throughput (ops/s) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Max (ms) |
 |------------:|----------:|-------------------:|---------:|---------:|---------:|-----------:|---------:|
-|        1000 |   26.6 ms |             37,601 |    15.01 |    23.10 |    25.20 |      25.45 |    25.45 |
-|        5000 |  100.4 ms |             49,799 |    47.48 |    88.75 |    97.33 |      98.58 |    98.68 |
-|       10000 |  191.8 ms |             52,126 |    93.88 |   168.25 |   184.77 |     188.20 |   188.45 |
+|        1000 |   30.9 ms |             32,388 |    16.38 |    27.25 |    29.55 |      29.88 |    29.88 |
+|        5000 |  131.2 ms |             38,117 |    69.07 |   116.47 |   127.36 |     128.55 |   128.69 |
+|       10000 |  271.4 ms |             36,847 |   129.22 |   238.28 |   263.00 |     266.43 |   266.87 |
 
 📈 Memory Footprint (Post 50,000-Task Burst):
-  • Peak RSS Memory        : 225.6 MB
-  • Settled Cooldown RSS   : 75.6 MB (Clean GC release)
+  • Peak RSS Memory        : 135.6 MB
+  • Settled Cooldown RSS   : 88.2 MB (Clean GC release)
 
 =========================================================================
    ✅ COMPREHENSIVE WORKLOAD BENCHMARK COMPLETE
@@ -248,16 +248,19 @@ Method: one process per framework, 3 repetitions each, median reported
 
 | Framework | Requests/sec | vs Yatta | Spread | p50 | p95 | p99 |
 |-----------|-------------:|---------:|-------:|----:|----:|----:|
-| Yatta     |      62,608 |     1.00x |    12% | 1.52ms | 2.97ms | 3.40ms |
-| Raw Bun   |      71,519 |     1.14x |    13% | 1.29ms | 2.25ms | 2.65ms |
-| Hono      |      70,797 |     1.13x |    13% | 1.35ms | 2.45ms | 2.79ms |
-| Elysia    |      77,977 |     1.25x |     3% | 1.21ms | 2.23ms | 2.92ms |
-| Express   |      27,461 |     0.44x |     6% | 3.29ms | 6.25ms | 7.48ms |
-| Fastify   |      35,287 |     0.56x |    15% | 2.54ms | 5.10ms | 6.41ms |
-| Koa       |      27,277 |     0.44x |    15% | 3.38ms | 6.94ms | 9.08ms |
+| Yatta     |      43,227 |     1.00x |    34% | 3.67ms | 4.90ms | 6.88ms |
+| Raw Bun   |      42,434 |     0.98x |    49% | 2.72ms | 5.92ms | 8.90ms |
+| Hono      |      44,258 |     1.02x |     8% | 2.00ms | 3.65ms | 4.55ms |
+| Elysia    |      48,351 |     1.12x |    23% | 2.16ms | 3.13ms | 4.84ms |
+| Express   |      14,842 |     0.34x |     8% | 7.09ms | 10.98ms | 12.23ms |
+| Fastify   |      20,615 |     0.48x |     4% | 4.52ms | 7.81ms | 8.86ms |
+| Koa       |      15,816 |     0.37x |     7% | 5.78ms | 9.72ms | 11.54ms |
 
-  Yatta dispatch adds about 2.0µs per request over a
+  Yatta dispatch adds about -0.4µs per request over a
   handler that returns a static Response. That is the whole cost of routing.
+
+  Note: Yatta's own spread is 34%, so differences smaller
+  than that are not resolved by this benchmark. Read the spread column.
 
   Wrote /tmp/bench/comparison.json
 
