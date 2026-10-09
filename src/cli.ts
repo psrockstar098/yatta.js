@@ -1849,7 +1849,9 @@ function cmdInit(): number {
 
   // Wire the existing project up: scripts, entrypoint, and the dependency.
   // Nothing here should require the developer to edit anything by hand.
-  const pkgResult = wireUpProjectPackage(root);
+  // A registered local checkout can supply the package on its own, so the dependency
+  // is only declared when there is no checkout to link against.
+  const pkgResult = wireUpProjectPackage(root, isGloballyLinked());
 
   if (pkgResult.created) ok("Created package.json");
   if (pkgResult.devUpdated) ok('"dev" script → bun --watch yatta/main.ts');
@@ -1866,22 +1868,56 @@ function cmdInit(): number {
     ok("Patched tsconfig.json (added DOM lib + undici-types alias)");
   }
 
-  // Install and connect the dependency. Leaving this to the developer meant a
-  // bare `yatta init && bun run dev` failed with "Cannot find module
-  // 'yatta/runtime'", because the dependency was declared but never installed.
+  /*
+   * Connect the framework *before* installing, and prefer the local checkout.
+   *
+   * Two bugs met here.
+   *
+   * `bun link` was called with a hardcoded "yatta" while the package is `yatta.js`, so
+   * it created node_modules/yatta and the project still could not resolve anything.
+   * The printed instructions had been corrected; the call had not.
+   *
+   * And the order was wrong. `bun install` ran first, against a `"yatta.js": "*"`
+   * dependency — which does not exist on the registry (npm returns 404), so install
+   * failed, and the dependency stayed in package.json. Every later `bun install` in
+   * that project failed too, permanently, for a package that is never going to
+   * resolve from there.
+   *
+   * `bun link <name>` creates node_modules/<name> without the package being a declared
+   * dependency, so linking first means there is nothing unresolvable left to install.
+   */
+  step("Connecting the framework…");
+  let linked = false;
+  if (isGloballyLinked() && runQuiet("bun", ["link", pkgName()], root) === 0) {
+    linked = true;
+    ok(`Connected to your local Yatta checkout (${pkgName()})`);
+  } else if (addFallbackDependency(root)) {
+    // Nothing to link against, so declare it and let the registry decide.
+    log(`${c.dim}    Added "${pkgName()}" to dependencies — no local checkout found.${c.reset}`);
+  }
+
   step("Installing dependencies…");
   const installed = runQuiet("bun", ["install"], root) === 0;
   if (installed) ok("Dependencies installed");
-  else warn("`bun install` failed — run it manually before starting.");
-
-  // Prefer a locally linked checkout over the published package, so edits to
-  // the framework show up here immediately.
-  if (isGloballyLinked()) {
-    if (runQuiet("bun", ["link", "yatta"], root) === 0) {
-      ok("Connected to your local Yatta checkout");
-    } else {
-      warn("Could not link the local checkout — using the installed package.");
-    }
+  else if (linked) {
+    /*
+     * The link is in place, so a failed install is about the project's *other*
+     * dependencies. Nothing to undo here.
+     */
+    warn("`bun install` failed — run it manually. The Yatta link is already in place.");
+  } else {
+    /*
+     * No link, and the registry could not resolve the package either. Take the entry
+     * back out rather than leaving the project permanently uninstallable — the failure
+     * is reported either way, and a package.json that cannot install is worse than a
+     * message saying what to do about it.
+     */
+    removeDependency(root, pkgName());
+    warn("`bun install` could not resolve the framework, so it was left out of");
+    warn("dependencies — keeping it there would make every later install fail.");
+    warn("");
+    warn("  Run `yatta link` in the framework checkout, then:");
+    warn(`    bun link ${pkgName()}`);
   }
 
   /*
@@ -1898,7 +1934,7 @@ function cmdInit(): number {
     log(`  ${c.dim}cd ${root}${c.reset}`);
     log(`  ${c.dim}bun install && bun link ${pkgName()}${c.reset}`);
     log("");
-    log(`${c.dim}  If that still fails, node_modules/yatta is missing or points`);
+    log(`${c.dim}  If that still fails, node_modules/${pkgName()} is missing or points`);
     log(`  somewhere that does not contain the framework.${c.reset}`);
     log("");
     return 1;
@@ -2035,7 +2071,51 @@ function ensureTsconfigCompatible(root: string): boolean {
  * Also ensures `yatta` is listed as a dependency so `npm install yatta`
  * followed by `yatta init` is all that is required.
  */
-function wireUpProjectPackage(root: string): {
+/**
+ * Declares the framework as a dependency, and reports whether it did.
+ *
+ * Only reached when there is no local checkout to link. On its own the entry can still
+ * be wrong — the package is not published, so the install that follows fails and the
+ * entry has to be taken back out again, or the project is permanently uninstallable.
+ */
+function addFallbackDependency(root: string): boolean {
+  const pkgPath = join(root, "package.json");
+  try {
+    const json = JSON.parse(readFileSync(pkgPath, "utf8"));
+    const deps = { ...(json.dependencies ?? {}) };
+    if (deps[pkgName()]) return true;
+
+    deps[pkgName()] = "*";
+    json.dependencies = deps;
+    writeFileSync(pkgPath, `${JSON.stringify(json, null, 2)}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Removes a dependency this command added and that did not install.
+ *
+ * Leaving an unresolvable entry in package.json is the worse outcome: the project looks
+ * wired up, and every future `bun install` fails for a reason nobody will connect back
+ * to `yatta init`.
+ */
+function removeDependency(root: string, name: string): void {
+  const pkgPath = join(root, "package.json");
+  try {
+    const json = JSON.parse(readFileSync(pkgPath, "utf8"));
+    if (!json.dependencies?.[name]) return;
+
+    delete json.dependencies[name];
+    if (Object.keys(json.dependencies).length === 0) delete json.dependencies;
+    writeFileSync(pkgPath, `${JSON.stringify(json, null, 2)}\n`);
+  } catch {
+    // Nothing more to do; the failure is already reported.
+  }
+}
+
+function wireUpProjectPackage(root: string, skipDependency = false): {
   created: boolean;
   devUpdated: boolean;
   startUpdated: boolean;
@@ -2097,11 +2177,23 @@ function wireUpProjectPackage(root: string): {
     result.moduleUpdated = true;
   }
 
+  /*
+   * The dependency is a fallback, and only added when nothing else will provide it.
+   *
+   * It used to be added unconditionally, as `"yatta.js": "*"`. That name is not on the
+   * registry — `bun install` answered 404 — so the very first install failed, and the
+   * entry stayed in package.json afterwards, so every subsequent one failed too. The
+   * project was left permanently uninstallable for a package that could only ever come
+   * from a link.
+   *
+   * `skipDependency` is set by the caller when it has already linked this checkout, or
+   * when it is about to try.
+   */
   const deps = { ...(json.dependencies ?? {}) };
-  if (!deps["yatta.js"]) {
-    // Left as a normal range: `bun add yatta.js` / `npm i yatta.js` fills in the
-    // version, and this keeps the file valid in the meantime.
-    deps["yatta.js"] = "*";
+  if (!skipDependency && !deps[pkgName()]) {
+    // Left as a normal range: `bun add yatta.js` fills in the version when it is
+    // published, and this keeps the file valid until then.
+    deps[pkgName()] = "*";
     json.dependencies = deps;
     result.dependencyAdded = true;
   }

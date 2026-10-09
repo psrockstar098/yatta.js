@@ -172,3 +172,90 @@ describe("a scaffolded project compiles", () => {
     expect(existsSync(marker)).toBe(true);
   });
 });
+
+describe("yatta init in an existing project", () => {
+  /*
+   * The path a `bun init` project takes, which is the one most projects start from.
+   *
+   * Two bugs lived here and neither was visible from the framework's own test suite.
+   *
+   * `yatta init` added `"yatta.js": "*"` to dependencies, and that name is not on the
+   * registry — npm answers 404 — so `bun install` failed. The entry stayed in
+   * package.json, so every later install failed too, permanently.
+   *
+   * And the `bun link` call was made with a hardcoded "yatta" while the package is
+   * `yatta.js`, so it created node_modules/yatta and resolved nothing. The printed
+   * instructions had been corrected; the call had not been.
+   */
+  let initDir: string;
+  let initOutput = "";
+  let initExit = 0;
+
+  beforeAll(() => {
+    initDir = mkdtempSync(join(tmpdir(), "yatta-init-"));
+    execFileSync("bun", ["init", "-y"], { cwd: initDir, encoding: "utf8", timeout: 120_000 });
+
+    /*
+     * Captured rather than allowed to throw. `yatta init` reports a non-zero exit when
+     * the framework does not resolve — which is exactly the bug — and letting that
+     * abort the suite means every assertion below is skipped instead of naming what is
+     * wrong. The exit code is asserted on its own.
+     */
+    try {
+      initOutput = run(["init"], initDir);
+    } catch (err) {
+      const e = err as { stdout?: string; stderr?: string; status?: number };
+      initOutput = `${e.stdout ?? ""}${e.stderr ?? ""}`;
+      initExit = e.status ?? 1;
+    }
+  }, 300_000);
+
+  afterAll(() => {
+    if (initDir) rmSync(initDir, { recursive: true, force: true });
+  });
+
+  it("reports success", () => {
+    // The old failure printed "The framework did not resolve, so `bun run dev` will
+    // fail" and exited 1, which was accurate and still left a broken project behind.
+    expect(initOutput).not.toContain("did not resolve");
+    expect(initExit).toBe(0);
+  });
+
+  it("leaves a package.json that installs", () => {
+    // The user's exact failure: `bun install` answering
+    // "error: GET https://registry.npmjs.org/yatta.js - 404".
+    const out = execFileSync("bun", ["install"], { cwd: initDir, encoding: "utf8", timeout: 120_000 });
+    expect(out).not.toContain("404");
+  }, 180_000);
+
+  it("declares no dependency that the registry cannot resolve", () => {
+    const pkg = JSON.parse(readFileSync(join(initDir, "package.json"), "utf8"));
+    const deps = Object.keys(pkg.dependencies ?? {});
+    const name = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).name;
+
+    /*
+     * Either there is no dependency (a local link supplies the package, which is the
+     * normal case while developing against a checkout), or it is the real package name
+     * — never a bare "yatta" that the templates do not import.
+     */
+    expect(deps).not.toContain("yatta");
+    if (deps.includes(name)) expect(deps.filter((d) => d !== name)).toEqual([]);
+  });
+
+  it("resolves the framework after init", () => {
+    expect(existsSync(join(initDir, "node_modules", "yatta.js"))).toBe(true);
+    expect(existsSync(join(initDir, "yatta", "main.ts"))).toBe(true);
+  });
+
+  it("typechecks after init", () => {
+    expect(typecheck(initDir).trim()).toBe("");
+  }, 300_000);
+
+  it("sets the entrypoint and the scripts", () => {
+    const pkg = JSON.parse(readFileSync(join(initDir, "package.json"), "utf8"));
+
+    expect(pkg.module).toBe("yatta/main.ts");
+    expect(pkg.scripts.dev).toContain("yatta/main.ts");
+    expect(pkg.scripts.start).toContain("yatta/main.ts");
+  });
+});

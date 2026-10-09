@@ -6,12 +6,6 @@ out
 dist
 *.tgz
 
-Database
-storage
-AGENTS.md
-CLAUDE.md
-STRATEGY_REVIEW_TAKEAWAYS.md
-
 # code coverage
 coverage
 *.lcov
@@ -38,6 +32,3 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
-
-
-

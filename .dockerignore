@@ -7,6 +7,11 @@ coverage
 # Runtime data — mounted as a volume in production, never baked into the image.
 Database
 storage/uploads
+Database
+storage
+AGENTS.md
+CLAUDE.md
+STRATEGY_REVIEW_TAKEAWAYS.md
 
 # Local env files
 .env

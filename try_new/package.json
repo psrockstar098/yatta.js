@@ -1,0 +1,19 @@
+{
+  "name": "try_new",
+  "module": "yatta/main.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "scripts": {
+    "dev": "bun --watch yatta/main.ts",
+    "start": "bun yatta/main.ts"
+  },
+  "dependencies": {
+    "yatta.js": "*"
+  }
+}
