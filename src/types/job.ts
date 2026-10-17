@@ -1301,13 +1301,22 @@ export class SQLiteJobStore implements JobStore {
 
   /** Returns a running job to queued without consuming an attempt. */
   async release(id: string, workerId?: string): Promise<boolean> {
+    /*
+     * `state = 'running'` in both branches used to be missing: without a `workerId` the
+     * only guard was `? IS NULL`, which matched any state, so `release(id)` on a
+     * *completed* job moved it back to queued with `run_at` still in the past, and its
+     * work — already done — ran a second time on the next claim. A dead job came back
+     * without `replayDead`'s attempt reset or error cleanup. Releasing a job that is not
+     * running serves no documented purpose: queued/delayed jobs are dequeueable anyway.
+     */
     const res = this.db
       .query(
         `
       UPDATE "_yatta_jobs"
       SET state = 'queued', locked_by = NULL, lock_expires_at = NULL, updated_at = ?
       WHERE id = ?
-        AND (? IS NULL OR (state = 'running' AND locked_by = ?))
+        AND state = 'running'
+        AND (? IS NULL OR locked_by = ?)
     `,
       )
       .run(Date.now(), id, workerId ?? null, workerId ?? null);
@@ -1639,8 +1648,13 @@ export class MemoryJobStore implements JobStore {
 
   /** Returns a running job to queued in memory without consuming an attempt. */
   async release(id: string, workerId?: string): Promise<boolean> {
+    /*
+     * The running-state check was missing: `ownsLease` alone treats a `workerId`-less
+     * call as a trusted admin for *any* state — right for `complete`/`fail`, wrong here,
+     * where it resurrected completed jobs back into the queue and re-ran finished work.
+     */
     const j = this.jobs.get(id);
-    if (!j || !ownsLease(j, workerId)) return false;
+    if (!j || j.state !== "running" || !ownsLease(j, workerId)) return false;
 
     j.state = "queued";
     j.lease = undefined;

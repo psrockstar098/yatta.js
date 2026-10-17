@@ -1,5 +1,5 @@
 {
-  "name": "try_new",
+  "name": "playground",
   "module": "yatta/main.ts",
   "type": "module",
   "private": true,
@@ -12,8 +12,5 @@
   "scripts": {
     "dev": "bun --watch yatta/main.ts",
     "start": "bun yatta/main.ts"
-  },
-  "dependencies": {
-    "yatta.js": "*"
   }
 }
