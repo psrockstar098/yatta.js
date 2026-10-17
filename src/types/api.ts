@@ -1989,6 +1989,15 @@ export class API<TParams extends RouteParams = RouteParams> {
   rateLimit(options: {
     maxRequests: number;
     windowMs: number;
+    /**
+     * Cap on distinct keys that may hold their own bucket.
+     *
+     * Not performance tuning: on a direct-to-internet deployment the default key is
+     * `X-Forwarded-For`, which any client can forge, so new keys are minted by the
+     * attacker. Past this cap new keys fall into one shared bucket instead. Defaults
+     * to 100,000; must be a finite number of at least 1.
+     */
+    maxKeys?: number;
     getKey?: (ctx: Context<TParams>) => string;
   }): this {
     const buckets = new Map<string, { count: number; resetAt: number }>();
@@ -2031,9 +2040,57 @@ export class API<TParams extends RouteParams = RouteParams> {
       return "global";
     };
 
+    // The shared bucket that new keys fall into when the key cap is reached. A real
+    // deployment's X-Forwarded-For list is under the operator's control; on a
+    // direct-to-internet one, every forged header value is a new key, and without a
+    // cap every new key is a new bucket — map growth an attacker steers directly,
+    // plus, once the old `size > 10000` cleanup triggered with mostly-live buckets,
+    // an O(n) scan per request that deleted nothing. The fallback keeps the map
+    // bounded and makes further forged keys share the budget they should have had.
+    const GLOBAL_KEY = "global";
+    const maxKeys = Number(options.maxKeys ?? 100_000);
+    if (!Number.isFinite(maxKeys) || maxKeys < 1) {
+      throw new TypeError(
+        `rateLimit(): maxKeys must be a finite number of at least 1, got ${String(options.maxKeys)}. ` +
+          "The key cap bounds check-store growth when the key header is attacker-controlled, so an unset value must not disable it.",
+      );
+    }
+
+    // Sweeping by time rather than by size: size-gated cleanup only runs when the
+    // attack has already grown the map, and then can't help for live buckets.
+    let lastSweep = 0;
+    const sweepExpired = (now: number): number => {
+      let removed = 0;
+      for (const [key, bucket] of buckets) {
+        if (now > bucket.resetAt) {
+          buckets.delete(key);
+          removed++;
+        }
+      }
+      lastSweep = now;
+      return removed;
+    };
+
     this.use(async (ctx, next) => {
-      const key = getKey ? getKey(ctx) : defaultGetKey(ctx);
       const now = Date.now();
+
+      // Housekeeping rides the request path (per engine convention: no timers to
+      // clean up, no work after shutdown). One scan per window halves the memory a
+      // completed window holds; the size gate below is for caps, not sweeps.
+      if (now - lastSweep >= windowMs) {
+        sweepExpired(now);
+      }
+
+      let key = getKey ? getKey(ctx) : defaultGetKey(ctx);
+
+      if (!buckets.has(key)) {
+        if (buckets.size >= maxKeys) {
+          // A window boundary has passed since the cap: expired keys can be swept,
+          // and if that frees a slot the key keeps its own bucket.
+          if (now - lastSweep >= windowMs) sweepExpired(now);
+          if (buckets.size >= maxKeys) key = GLOBAL_KEY;
+        }
+      }
 
       let bucket = buckets.get(key);
       if (!bucket || now > bucket.resetAt) {
@@ -2057,13 +2114,9 @@ export class API<TParams extends RouteParams = RouteParams> {
         );
       }
 
-      // Cleanup old buckets periodically (every 1000 requests)
-      if (buckets.size > 10000) {
-        for (const [k, b] of buckets) {
-          if (now > b.resetAt) buckets.delete(k);
-        }
-      }
-
+      // The map is bounded by the key cap now; this removes the old size-triggered
+      // full scan, which ran per request past 10k entries even when nothing was
+      // expirable. Expired buckets still get reclaimed, one sweep per window.
       return next();
     });
 

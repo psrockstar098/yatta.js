@@ -61,7 +61,18 @@ beforeAll(async () => {
     throw new Error("scaffold did not link; the load test below would be meaningless");
   }
 
-  server = spawn("bun", ["run", "start"], {
+  /*
+   * The entrypoint directly, not `bun run start`.
+   *
+   * `bun run start` spawns a child that runs the entrypoint, so killing the process this
+   * test holds does not reach the server: a previous run's server survived on the port
+   * and answered the next run's requests — measured in the last full-suite run, where
+   * three file-routed tests failed against a stale server whose scaffold directory had
+   * already been deleted by the run before it. Which is worse than a flaky test: the
+   * next run measures the *previous* build, and passes or fails for reasons that have
+   * nothing to do with the code under test.
+   */
+  server = spawn("bun", ["yatta/main.ts"], {
     cwd: app,
     env: { ...process.env, PORT: String(PORT) },
     stdio: ["ignore", "pipe", "pipe"],
@@ -70,8 +81,22 @@ beforeAll(async () => {
   if (!(await waitForUp())) throw new Error("scaffolded server did not come up");
 }, 420_000);
 
-afterAll(() => {
+afterAll(async () => {
   server?.kill("SIGKILL");
+
+  // Wait for the port to be released before deleting the directory. Returning while
+  // the server is still bound means the next run of this file — in CI or locally —
+  // talks to *this* run's server, whose directory is about to disappear.
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(`${BASE}/health`);
+      await new Promise((r) => setTimeout(r, 200));
+    } catch {
+      break;
+    }
+  }
+
   if (dir) rmSync(dir, { recursive: true, force: true });
 });
 

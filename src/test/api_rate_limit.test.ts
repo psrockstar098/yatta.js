@@ -95,3 +95,67 @@ describe("rateLimit refuses a limit that is not a number", () => {
     expect((await api.handle(new Request("http://localhost/x"), {})).status).toBe(200);
   });
 });
+
+describe("rateLimit cannot be expanded past its key cap by forged keys", () => {
+  /*
+   * The default key is the first `X-Forwarded-For` token, which is client-controlled
+   * on any direct-to-internet deployment: every forged value is a brand-new key, and
+   * a new key is a brand-new bucket. The cleanup that controlled map growth was
+   * gated on `buckets.size > 10000` — a threshold an attacker never has to let the
+   * map cross, and, once crossed with all-live buckets, an O(n) scan per request
+   * that deletes nothing. Both directions: unbounded memory, or a full scan per
+   * request during the attack that triggered it.
+   *
+   * The cap redirects new keys to one shared bucket instead of minting another. Its
+   * observable effect here: beyond the cap, forged keys land in a bucket whose
+   * budget is finite, so they start seeing 429s — which the uncapped version never
+   * produces for a fresh key, no matter how many keys arrive.
+   */
+
+  function cappedApp() {
+    const api = createAPI();
+    api.get("/x", () => new Response("ok"));
+    api.rateLimit({ maxRequests: 2, windowMs: 60_000, maxKeys: 2 });
+    return api;
+  }
+
+  it("shares one bucket among new keys once the cap is reached", async () => {
+    const api = cappedApp();
+    const req = (key: string) =>
+      api.handle(
+        new Request("http://localhost/x", { headers: { "x-forwarded-for": key } }),
+        {},
+      ).then((r) => r.status);
+
+    // Two live keys are allowed their own buckets; the flow below reaches the
+    // shared fallback via Keys past the cap, and the shared budget runs out.
+    const statuses = [
+      await req("a"), // a1: a's own bucket 1
+      await req("a"), // a2: a's own bucket 2
+      await req("c"), // c: the second key takes the last own slot
+      await req("c"), // c2: c's own bucket 2
+      await req("d"), // d: past the cap -> shared bucket, count 1
+      await req("g"), // g: shared again, count 2
+      await req("h"), // h: shared, count 3 -> 429
+    ];
+
+    expect(statuses).toEqual([200, 200, 200, 200, 200, 200, 429]);
+
+    // That shared bucket is a real limiter, not a bypass: h has no budget of its own.
+    expect(await req("h")).toBe(429);
+  });
+
+  it("is not tripped by non-numeric caps either", () => {
+    // Same NaN discipline as maxRequests and windowMs: a cap that skips validation
+    // is the fourth undefended boundary in this engine.
+    const api = createAPI();
+    api.get("/x", () => new Response("ok"));
+    expect(() =>
+      api.rateLimit({
+        maxRequests: 2,
+        windowMs: 60_000,
+        maxKeys: Number(process.env.YATTA_TEST_UNSET_MAXKEYS),
+      }),
+    ).toThrow(/maxKeys/);
+  });
+});
