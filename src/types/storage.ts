@@ -460,7 +460,17 @@ export function resolveSigningSecret(configuredSecret?: string): string {
   if (!ephemeralDevSecret) {
     ephemeralDevSecret = crypto.randomBytes(32).toString("hex");
   }
-  if (!devSecretWarned) {
+  if (
+    process.env.YATTA_FLEET_THREAD !== "1" &&
+    !devSecretWarned
+  ) {
+    /*
+     * A worker thread re-imports this module in its own registry, so the flag above
+     * cannot know the host thread has already printed this exact line; each fleet
+     * thread would print it again and the warning would appear once per thread on the
+     * same console. The scheduler marks fleet worker threads for exactly this, and the
+     * host is the only copy that carries information.
+     */
     console.warn(
       "\x1b[33m[YATTA Storage Warning]\x1b[0m No secret provided. Generated an ephemeral in-memory secret for development. Signed URLs will be invalidated upon restart.",
     );
@@ -2820,7 +2830,11 @@ export class StorageManager {
     }
 
     // Warn if no authorizer is configured — files are world-readable by default.
-    if (!this.authorizer) {
+    // Fleet worker threads hold their own copy of this module but no fleet traffic
+    // ever reaches their copy of the manager; the host thread's copy is the one this
+    // warning is about, and printing it per thread is how it looks like the system
+    // re-bootstrapped. See src/test/boot_warning.test.ts.
+    if (!this.authorizer && process.env.YATTA_FLEET_THREAD !== "1") {
       console.warn(
         "[yatta] WARNING: Storage has no 'authorize' callback configured. " +
         "All stored files are world-readable via GET /storage/files/<key>. " +

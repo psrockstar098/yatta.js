@@ -41,7 +41,13 @@ export class IsolatedAppGraph {
             );
         },
       });
-    } else if (!warnedFallback) {
+    } else if (!warnedFallback && process.env.YATTA_FLEET_THREAD !== "1") {
+      /*
+       * Every fleet worker thread copies this module registry, so without the
+       * host-thread check the fallback note prints once per thread — three identical
+       * lines for one unavailability. The host print is the one that matters. See
+       * src/test/boot_warning.test.ts.
+       */
       warnedFallback = true;
       console.warn(
         "[ModuleGraph] Bun.ModuleGraph is unavailable: graphs share one module " +

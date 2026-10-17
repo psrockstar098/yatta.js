@@ -240,6 +240,20 @@ export class HardwareAwareScheduler {
       throw new Error("Scheduler is already bootstrapped.");
     }
 
+    /*
+     * Subsystem graph execution happens on worker threads, which have no
+     * Bun.ModuleGraph — so the fallback note the graph executor used to print once
+     * per worker (now silenced by YATTA_FLEET_THREAD, see moduleGraph.ts) would never
+     * print at all. The host prints it once here instead: the fact is about this
+     * deployment, so one line at fleet boot is the right place for it.
+     */
+    if (typeof (globalThis as any).Bun?.ModuleGraph !== "function") {
+      console.warn(
+        "[ModuleGraph] Bun.ModuleGraph is unavailable: subsystem graphs share one " +
+          "module cache and per-tenant globals/env are NOT applied. Not isolated.",
+      );
+    }
+
     const specs: Array<[string, WorkerRole, WorkerSpawnSpec]> = [];
     // CPU-bound pool: strict concurrency = 1
     for (let i = 0; i < this.topology.cpuWorkers; i++) {
@@ -300,7 +314,17 @@ export class HardwareAwareScheduler {
     role: WorkerRole,
     spec: WorkerSpawnSpec,
   ): Promise<ManagedWorker> {
-    const worker = new Worker(spec.scriptUrl.href, { smol: spec.smol });
+    const worker = new Worker(spec.scriptUrl.href, {
+      smol: spec.smol,
+      /*
+       * A fleet thread re-imports the host's modules in its own registry, so every
+       * module-level "warned once" flag starts fresh here. Marking the context lets
+       * those sites stay quiet about boot warnings the host thread already printed —
+       * identical lines per thread on a multi-worker fleet read as accidental
+       * re-bootstrapping. See src/test/boot_warning.test.ts.
+       */
+      env: { ...process.env, YATTA_FLEET_THREAD: "1" },
+    });
 
     const managed: ManagedWorker = {
       id,
