@@ -150,7 +150,10 @@ ${REPORT}`,
     );
 
     expect(error).toBeUndefined();
-    expect(warns.filter((w) => w.includes("Bun.ModuleGraph is unavailable"))).toHaveLength(1);
+    const fallbacks = warns.filter((w) => w.includes("Bun.ModuleGraph is unavailable"));
+    // Availability is a property of the Bun build under test, not of this code: CI runs
+    // a Bun where Bun.ModuleGraph exists and the fallback legitimately never fires.
+    expect(fallbacks).toHaveLength((globalThis as any).Bun?.ModuleGraph ? 0 : 1);
   });
 
   it("worker threads stay silent about the fallback too", async () => {
