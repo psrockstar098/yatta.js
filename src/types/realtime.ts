@@ -1135,7 +1135,12 @@ export class JobTracker<TResult = unknown> {
 
   /**
    * Updates the job's progress percentage and optional status message.
-   * No-op if the job is already in a terminal state (`cancelled` or `failed`).
+   * No-op if the job is already in a terminal state (`completed`, `cancelled` or `failed`).
+   *
+   * `completed` is included even though the old guard checked two of the three
+   * terminal states: ticking a finished job set it back to `running`, dropped its
+   * stored result, and the second `done()` then ran the terminal callback again —
+   * one decrement too many on the job gauge, and a second GC timer.
    *
    * @param percent Progress 0–100 (clamped automatically).
    * @param message Optional status message.
@@ -1147,8 +1152,13 @@ export class JobTracker<TResult = unknown> {
     message?: string,
     extra?: Record<string, unknown>,
   ): this {
-    if (this.state.status === "cancelled" || this.state.status === "failed")
+    if (
+      this.state.status === "completed" ||
+      this.state.status === "cancelled" ||
+      this.state.status === "failed"
+    ) {
       return this;
+    }
     this.state.status = "running";
     this.state.percent = Math.min(100, Math.max(0, percent));
     if (message) this.state.message = message;

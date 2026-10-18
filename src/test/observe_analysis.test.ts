@@ -1955,3 +1955,338 @@ describe("Observer — trace sampling", () => {
     expect(() => observerWith(Number.NaN)).toThrow(/tracesSampleRate/);
   });
 });
+
+/*
+ * Surfaces the original file either covered only in one direction (dedupe works,
+ * but never across kinds) or not at all. Same fixture vocabulary as above —
+ * `span`, `stub`, `issue`, `occurrence` — so a failure reads against familiar
+ * names.
+ */
+describe("gaps the original file left open", () => {
+  describe("SafeActions", () => {
+    const actions = () => new SafeActions(stub({}));
+
+    it("does not let one action's idempotency key answer for a different kind", async () => {
+      let purged = false;
+      const shared = actions();
+
+      const cacheOutcome = await shared.execute(
+        { kind: "clear-cache", idempotencyKey: "op-key" },
+        () => ({ cleared: true }),
+        { confirmed: true },
+      );
+      const purgeOutcome = await shared.execute(
+        { kind: "purge-dead-jobs", idempotencyKey: "op-key" },
+        () => {
+          purged = true;
+          return { purged: 5 };
+        },
+        { confirmed: true },
+      );
+
+      // The ledger keyed only on the raw string: the purge looked up "op-key",
+      // found the cache-clear outcome, and reported a purge that never ran. An
+      // operator reusing a key across actions was lied to about the second one.
+      expect(cacheOutcome.kind).toBe("clear-cache");
+      expect(purgeOutcome.kind).toBe("purge-dead-jobs");
+      expect(purgeOutcome.deduplicated).toBeUndefined();
+      expect(purgeOutcome.ok).toBe(true);
+      expect(purged).toBe(true);
+    });
+
+    it("still deduplicates a retried action of the same kind", async () => {
+      let calls = 0;
+      const shared = actions();
+      const request = { kind: "clear-cache", idempotencyKey: "retry-key" } as const;
+      const run = () => {
+        calls++;
+        return "cache cleared";
+      };
+
+      await shared.execute(request, run, { confirmed: true });
+      const retry = await shared.execute(request, run, { confirmed: true });
+
+      expect(calls).toBe(1);
+      expect(retry.deduplicated).toBe(true);
+    });
+
+    it("evicts the oldest ledger entry once the ledger passes 500", async () => {
+      const shared = actions();
+      for (let i = 0; i < 501; i++) {
+        await shared.execute(
+          { kind: "clear-cache", idempotencyKey: `key-${i}` },
+          () => "ok",
+          { confirmed: true },
+        );
+      }
+
+      // The first key was evicted, so executing it again runs for real.
+      const evicted = await shared.execute(
+        { kind: "clear-cache", idempotencyKey: "key-0" },
+        () => "ran again",
+        { confirmed: true },
+      );
+      expect(evicted.deduplicated).toBeUndefined();
+
+      // The most recent key is still vouched for.
+      const retained = await shared.execute(
+        { kind: "clear-cache", idempotencyKey: "key-500" },
+        () => "should not run",
+        { confirmed: true },
+      );
+      expect(retained.deduplicated).toBe(true);
+    });
+  });
+
+  describe("GoldenTraceStore", () => {
+    const golden = (name: string) => ({
+      name,
+      traceId: `trace-${name}`,
+      savedAt: 0,
+      steps: ["root", "db", "pay"],
+      stepTimings: [
+        { name: "root", ms: 300 },
+        { name: "db", ms: 40 },
+        { name: "pay", ms: 100 },
+      ],
+      totalMs: 300,
+    });
+
+    it("evicts the oldest baseline past the cap, without losing newer ones", () => {
+      const store = new GoldenTraceStore();
+      for (let i = 0; i < 26; i++) store.save(golden(`golden-${i}`));
+
+      expect(store.all()).toHaveLength(25);
+      expect(store.find("golden-0")).toBeUndefined();
+      expect(store.find("golden-25")).toBeDefined();
+    });
+
+    it("lets a re-saved baseline keep its eviction slot instead of ageing twice", () => {
+      const store = new GoldenTraceStore();
+      for (let i = 0; i < 20; i++) store.save(golden(`g-${i}`));
+
+      // Re-saving a baseline must refresh it, not push a second copy that forces
+      // an unrelated entry out.
+      store.save(golden("g-0"));
+
+      // Exactly the cap fits, and the oldest after the refresh is g-1.
+      for (let i = 20; i < 26; i++) store.save(golden(`g-${i}`));
+      expect(store.all()).toHaveLength(25);
+      expect(store.find("g-0")).toBeDefined();
+      expect(store.find("g-1")).toBeUndefined();
+    });
+  });
+
+  describe("SloEngine status boundaries", () => {
+    const NOW = 10_000_000;
+    const tx = (status: number, at: number) => ({
+      id: `${status}-${at}`,
+      traceId: "t",
+      method: "POST",
+      route: "/checkout",
+      url: "/checkout",
+      status,
+      durationMs: 10,
+      timestamp: at,
+      inFlight: false,
+    });
+    const engine = (transactions: any[]) =>
+      new SloEngine(stub({ transactions: { all: () => transactions } }));
+    const objective = { name: "Checkout", target: 99, windowMs: 86_400_000 };
+
+    it("stays healthy when the spend matched the budget across the whole window", () => {
+      // 100 requests spanning the full window (first at its start, last at
+      // `now`), 1 error: 99% achieved, a full 1%-of-1% budget spent over 100%
+      // of the window — burn rate exactly 1.
+      const txs = Array.from({ length: 100 }, (_, i) =>
+        tx(i < 99 ? 200 : 500, NOW - Math.round((99 - i) * (86_400_000 / 99))),
+      );
+      const r = engine(txs).evaluate(objective, NOW);
+
+      expect(r.achieved).toBe(99);
+      expect(r.burnRate).toBe(1);
+      expect(r.status).toBe("healthy");
+    });
+
+    it("flags at-risk when the target still holds but budget burns ahead of the window", () => {
+      // Same spend, but the traffic only covers the first half of the window:
+      // elapsed is 0.5 while the entire budget was consumed, so burn rate is 2.
+      const txs = Array.from({ length: 100 }, (_, i) =>
+        tx(i < 99 ? 200 : 500, NOW - 86_400_000 + Math.round(i * (43_200_000 / 99))),
+      );
+      const r = engine(txs).evaluate(objective, NOW);
+
+      expect(r.achieved).toBe(99);
+      expect(r.burnRate).toBe(2);
+      expect(r.status).toBe("at-risk");
+    });
+
+    it("flags at-risk from the degraded mid-band, below target but not breached", () => {
+      // Target 99.9 leaves a 0.1% budget. Achieved 99.86% sits in the band
+      // [target - budget/2, target) = [99.85, 99.9), which is at-risk, not breach.
+      const txs = Array.from({ length: 5_000 }, (_, i) =>
+        tx(i < 4_993 ? 200 : 500, NOW - 80_000_000 + i * 10_000),
+      );
+      const r = engine(txs).evaluate(
+        { name: "Checkout", target: 99.9, windowMs: 86_400_000 },
+        NOW,
+      );
+
+      expect(r.achieved).toBe(99.86);
+      expect(r.status).toBe("at-risk");
+    });
+  });
+
+  describe("IncidentAnalyzer span-level suspects", () => {
+    it("names the span that recorded the failure, with its caveat attached", () => {
+      const fp = "fp-erroring-span";
+      const traceId = generateTraceId();
+      const source = stub({
+        errors: {
+          issues: new Map([
+            [fp, issue(fp, { occurrences: [occurrence({ fingerprint: fp, traceId })] })],
+          ]),
+        },
+        spans: {
+          all: () => [
+            span({ traceId, spanId: "root", name: "GET /api/x", startTime: 0, durationMs: 100,
+              attributes: { "http.route": { string: "/api/x", number: 0, bool: false } } }),
+            span({ traceId, spanId: "boom", parentSpanId: "root", name: "saveOrder",
+              startTime: 60, durationMs: 20, status: "error" }),
+          ],
+        },
+      });
+
+      const analysis = new IncidentAnalyzer(source).analyze(fp)!;
+      const suspect = analysis.suspects.find((s) => s.id === "erroring-span");
+
+      expect(suspect).toBeDefined();
+      expect(suspect!.confidence).toBe("likely");
+      expect(suspect!.caveats.join(" ")).toMatch(/not necessarily its origin/);
+    });
+
+    it("counts database work as a suspect span group", () => {
+      const fp = "fp-db-work";
+      const traceId = generateTraceId();
+      const source = stub({
+        errors: {
+          issues: new Map([
+            [fp, issue(fp, { occurrences: [occurrence({ fingerprint: fp, traceId })] })],
+          ]),
+        },
+        spans: {
+          all: () => [
+            span({ traceId, spanId: "root", name: "GET /api/x", startTime: 0, durationMs: 100,
+              attributes: { "http.route": { string: "/api/x", number: 0, bool: false } } }),
+            span({ traceId, spanId: "d", parentSpanId: "root", name: "db.SELECT orders", startTime: 0, durationMs: 60 }),
+          ],
+        },
+      });
+
+      const analysis = new IncidentAnalyzer(source).analyze(fp)!;
+      const dbSuspect = analysis.suspects.find((s) => s.id === "db-work");
+
+      expect(dbSuspect).toBeDefined();
+      expect(dbSuspect!.confidence).toBe("possible");
+      expect(dbSuspect!.caveats.join(" ")).toMatch(/proves the query result/);
+    });
+  });
+
+  describe("BaselineEngine.reference", () => {
+    const seed = (h: MetricsHistory, values: number[]) => {
+      values.forEach((v, i) => h.record(i * 1000, { dbLatencyMs: v }));
+    };
+
+    it("answers null before it has the samples to say anything", () => {
+      const h = new MetricsHistory();
+      seed(h, [5, 5, 5, 5]);
+      const engine = new BaselineEngine(h);
+
+      // Four samples: not enough for classification, whatever the caller asked for.
+      expect(engine.reference("dbLatencyMs", 120_000, 5, 40_000)).toBeNull();
+    });
+
+    it("returns the 95th percentile once the sample floor is met", () => {
+      const h = new MetricsHistory();
+      seed(h, [5, 5, 5, 5, 5, 5]);
+
+      // A flat series: the p95 of six identical values is the value itself.
+      expect(new BaselineEngine(h).reference("dbLatencyMs", 120_000, 5, 60_000)).toBe(5);
+    });
+  });
+
+  describe("MetricsHistory.clear", () => {
+    it("forgets everything, so a cleared history cannot keep vouching", () => {
+      const h = new MetricsHistory();
+      for (let i = 0; i < 20; i++) h.record(i * 1000, { dbLatencyMs: 20 });
+
+      h.clear();
+      expect(h.size).toBe(0);
+      expect(h.values("dbLatencyMs", 120_000, 20_000)).toEqual([]);
+
+      // And the engine that fed on it must say "not ready" again, not quietly
+      // reuse eviction-era data.
+      const verdict = new BaselineEngine(h).evaluate("dbLatencyMs", 900, 120_000, 21_000);
+      expect(verdict.anomalous).toBe(false);
+      expect(verdict.confidence).toBe("unknown");
+    });
+  });
+
+  describe("ReleaseIntelligence direction", () => {
+    const NOW = 1_000_000_000;
+    const tx = (at: number, status: number) => ({
+      id: `t${at}-${status}`,
+      traceId: "tr",
+      method: "POST",
+      route: "/api/checkout",
+      url: "/api/checkout",
+      status,
+      durationMs: 100,
+      timestamp: at,
+      inFlight: false,
+    });
+    const world = (releases: [string, number][], transactions: any[]) => {
+      const tl = new ReleaseTimeline();
+      for (const [release, at] of releases) {
+        tl.record({ release, version: release, environment: "test", deployedAt: at, pid: 1 });
+      }
+      return stub({
+        releases: tl,
+        transactions: { all: () => transactions },
+        slowQueries: { all: () => [] },
+        errors: { issues: new Map() },
+      });
+    };
+
+    it("credits a release whose error rate fell, instead of never improving", () => {
+      // 20 requests under the old release with 2 errors (10%), 20 under the new
+      // with none. MIN_SAMPLE is 20 exactly, so this clears the floor for both.
+      const transactions = [
+        ...Array.from({ length: 20 }, (_, i) => tx(NOW - 90_000 + i, i < 18 ? 200 : 500)),
+        ...Array.from({ length: 20 }, (_, i) => tx(NOW - 9_000 + i, 200)),
+      ];
+      const ri = new ReleaseIntelligence(
+        world([["1.8.3", NOW - 100_000], ["1.8.4", NOW - 10_000]], transactions),
+      );
+
+      const rows = ri.health();
+      expect(rows[0]!.status).toBe("unknown");
+      expect(rows[1]!.status).toBe("improved");
+      expect(ri.current()!.release).toBe("1.8.4");
+    });
+
+    it("says unknown rather than comparing releases nobody sampled", () => {
+      const transactions = [
+        ...Array.from({ length: 3 }, (_, i) => tx(NOW - 90_000 + i, 200)),
+        ...Array.from({ length: 3 }, (_, i) => tx(NOW - 9_000 + i, 500)),
+      ];
+      const ri = new ReleaseIntelligence(
+        world([["1.8.3", NOW - 100_000], ["1.8.4", NOW - 10_000]], transactions),
+      );
+
+      // 3 requests each: both rows sit below MIN_SAMPLE, so a verdict either way
+      // would be noise. Every row must read unknown.
+      expect(ri.health().map((r) => r.status)).toEqual(["unknown", "unknown"]);
+    });
+  });
+});

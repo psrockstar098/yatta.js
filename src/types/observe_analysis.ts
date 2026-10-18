@@ -1940,7 +1940,16 @@ export class SafeActions {
 
   constructor(private readonly source: AnalysisSource) {}
 
-  /** Describe an action without running it. Null when the kind is unknown. */
+  /**
+   * The ledger is namespaced by kind on purpose: keys are per-action intents,
+   * and a raw-shared ledger let a key an operator once used for `clear-cache`
+   * answer a later `purge-dead-jobs` request — reporting a purge that never ran.
+   * A key still deduplicates a retry of the same action, which is what the
+   * contract promises.
+   */
+  private ledgerKey(kind: string, idempotencyKey: string): string {
+    return `${kind}:${idempotencyKey}`;
+  }  /** Describe an action without running it. Null when the kind is unknown. */
   preview(request: ActionRequest, analysis?: IncidentAnalysis): ActionPreview | null {
     const kind = request.kind;
     const payload = request.payload ?? {};
@@ -2075,7 +2084,9 @@ export class SafeActions {
     }
 
     if (request.idempotencyKey) {
-      const prior = this.seenKeys.get(request.idempotencyKey);
+      const prior = this.seenKeys.get(
+        this.ledgerKey(request.kind, request.idempotencyKey),
+      );
       if (prior) {
         return { ...prior, deduplicated: true };
       }
@@ -2123,7 +2134,10 @@ export class SafeActions {
     };
 
     if (request.idempotencyKey) {
-      this.seenKeys.set(request.idempotencyKey, outcome);
+      this.seenKeys.set(
+        this.ledgerKey(request.kind, request.idempotencyKey),
+        outcome,
+      );
       // Bounded, so this cannot become its own leak.
       if (this.seenKeys.size > 500) {
         const oldest = this.seenKeys.keys().next().value;
