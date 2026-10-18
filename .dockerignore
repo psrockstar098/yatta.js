@@ -13,6 +13,7 @@ AGENTS.md
 CLAUDE.md
 STRATEGY_REVIEW_TAKEAWAYS.md
 playground
+.npmrc
 
 # Local env files
 .env
