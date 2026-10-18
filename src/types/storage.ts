@@ -418,6 +418,12 @@ export interface MultiDiskStorageConfig {
   secret?: string;
   /** Global authorization guard for request handling. */
   authorize?: StorageAuthorizer;
+  /**
+   * Acknowledgement that the default world-readable reads are intended, which
+   * silences the constructor warning whose message names this option. It does
+   * not change any behaviour — an `authorize` callback still overrides it.
+   */
+  publicReads?: boolean;
 }
 
 /**
@@ -2834,7 +2840,13 @@ export class StorageManager {
     // ever reaches their copy of the manager; the host thread's copy is the one this
     // warning is about, and printing it per thread is how it looks like the system
     // re-bootstrapped. See src/test/boot_warning.test.ts.
-    if (!this.authorizer && process.env.YATTA_FLEET_THREAD !== "1") {
+    // The message names publicReads as the acknowledgement, so honour it — before
+    // the option existed, following the warning's own advice changed nothing.
+    if (
+      !this.authorizer &&
+      !(config as MultiDiskStorageConfig).publicReads &&
+      process.env.YATTA_FLEET_THREAD !== "1"
+    ) {
       console.warn(
         "[yatta] WARNING: Storage has no 'authorize' callback configured. " +
         "All stored files are world-readable via GET /storage/files/<key>. " +

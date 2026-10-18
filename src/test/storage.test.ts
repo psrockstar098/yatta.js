@@ -27,6 +27,9 @@ describe("Yatta Storage — High-Performance Storage Layer", () => {
     storage = createStorage({
       default: "local",
       secret: "storage-secret-signing-key-32-chars-long!",
+      // Acknowledged rather than leaving the constructor to warn before every one
+      // of this suite's tests; nothing here exercises the warning itself.
+      publicReads: true,
       disks: {
         local: {
           driver: "local",
@@ -351,5 +354,56 @@ describe("Yatta Storage — High-Performance Storage Layer", () => {
         expect(await file.text()).toContain(`Content of file number ${i}`);
       }
     });
+  });
+});
+
+describe("the world-readable warning", () => {
+  const WARN_DIR = path.resolve("./storage/test_warn");
+
+  const baseConfig = {
+    default: "local",
+    secret: "storage-secret-signing-key-32-chars-long!",
+    disks: {
+      local: {
+        driver: "local" as const,
+        baseDir: WARN_DIR,
+      },
+    },
+  };
+
+  function captureWarnings(create: () => unknown): string[] {
+    const warns: string[] = [];
+    const original = console.warn;
+    console.warn = (message?: unknown) => {
+      warns.push(String(message));
+    };
+    try {
+      create();
+    } finally {
+      console.warn = original;
+    }
+    return warns;
+  }
+
+  it("prints when there is neither an authorizer nor an acknowledgement", () => {
+    fs.mkdirSync(WARN_DIR, { recursive: true });
+    const warns = captureWarnings(() => createStorage(baseConfig));
+    expect(warns.some((message) => message.includes("authorize"))).toBe(true);
+  });
+
+  it("stays quiet when publicReads: true acknowledges it, exactly as the warning itself instructs", () => {
+    fs.mkdirSync(WARN_DIR, { recursive: true });
+    const warns = captureWarnings(() =>
+      createStorage({ ...baseConfig, publicReads: true }),
+    );
+    expect(
+      warns.some((message) => message.includes("authorize")),
+    ).toBe(false);
+  });
+
+  afterEach(() => {
+    try {
+      if (fs.existsSync(WARN_DIR)) fs.rmSync(WARN_DIR, { recursive: true, force: true });
+    } catch {}
   });
 });
