@@ -854,7 +854,14 @@ describe("Realtime — the reachable surface, from handshake to broadcast", () =
     });
 
     it("delivers a broadcast to a subscribed SSE channel as SSE text", async () => {
+      const wsPayloads: string[] = [];
       const rt = createRealtime();
+      // Bound, so the WebSocket road is exercised too rather than logging an
+      // unbound-server error for a broadcast that never was a misdelivery.
+      rt.bindServer({
+        publish: (_t: string, payload: string) => wsPayloads.push(payload),
+        upgrade: () => true,
+      } as AnyWebSocket);
       const channel = rt.channel("orders");
 
       const textPromise = sse(new Request("http://host/sse"), (client) => {
@@ -866,6 +873,8 @@ describe("Realtime — the reachable surface, from handshake to broadcast", () =
 
       expect(text).toContain("event: order.created");
       expect(text).toContain("ord_2");
+      // One envelope reached the WebSocket road alongside the SSE one.
+      expect(JSON.parse(wsPayloads[0]!).data).toEqual({ id: "ord_2" });
     });
 
     it("does not touch an SSE channel that exists but has no subscribers", () => {
