@@ -14,6 +14,7 @@ import {
   type AuthSession,
   type TokenPair,
 } from "../types/auth";
+import { createMailer } from "../types/mail";
 
 describe("Yatta Auth — Enterprise Security & Authentication Engine", () => {
   const SECRET = "super-secret-cryptographic-signing-key-32-chars-minimum";
@@ -33,6 +34,10 @@ describe("Yatta Auth — Enterprise Security & Authentication Engine", () => {
       security: {
         allowUnverifiedSession: true,
       },
+      // signUp dispatches a background verification email; without a configured
+      // mailer it falls back to the global Mail facade and its ethereal default,
+      // which is a live network call that fails noisily on an offline machine.
+      email: { mailer: createMailer({ mode: "memory" }), appUrl: "https://app.test" },
       passwordPolicy: {
         minLength: 8,
         requireNumbers: true,

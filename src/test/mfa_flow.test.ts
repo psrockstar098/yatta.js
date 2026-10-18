@@ -12,6 +12,7 @@ import {
   type MfaChallenge,
   type AuthSession,
 } from "../types/auth";
+import { createMailer } from "../types/mail";
 import { authenticator } from "otplib";
 
 /*
@@ -36,6 +37,10 @@ function build() {
     challengeStore: new MemoryChallengeStore(),
     rateLimitStore: new MemoryRateLimitStore(),
     security: { allowUnverifiedSession: true },
+    // signUp dispatches a background verification email; keep it local instead of
+    // the default Mail facade, whose ethereal mode is a live network call that
+    // fails noisily on an offline machine.
+    email: { mailer: createMailer({ mode: "memory" }), appUrl: "https://app.test" },
     mfa: { challengeTtlSec: 300 },
   });
   return { auth, store };

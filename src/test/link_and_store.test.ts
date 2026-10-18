@@ -9,6 +9,7 @@ import {
   type AuthResult,
   type OAuthProvider,
 } from "../types/auth";
+import { createMailer } from "../types/mail";
 
 /*
  * Two guards from this round, both closing a path where a caller-supplied value
@@ -52,12 +53,20 @@ afterAll(() => {
 const base = () => `http://localhost:${oauthProvider.port}`;
 
 function build() {
+  // signUp dispatches a background verification email through `config.email.mailer`.
+  // Unconfigured, auth falls back to the global Mail facade, whose default mode is
+  // `ethereal` — a live call to smtp.ethereal.email that an offline machine surfaces
+  // as a console.error stack next to every passing test. Memory mode keeps the send
+  // local, the way auth_attacks.test.ts already handles it.
+  const mailer = createMailer({ mode: "memory" });
+
   const auth = createAuth({
     secret: SECRET,
     store: new MemoryAuthStore(),
     challengeStore: new MemoryChallengeStore(),
     rateLimitStore: new MemoryRateLimitStore(),
     security: { allowUnverifiedSession: true },
+    email: { mailer, appUrl: "https://app.test" },
   });
 
   // Registered through the same path a real provider uses.
@@ -239,9 +248,12 @@ describe("MemoryAuthStore is not a silent production default", () => {
 
   /**
    * Production has several fail-fast guards and the email one fires first, so a test
-   * about the store check has to satisfy it to isolate what it means.
+   * about the store check has to satisfy it to isolate what it means. The same applies
+   * to the getClientIp warning: nothing here is about client addresses, and an
+   * unconfigured resolver is otherwise printed on both runs.
    */
   const email = { appUrl: "https://app.test" };
+  const security = { getClientIp: () => "203.0.113.9" };
 
   it("refuses to start in production without a store", () => {
     inProduction(() => {
@@ -251,6 +263,7 @@ describe("MemoryAuthStore is not a silent production default", () => {
           challengeStore: new MemoryChallengeStore(),
           rateLimitStore: new MemoryRateLimitStore(),
           email,
+          security,
         } as never),
       ).toThrow(/No auth store was supplied/);
     });
@@ -267,6 +280,7 @@ describe("MemoryAuthStore is not a silent production default", () => {
           challengeStore: new MemoryChallengeStore(),
           rateLimitStore: new MemoryRateLimitStore(),
           email,
+          security,
         } as never),
       ).not.toThrow();
     });
