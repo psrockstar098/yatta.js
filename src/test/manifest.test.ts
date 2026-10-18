@@ -1,5 +1,6 @@
-import { describe, it, expect } from "bun:test";
-import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { describe, it, expect, beforeAll } from "bun:test";
+import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 /*
@@ -55,6 +56,131 @@ describe("package.json is valid JSON", () => {
     expect(shipped).toContain("src/types");
     expect(shipped).toContain("src/func");
     expect(shipped).toContain("core_runtime");
+  });
+
+  /*
+   * Pack the tarball and check what is actually inside it.
+   *
+   * This ran once as `cli_doctor.ts`, `cli_migrate.ts` and `cli_backup.ts`: the CLI
+   * imported them, nothing shipped them, and every local check — including this file's
+   * `files` whitelist assertions — stayed green because `files` said nothing about the
+   * CLI beyond `src/cli.ts` itself. The published package had a `yatta` command that
+   * crashed on most subcommands before the user saw a single line of output.
+   *
+   * npm's own walk is the only authority here; a re-implementation of npm-packlist
+   * semantics would agree with itself and not with npm. `--dry-run` writes no tarball,
+   * so the test litters nothing.
+   */
+  describe("the tarball npm would actually publish", () => {
+    let packStatus = 1;
+    const packed = new Set<string>();
+
+    beforeAll(() => {
+      const result = spawnSync("npm", ["pack", "--dry-run"], { cwd: root, encoding: "utf8" });
+      packStatus = result.status ?? 1;
+
+      // npm's file list goes to stderr, not stdout.
+      const output = [result.stdout, result.stderr].join("\n");
+      for (const line of output.split("\n")) {
+        // `npm notice 82.4kB src/cli.ts` — size, then the path inside the tarball.
+        const match = line.match(/^npm notice\s+\d+(?:\.\d+)?[kMG]?B\s+(\S.*)$/);
+        if (match) packed.add(match[1]!.trim());
+      }
+    });
+
+    it("packs without error and lists its contents", () => {
+      expect(packStatus).toBe(0);
+
+      // If the parse produced nothing, the assertions below would pass on an empty
+      // walk for the wrong reason, so pin the parse itself.
+      expect(packed.size).toBeGreaterThan(10);
+      expect(packed.has("package.json")).toBe(true);
+    });
+
+    it("contains the bin npm is being told about", () => {
+      /*
+       * npm strips an invalid `bin` entry with a warning and publishes a package that
+       * installs no command at all. It removed `bin.yatta = src/cli.ts` this way on a
+       * real publish, so the rule is pinned twice: the target may not be TypeScript,
+       * and whatever it is must survive into the tarball.
+       */
+      const binTarget = manifest.bin.yatta.replace(/^\.\//, "");
+      expect(manifest.bin.yatta).not.toMatch(/\.ts$/);
+      expect(existsSync(join(root, binTarget))).toBe(true);
+      expect(packed.has(binTarget)).toBe(true);
+    });
+
+    it("contains every module the bin transitively imports", () => {
+      /*
+       * `cli_doctor.ts`, `cli_migrate.ts` and `cli_backup.ts` were here: the CLI
+       * imported them, `files` shipped only `src/cli.ts`, and the published `yatta`
+       * command crashed on most subcommands. A repo-side import walk cannot see this
+       * because in the repo everything resolves — only the tarball can.
+       *
+       * The specifiers come from Bun's scanner, not a regex over the source: `cli.ts`
+       * builds other files from template literals, and a regex reads the imports
+       * *inside those templates* `—` files that must not ship because they are not
+       * modules of this package.
+       */
+      const binTarget = manifest.bin.yatta.replace(/^\.\//, "");
+      const transpiler = new Bun.Transpiler({ loader: "ts" });
+
+      const unresolved: string[] = [];
+      const seen = new Set<string>();
+
+      const walk = (rawPath: string): void => {
+        const path = rawPath.replace(/^\.\//, "");
+        if (seen.has(path)) return;
+        seen.add(path);
+
+        // A reached code file that npm would not pack is a shipped-crash-in-waiting,
+        // so the entry is kept (and named) even when it cannot be walked further.
+        const fullPath = join(root, path);
+        // Bun resolves extensionless relative specifiers against `.ts`; npm packs
+        // whole files, so the resolution has to happen here for the pack to answer.
+        if (!existsSync(fullPath) || !statSync(fullPath).isFile()) {
+          const withTs = `${fullPath}.ts`;
+          if (existsSync(withTs) && statSync(withTs).isFile()) {
+            walk(`${path}.ts`);
+            return;
+          }
+          unresolved.push(path);
+          return;
+        }
+
+        const isCode = /\.(ts|js|mjs)$/.test(path);
+        if (!isCode || !packed.has(path)) {
+          unresolved.push(path);
+          if (!isCode) return;
+        }
+
+        // The shebang trips the scanner under the plain `ts` loader; it is not code.
+        const source = readFileSync(fullPath, "utf8").replace(/^#![^\n]*\n/, "");
+        for (const { path: specifier } of transpiler.scanImports(source)) {
+          if (!specifier.startsWith(".")) continue;
+          walk(join(path, "..", specifier));
+        }
+      };
+
+      walk(binTarget);
+
+      expect(unresolved).toEqual([]);
+    });
+
+    it("starts through the bin shim, the way an installed user would run it", async () => {
+      const proc = Bun.spawn([process.execPath, manifest.bin.yatta, "help"], {
+        cwd: root,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+
+      // `yatta help` with no project present still succeeds, which exercises the
+      // import chain — cli_doctor, cli_migrate, cli_backup — that the tarball once
+      // shipped without.
+      expect(code).toBe(0);
+      expect(stdout).toContain("Commands");
+    });
   });
 });
 

@@ -53,11 +53,15 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "yatta": "./src/cli.ts"
+    "yatta": "./bin/yatta.js"
   },
   "files": [
+    "bin/yatta.js",
     "src/main.ts",
     "src/cli.ts",
+    "src/cli_doctor.ts",
+    "src/cli_migrate.ts",
+    "src/cli_backup.ts",
     "src/func",
     "src/types",
     "src/backend",
