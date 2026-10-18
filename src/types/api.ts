@@ -1511,6 +1511,18 @@ export interface CorsOptions {
   maxAge?: number;
 }
 
+/**
+ * Router options accepted by `createAPI`.
+ */
+export interface APIOptions {
+  /**
+   * Where the router reports an unrecognized handler failure — the ones it
+   * answers with a 500. Defaults to `console.error`; point it at a structured
+   * sink, or at a capturing array in a test, without changing the response.
+   */
+  errorLog?: (error: unknown) => void;
+}
+
 export class HttpError extends Error {
   status: number;
   details?: unknown;
@@ -1812,6 +1824,7 @@ export class API<TParams extends RouteParams = RouteParams> {
   private middlewareStack: Middleware<TParams>[] = [];
   private errorHandler?: ErrorHandler<TParams>;
   private corsOptions?: CorsOptions;
+  private errorLog?: (error: unknown) => void;
 
   // Cache: request method -> pre-filtered (incl. HEAD->GET fallback) and
   // pre-sorted (specificity descending) sub-routes. Rebuilt lazily after
@@ -1825,8 +1838,9 @@ export class API<TParams extends RouteParams = RouteParams> {
     Map<string, { handler: Handler<any>; params: Record<string, string>; routePath: string }>
   >();
 
-  constructor(path = "") {
+  constructor(path = "", options: APIOptions = {}) {
     this.declaredPath = path === "/" ? "" : path.replace(/\/$/, "");
+    this.errorLog = options.errorLog;
   }
 
   get(handler: Handler<TParams>): this;
@@ -2406,7 +2420,10 @@ export class API<TParams extends RouteParams = RouteParams> {
       try {
         return await this.errorHandler(error, ctx);
       } catch (handlerErr) {
-        console.error("Error within custom onError handler:", handlerErr);
+        (this.errorLog ?? console.error)(
+          "Error within custom onError handler:",
+          handlerErr,
+        );
       }
     }
 
@@ -2431,7 +2448,10 @@ export class API<TParams extends RouteParams = RouteParams> {
       );
     }
 
-    console.error(error);
+    // An unrecognized error is answered with a 500 but never swallowed: a
+    // handler failure that reaches nobody's eyes is undebuggable. errorLog
+    // decides where the report goes; it does not change the response.
+    (this.errorLog ?? console.error)(error);
     return API.json({ error: "Internal Server Error" }, { status: 500 });
   }
 
@@ -2853,11 +2873,18 @@ function matchPattern(
  * Factory creating a typed API router instance.
  */
 export function createAPI<Path extends string>(
-  path?: Path,
+  path: Path,
+  options?: APIOptions,
 ): API<ExtractRouteParams<Path>>;
-export function createAPI(): API<RouteParams>;
-export function createAPI(path?: string): API<any> {
-  return new API(path);
+export function createAPI(options?: APIOptions): API<RouteParams>;
+export function createAPI(
+  path?: string | APIOptions,
+  options?: APIOptions,
+): API<any> {
+  // One runtime sees both overloads: an object in the path slot means the
+  // no-path options form (`createAPI({ errorLog })`).
+  const opts = path && typeof path === "object" ? path : options ?? {};
+  return new API(typeof path === "string" ? path : "", opts);
 }
 
 let fileRouterInstance: any = null;

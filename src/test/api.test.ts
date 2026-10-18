@@ -88,7 +88,8 @@ describe("API & HTTP Layer", () => {
     });
 
     it("should prevent middleware next() double-invocation attack", async () => {
-      const api = createAPI();
+      const logged: unknown[] = [];
+      const api = createAPI({ errorLog: (error) => logged.push(error) });
       api.use(async (ctx, next) => {
         await next();
         return await next(); // Malicious/erroneous second call
@@ -102,6 +103,13 @@ describe("API & HTTP Layer", () => {
       expect(res.status).toBe(500);
       const json = await res.json();
       expect(json.error).toBe("Internal Server Error");
+
+      // The refusal is reported through errorLog instead of what used to be a
+      // caret dump beside the PASS line.
+      expect(logged).toHaveLength(1);
+      expect((logged[0] as Error).message).toBe(
+        "next() called multiple times in one middleware",
+      );
     });
 
     it("never emits '*' for a credentialed request, and fails closed without an allowlist", async () => {
@@ -664,12 +672,50 @@ describe("yatta/api — error handling across mounts", () => {
       readonly status: number = 7;
     }
 
-    const api = createAPI();
+    const logged: unknown[] = [];
+    const api = createAPI({ errorLog: (error) => logged.push(error) });
     api.get("/", () => {
       throw new JobError("not an http status");
     });
 
     expect((await api.handle(new Request("http://x/"), {})).status).toBe(500);
+
+    // An unknown error becomes 500 but is still reported — a handler failure
+    // that reaches nobody's eyes is undebuggable. errorLog decides where it
+    // goes, here the capture above rather than the console.
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toBeInstanceOf(Error);
+    expect((logged[0] as Error).message).toBe("not an http status");
+  });
+
+  it("still reports an unrecognized error to console.error when errorLog is not set", async () => {
+    class JobError extends Error {
+      readonly status: number = 7;
+    }
+
+    const printed: unknown[] = [];
+    const original = console.error;
+    console.error = (message?: unknown) => {
+      printed.push(message);
+    };
+
+    try {
+      const api = createAPI();
+      api.get("/", () => {
+        throw new JobError("unrecognized on purpose");
+      });
+
+      const res = await api.handle(new Request("http://x/"), {});
+
+      expect(res.status).toBe(500);
+      // The capture is on the error itself. Bun's display decorates it (with
+      // the throwing source and a status line), so it arrives as the Error, not
+      // a string.
+      expect(printed[0]).toBeInstanceOf(Error);
+      expect((printed[0] as Error).message).toBe("unrecognized on purpose");
+    } finally {
+      console.error = original;
+    }
   });
 
   it("passes details through from a subsystem error", async () => {

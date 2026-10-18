@@ -194,8 +194,9 @@ describe("Middleware gates the handler", () => {
 
   it("refuses to let one middleware call next twice", async () => {
     let handlerRuns = 0;
+    const logged: unknown[] = [];
 
-    const api = createAPI();
+    const api = createAPI({ errorLog: (error) => logged.push(error) });
     api.use(async (_ctx, next) => {
       await next();
       return next();
@@ -217,6 +218,13 @@ describe("Middleware gates the handler", () => {
      */
     expect(res.status).toBe(500);
     expect(handlerRuns).toBe(1);
+
+    // The bug is reported, not buried: it surfaces through errorLog, which here
+    // means the array, not the console output of the previous shape.
+    expect(logged).toHaveLength(1);
+    expect((logged[0] as Error).message).toBe(
+      "next() called multiple times in one middleware",
+    );
   });
 });
 
