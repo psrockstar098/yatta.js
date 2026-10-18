@@ -69,7 +69,6 @@
     "tsconfig.json",
     "README.md",
     "LICENSE",
-    "logo.png",
     "!src/test",
     "!**/*.test.ts",
     "!**/fixtures"

@@ -1,6 +1,6 @@
 <p align="center">
   
-  <img src="./logo.png" alt="Yatta" width="640" />
+  <img src="https://raw.githubusercontent.com/psrockstar098/yatta.js/main/logo.png" alt="Yatta" width="640" />
 </p>
 
 # Yatta
