@@ -27,6 +27,7 @@ export {
   type Handler,
   type HandlerResult,
   type ErrorHandler,
+  type APIOptions,
   type CookieOptions,
   type CorsOptions,
 } from "./api";
