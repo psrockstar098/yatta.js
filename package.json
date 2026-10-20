@@ -50,7 +50,8 @@
     "./realtime": "./src/types/realtime.ts",
     "./observe": "./src/types/observe.ts",
     "./otel": "./src/types/otel.ts",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./ds": "./src/types/ds.ts"
   },
   "bin": {
     "yatta": "bin/yatta.js"
