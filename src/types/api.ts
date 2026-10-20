@@ -1818,6 +1818,9 @@ export class API<TParams extends RouteParams = RouteParams> {
     path: string;
     handler: Handler<any>;
     specificity: number;
+    /** Pattern split into segments at registration so the matching loop
+     *  doesn't re-split it on every request. */
+    segments: string[];
   }> = [];
   private mounts: Array<{ prefix: string; router: API<any> }> = [];
 
@@ -1855,6 +1858,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         path: pathOrHandler,
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
+        segments: segmentsOf(pathOrHandler),
       });
       this.invalidateRouteCache();
     } else {
@@ -1875,6 +1879,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         path: pathOrHandler,
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
+        segments: segmentsOf(pathOrHandler),
       });
       this.invalidateRouteCache();
     } else {
@@ -1895,6 +1900,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         path: pathOrHandler,
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
+        segments: segmentsOf(pathOrHandler),
       });
       this.invalidateRouteCache();
     } else {
@@ -1915,6 +1921,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         path: pathOrHandler,
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
+        segments: segmentsOf(pathOrHandler),
       });
       this.invalidateRouteCache();
     } else {
@@ -1935,6 +1942,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         path: pathOrHandler,
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
+        segments: segmentsOf(pathOrHandler),
       });
       this.invalidateRouteCache();
     } else {
@@ -1955,6 +1963,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         path: pathOrHandler,
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
+        segments: segmentsOf(pathOrHandler),
       });
       this.invalidateRouteCache();
     } else {
@@ -1975,6 +1984,7 @@ export class API<TParams extends RouteParams = RouteParams> {
         path: pathOrHandler,
         handler: maybeHandler!,
         specificity: specificityOf(pathOrHandler),
+        segments: segmentsOf(pathOrHandler),
       });
       this.invalidateRouteCache();
     } else {
@@ -2503,7 +2513,9 @@ export class API<TParams extends RouteParams = RouteParams> {
   ): Promise<Response> {
     const ctx = new Context<TParams>(req, params);
     const method = req.method.toUpperCase() as Method;
-    const url = new URL(req.url);
+    // Reuse the URL the Context already parsed in its constructor instead of
+    // parsing req.url a second time — one parse per request, not two.
+    const url = ctx.url;
 
     const effectiveBase = basePath ?? (this.declaredPath || undefined);
     const path = stripPrefix(url.pathname, effectiveBase);
@@ -2564,6 +2576,10 @@ export class API<TParams extends RouteParams = RouteParams> {
             return hitRes;
           }
 
+          // The request path is split once here, not once per candidate:
+          // matchSegments takes the pattern's pre-split segments (stored at
+          // registration) and the request's pre-split segments.
+          const pathSegs = segmentsOf(path);
           for (const cand of candidates) {
             let matchedParams: Record<string, string> | null = null;
             if (
@@ -2572,7 +2588,7 @@ export class API<TParams extends RouteParams = RouteParams> {
             ) {
               matchedParams = {};
             } else {
-              matchedParams = matchPattern(cand.path, path);
+              matchedParams = matchSegments(cand.segments, pathSegs);
             }
 
             if (matchedParams !== null) {
@@ -2785,6 +2801,11 @@ function specificityOf(pattern: string): number {
   }, 1);
 }
 
+/** A route pattern pre-split into segments, computed once at registration. */
+function segmentsOf(pattern: string): string[] {
+  return pattern.split("/").filter(Boolean);
+}
+
 function httpStatusOf(error: unknown): number | undefined {
   if (!error || typeof error !== "object") return undefined;
 
@@ -2819,8 +2840,18 @@ function matchPattern(
   pattern: string,
   path: string,
 ): Record<string, string> | null {
-  const pSegs = pattern.split("/").filter(Boolean);
-  const rSegs = path.split("/").filter(Boolean);
+  return matchSegments(segmentsOf(pattern), segmentsOf(path));
+}
+
+/**
+ * The matching loop proper. Takes pre-split segments on both sides so the
+ * request path is split once per request instead of once per candidate
+ * pattern, and patterns carry their segments from registration.
+ */
+function matchSegments(
+  pSegs: string[],
+  rSegs: string[],
+): Record<string, string> | null {
   const params: Record<string, string> = {};
 
   for (let i = 0; i < pSegs.length; i++) {
