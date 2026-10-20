@@ -41,26 +41,26 @@ function resolveApi(module: Record<string, unknown>): API | undefined {
  *
  * HSTS is only sent over HTTPS: sending it over plain HTTP is ignored by
  * browsers at best, and can lock a local dev origin out of the browser.
+ *
+ * The two variants are precomputed once at module load instead of being
+ * rebuilt on every response — the request path just iterates the pairs.
  */
-function securityHeaders(isHttps: boolean): Record<string, string> {
-  const headers: Record<string, string> = {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Referrer-Policy": "strict-origin-when-cross-origin",
-    "X-XSS-Protection": "0",
-  };
+const SECURITY_HEADERS_HTTP: Array<[string, string]> = [
+  ["X-Content-Type-Options", "nosniff"],
+  ["X-Frame-Options", "DENY"],
+  ["Referrer-Policy", "strict-origin-when-cross-origin"],
+  ["X-XSS-Protection", "0"],
+];
 
-  if (isHttps) {
-    headers["Strict-Transport-Security"] =
-      "max-age=31536000; includeSubDomains";
-  }
-
-  return headers;
-}
+const SECURITY_HEADERS_HTTPS: Array<[string, string]> = [
+  ...SECURITY_HEADERS_HTTP,
+  ["Strict-Transport-Security", "max-age=31536000; includeSubDomains"],
+];
 
 /** Returns a copy of `res` with the standard hardening headers applied. */
 function withSecurityHeaders(res: Response, isHttps: boolean): Response {
-  for (const [key, value] of Object.entries(securityHeaders(isHttps))) {
+  const pairs = isHttps ? SECURITY_HEADERS_HTTPS : SECURITY_HEADERS_HTTP;
+  for (const [key, value] of pairs) {
     res.headers.set(key, value);
   }
   return res;

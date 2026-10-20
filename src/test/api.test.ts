@@ -68,6 +68,36 @@ describe("API & HTTP Layer", () => {
       expect(cookies.test).toBe("ok");
     });
 
+    it("should not prototype-pollute or misread inherited names in formData schema conversion", async () => {
+      const passthrough = { parse: (d: unknown) => d };
+      const fd = new FormData();
+      fd.append("__proto__", "polluted");
+      fd.append("constructor", "x");
+      fd.append("name", "alice");
+      fd.append("name", "bob");
+
+      const req = new Request("http://localhost/submit", {
+        method: "POST",
+        body: fd,
+      });
+      const ctx = new Context(req, {});
+      const obj = (await ctx.formData(passthrough)) as Record<string, unknown>;
+
+      // A single field named `constructor` must stay a string — before the fix
+      // the inherited `constructor` made `key in dataObj` true, so the first
+      // occurrence was treated as a repeat and came back as an array.
+      expect(obj["constructor"]).toBe("x");
+
+      // A `__proto__` field must be an own key, never the prototype, and the
+      // global Object.prototype must be untouched.
+      expect(Object.prototype.hasOwnProperty.call(obj, "__proto__")).toBe(true);
+      expect(obj["__proto__"]).toBe("polluted");
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+
+      // Repeated fields still collapse into arrays.
+      expect(obj.name).toEqual(["alice", "bob"]);
+    });
+
     it("should reject invalid JSON payloads with ValidationError (400)", async () => {
       const api = createAPI();
       api.post(async (ctx) => {
