@@ -59,4 +59,23 @@ describe("API — mounts sharing a prefix", () => {
     const res = await root.handle(new Request("http://x/api/unknown"));
     expect(res.status).toBe(404);
   });
+
+  it("does not stack-overflow when mounts form a cycle and CORS is on", async () => {
+    const a = createAPI();
+    const b = createAPI();
+    a.cors({});
+    a.get("/x", () => API.json({ ok: true }));
+    a.mount("/b", b);
+    b.mount("/a", a);
+
+    // applyCors() calls collectAllMethods(), which recursed through mounts
+    // with no cycle guard — a request against this configuration blew the
+    // stack and crashed the process instead of answering.
+    const res = await a.handle(
+      new Request("http://x/missing", { headers: { Origin: "http://example.com" } }),
+      {},
+    );
+    expect(res.status).toBe(404);
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
 });

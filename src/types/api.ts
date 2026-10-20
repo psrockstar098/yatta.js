@@ -1756,10 +1756,17 @@ export class Context<TParams extends RouteParams = RouteParams> {
     }
     if (!schema) return this.rawFormData as unknown as T;
 
-    // Convert FormData to object for schema validators like Zod
-    const dataObj: Record<string, any> = {};
+    // Convert FormData to object for schema validators like Zod.
+    //
+    // Null-prototype, for the same reason as `query()` and `cookies()`: a
+    // plain `{}` made `key in dataObj` true for inherited names, so a single
+    // `constructor` field was treated as a repeat and came back as an array
+    // `[Object, value]`, and a `__proto__` field assigned through the
+    // prototype setter — silently swallowed as a key while corrupting the
+    // result object's prototype before the schema ever saw it.
+    const dataObj: Record<string, any> = Object.create(null);
     for (const [key, value] of this.rawFormData.entries()) {
-      if (key in dataObj) {
+      if (Object.prototype.hasOwnProperty.call(dataObj, key)) {
         if (Array.isArray(dataObj[key])) {
           dataObj[key].push(value);
         } else {
@@ -2302,11 +2309,19 @@ export class API<TParams extends RouteParams = RouteParams> {
     });
   }
 
-  collectAllMethods(): Set<Method> {
+  collectAllMethods(seen?: Set<API<any>>): Set<Method> {
+    // Cycle-guard: two routers that mount each other (directly or through a
+    // chain) used to recurse here forever — one request against a
+    // CORS-enabled router with a mount cycle blew the stack and crashed the
+    // process. The visited set breaks the cycle; the first visit wins.
+    const visited = seen ?? new Set<API<any>>();
+    if (visited.has(this)) return new Set();
+    visited.add(this);
+
     const set = new Set<Method>(this.routes.keys());
     for (const r of this.subRoutes) set.add(r.method);
     for (const m of this.mounts) {
-      for (const meth of m.router.collectAllMethods()) set.add(meth);
+      for (const meth of m.router.collectAllMethods(visited)) set.add(meth);
     }
     return set;
   }
