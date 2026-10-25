@@ -499,6 +499,11 @@ change to a claim the site makes. The AGENTS.md file at the repo root has the
 mapping, and yatta-docs fails its build if the generated API reference has drifted
 from this source.
 
+## Support
+
+Yatta JS is free and open source. If it saves you time, you can
+[support the project on Ko-fi](https://ko-fi.com/yattajs).
+
 ## License
 
 MIT
