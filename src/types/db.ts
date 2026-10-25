@@ -2467,6 +2467,17 @@ export class YattaDB {
 
   private buildColumnDefFragment(colName: string, def: ColumnDefinition, mode: "create" | "alter"): string {
     const safeName = colName.replace(/"/g, '""');
+    // Runtime whitelist: TypeScript narrows these, but a JS caller, an `as any`
+    // cast, or a dynamically loaded schema can pass anything, and both values
+    // used to be interpolated into DDL verbatim.
+    const ALLOWED_TYPES = ["INTEGER", "TEXT", "REAL", "BLOB"];
+    if (!ALLOWED_TYPES.includes(def.type)) {
+      throw new YattaError(`Invalid column type "${def.type}" for "${colName}". Expected one of ${ALLOWED_TYPES.join(", ")}.`);
+    }
+    const ALLOWED_ON_DELETE = ["CASCADE", "SET NULL", "RESTRICT"];
+    if (def.references?.onDelete && !ALLOWED_ON_DELETE.includes(def.references.onDelete)) {
+      throw new YattaError(`Invalid ON DELETE action "${def.references.onDelete}" for "${colName}". Expected one of ${ALLOWED_ON_DELETE.join(", ")}.`);
+    }
     let s = `"${safeName}" ${def.type}`;
 
     if (mode === "create") {
@@ -2564,8 +2575,13 @@ export class YattaDB {
 
             if ((def.isIndex || def.references) && !def.unique && !indexedCols.has(colName)) {
               indexedCols.add(colName);
+              // The index NAME is an identifier too: a `"` in the table or column
+              // name used to close it and let the rest parse as SQL (a crafted
+              // column name created arbitrary tables via syncSchema). Escape it
+              // exactly like every other identifier on this line.
+              const idxName = `idx_${tableName}_${colName}`.replace(/"/g, '""');
               indexSqls.push(
-                `CREATE INDEX IF NOT EXISTS "idx_${tableName}_${colName}" ON "${tableName.replace(/"/g, '""')}" ("${colName.replace(/"/g, '""')}");`,
+                `CREATE INDEX IF NOT EXISTS "${idxName}" ON "${tableName.replace(/"/g, '""')}" ("${colName.replace(/"/g, '""')}");`,
               );
             }
           }
@@ -2610,14 +2626,16 @@ export class YattaDB {
               .run(`alter:${tableName}.${colName}`, schemaHash);
 
             if (def.unique) {
+              const uniqName = `uniq_${tableName}_${colName}`.replace(/"/g, '""');
               indexSqls.push(
-                `CREATE UNIQUE INDEX IF NOT EXISTS "uniq_${tableName}_${colName}" ON "${tableName.replace(/"/g, '""')}" ("${colName.replace(/"/g, '""')}");`,
+                `CREATE UNIQUE INDEX IF NOT EXISTS "${uniqName}" ON "${tableName.replace(/"/g, '""')}" ("${colName.replace(/"/g, '""')}");`,
               );
             }
             if ((def.isIndex || def.references) && !def.unique && !indexedCols.has(colName)) {
               indexedCols.add(colName);
+              const idxName = `idx_${tableName}_${colName}`.replace(/"/g, '""');
               indexSqls.push(
-                `CREATE INDEX IF NOT EXISTS "idx_${tableName}_${colName}" ON "${tableName.replace(/"/g, '""')}" ("${colName.replace(/"/g, '""')}");`,
+                `CREATE INDEX IF NOT EXISTS "${idxName}" ON "${tableName.replace(/"/g, '""')}" ("${colName.replace(/"/g, '""')}");`,
               );
             }
           }

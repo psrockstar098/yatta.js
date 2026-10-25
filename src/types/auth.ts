@@ -776,12 +776,29 @@ export class MemoryAuditStore implements AuthAuditStore {
 // ──────────────────────────────────────────────────────────────────────────
 
 export class AuthCrypto {
+  private static shortSecretWarned = false;
   readonly encKey: Buffer;
   readonly jwtKey: Buffer;
   readonly oauthKey: Buffer;
   readonly recoveryKey: Buffer;
 
   constructor(secret: string, customEncKey?: string) {
+    /*
+     * No length check used to exist here at all: the salt and info strings
+     * are public (open-source code), so a guessable secret ("secret",
+     * "yatta", "") lets an attacker derive every key offline with HKDF and
+     * forge any token without touching the server. Warn once for short
+     * secrets; length is enforced by deployment config, not by throwing
+     * here, so existing test/dev setups keep working.
+     */
+    if (secret.length < 32 && !AuthCrypto.shortSecretWarned) {
+      AuthCrypto.shortSecretWarned = true;
+      console.warn(
+        "[yatta] WARNING: AUTH_SECRET is shorter than 32 characters. " +
+          "Use a long random secret (openssl rand -base64 32) — short secrets " +
+          "can be guessed offline and every derived key forged.",
+      );
+    }
     if (customEncKey) {
       const buf = Buffer.from(customEncKey, "hex");
       if (buf.length !== 32) {
@@ -1088,8 +1105,17 @@ export class GranularRateLimiter {
       const validHits = record.hits.filter((t) => t > windowStart);
       validHits.push(now);
 
+      /*
+       * Never extend an active lockout: every failure during a lockout used
+       * to re-set lockoutUntil to now + lockoutSec, so an attacker who kept
+       * failing could hold a victim account/IP locked out indefinitely. The
+       * lockout now lasts exactly lockoutSec from the failure that triggered
+       * it; hits are still recorded for the next window.
+       */
       let lockoutUntil = record.lockoutUntil;
-      if (validHits.length >= rule.maxAttempts) {
+      const alreadyLockedOut =
+        record.lockoutUntil !== undefined && record.lockoutUntil > now;
+      if (validHits.length >= rule.maxAttempts && !alreadyLockedOut) {
         lockoutUntil = now + rule.lockoutSec * 1000;
       }
 

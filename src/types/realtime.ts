@@ -1722,6 +1722,21 @@ export class RealtimeServer<TData = Record<string, unknown>> {
   constructor(readonly config: RealtimeConfig<TData> = {}) {
     this.logger = config.logger ?? defaultLogger;
     this.adapter = config.adapter ?? new InMemoryPubSubAdapter();
+    /*
+     * Warn, mirroring storage's no-authorizer warning: with neither
+     * `authenticate` nor `authorize.join` configured, any client that can
+     * reach the port can open a WebSocket and subscribe to any topic, so
+     * anything the server publishes to a predictable topic is readable by
+     * strangers. The callbacks are the opt-in; silence means the app has
+     * not decided yet, and that should be loud.
+     */
+    if (!config.authenticate && !config.authorize?.join) {
+      this.logger.warn(
+        "[yatta] WARNING: Realtime has no 'authenticate' or 'authorize.join' configured. " +
+          "Any client can connect and subscribe to any topic. " +
+          "Configure authenticate/authorize to restrict access.",
+      );
+    }
   }
 
   /**
@@ -1939,6 +1954,29 @@ export class RealtimeServer<TData = Record<string, unknown>> {
       const topic = url.searchParams.get("topic") ?? "global";
       const lastEventId =
         req.headers.get("last-event-id") ?? url.searchParams.get("lastEventId");
+
+      /*
+       * The WS path runs `authorize.join` before subscribing; this branch
+       * used to skip it entirely, so an app's join guard was silently void
+       * over SSE. Run the same guard here. There is no socket for an SSE
+       * client, so the guard receives a data-only client (id + data); guards
+       * must only read `client.data`. A throwing guard denies, fail-closed.
+       */
+      if (this.config.authorize?.join) {
+        const sseClient = {
+          id: `sse-${crypto.randomUUID()}`,
+          data: mergedData,
+        } as SocketClient<TData>;
+        let allowed = false;
+        try {
+          allowed = await this.checkAuthorizeJoin(sseClient, topic);
+        } catch {
+          allowed = false;
+        }
+        if (!allowed) {
+          return new Response("Forbidden", { status: 403 });
+        }
+      }
 
       const channel = this.channel(topic);
       return sse<TData>(

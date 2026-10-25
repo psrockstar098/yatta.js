@@ -427,10 +427,25 @@ export interface MultiDiskStorageConfig {
 }
 
 /**
+ * Single-disk configuration: a driver config plus the manager-level options
+ * that used to exist only on the multi-disk form. Without this, a developer
+ * using the documented `createStorage({ driver: "local", baseDir })` form had
+ * no config path to set an authorizer or signed-URL-only mode, and silently
+ * got world-readable files.
+ */
+export type SingleDiskStorageConfig = DriverConfig & {
+  authorize?: StorageAuthorizer;
+  security?: StorageSecurityConfig;
+  secret?: string;
+  publicReads?: boolean;
+};
+
+/**
  * Combined configuration accepted by `createStorage`.
  */
 export type StorageConfig =
   | DriverConfig
+  | SingleDiskStorageConfig
   | (MultiDiskStorageConfig & { driver?: never });
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -517,8 +532,16 @@ export function parseDuration(val?: HumanTime): number {
 
   // Decimals are allowed by the HumanTime type ("1.5h"), and rejecting them
   // here silently substituted the default: "1.5h" became 1 hour, not 90 minutes.
+  // Likewise an unparseable string used to silently become 3600s — so a typo
+  // like "1hh" or a negative "-1h" issued a valid 1-hour token instead of
+  // failing. The number form already throws on invalid input; the string form
+  // now does the same. Only `undefined` takes the default.
   const match = val.trim().match(/^(\d+(?:\.\d+)?)\s*(s|m|h|d|w)$/i);
-  if (!match) return 3600;
+  if (!match) {
+    throw new StorageError(
+      `Invalid duration: expected a value like "30s", "5m" or "2h", got "${val}".`,
+    );
+  }
 
   const count = parseFloat(match[1]!);
   const unit = match[2]!.toLowerCase();
@@ -2831,8 +2854,12 @@ export class StorageManager {
         );
       }
     } else {
-      const cfg = config as DriverConfig;
-      this.disks.set(this.defaultDiskName, this.createDisk(cfg));
+      const cfg = config as SingleDiskStorageConfig;
+      this.authorizer = cfg.authorize;
+      this.disks.set(
+        this.defaultDiskName,
+        this.createDisk(cfg, cfg.security, cfg.secret),
+      );
     }
 
     // Warn if no authorizer is configured — files are world-readable by default.

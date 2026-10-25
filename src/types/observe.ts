@@ -2895,6 +2895,16 @@ export class Observer {
 
         try {
           const res = await this.tracer.activate(span, () => handler(req));
+          /*
+           * Upgrade responses have no Response object: a WebSocket upgrade
+           * returns `undefined` (Bun upgrades the socket in place), so `res`
+           * is undefined here. Reading `res.status` used to throw, and that
+           * rejection escaped the fetch handler and killed the process via
+           * the unhandled-rejection shutdown path — one WS handshake was
+           * enough to take the server down. There is nothing to annotate
+           * for an upgrade, so return it as-is.
+           */
+          if (!res) return res as any;
           span.setHttpStatus(res.status);
 
           const duration = performance.now() - start;
