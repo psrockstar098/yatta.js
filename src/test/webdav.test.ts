@@ -229,4 +229,49 @@ describe("WebDAV", () => {
     expect(res.headers.get("Dav")).toContain("1");
     expect(res.headers.get("Allow")).toContain("PROPFIND");
   });
+
+  it("a lock on a collection blocks writes to its children", async () => {
+    const handle = dav(memoryStore());
+    await handle(req("http://x/dav/dir", { method: "MKCOL" }));
+    const lock = await handle(req("http://x/dav/dir", { method: "LOCK", body: "" }));
+    expect(lock.status).toBe(200);
+    const token = lock.headers.get("Lock-Token") ?? "";
+    const blocked = await handle(
+      req("http://x/dav/dir/child.txt", { method: "PUT", body: "no" }),
+    );
+    expect(blocked.status).toBe(423);
+    const allowed = await handle(
+      req("http://x/dav/dir/child.txt", {
+        method: "PUT",
+        body: "yes",
+        headers: { "Lock-Token": token },
+      }),
+    );
+    expect(allowed.status).toBe(201);
+  });
+
+  it("deleting a collection with a locked child is refused", async () => {
+    const handle = dav(memoryStore());
+    await handle(req("http://x/dav/dir", { method: "MKCOL" }));
+    await handle(req("http://x/dav/dir/secret.txt", { method: "PUT", body: "s" }));
+    await handle(req("http://x/dav/dir/secret.txt", { method: "LOCK", body: "" }));
+    const del = await handle(req("http://x/dav/dir", { method: "DELETE" }));
+    expect(del.status).toBe(423);
+    const kept = await handle(req("http://x/dav/dir/secret.txt"));
+    expect(kept.status).toBe(200);
+  });
+
+  it("MOVE of a collection with a locked descendant is refused", async () => {
+    const handle = dav(memoryStore());
+    await handle(req("http://x/dav/d", { method: "MKCOL" }));
+    await handle(req("http://x/dav/d/f.txt", { method: "PUT", body: "f" }));
+    await handle(req("http://x/dav/d/f.txt", { method: "LOCK", body: "" }));
+    const move = await handle(
+      req("http://x/dav/d", {
+        method: "MOVE",
+        headers: { Destination: "http://x/dav/e" },
+      }),
+    );
+    expect(move.status).toBe(423);
+  });
 });

@@ -106,12 +106,40 @@ export function createWebDAVHandler(
   }
 
   // A locked file refuses changes unless the caller shows the lock token,
-  // either in an If header or in a Lock-Token header.
+  // either in an If header or in a Lock-Token header. A lock on a
+  // collection covers everything under it too: writing to a child of a
+  // locked collection needs the collection's token, not just the
+  // child's own lock. Without this, locking a folder would not stop
+  // anyone from changing or deleting what is inside it.
   function lockBlocks(req: Request, path: string): boolean {
-    const lock = liveLock(path);
-    if (!lock) return false;
     const shown = `${req.headers.get("if") ?? ""} ${req.headers.get("lock-token") ?? ""}`;
-    return !shown.includes(lock.token);
+    let current = path;
+    for (;;) {
+      const lock = liveLock(current);
+      if (lock && !shown.includes(lock.token)) return true;
+      if (current === "") return false;
+      current = parentOf(current);
+    }
+  }
+
+  // Every path in a tree: the path itself plus all descendants.
+  // Used to check locks before a whole-tree change (DELETE, MOVE).
+  async function collectSubtree(path: string): Promise<string[]> {
+    const out: string[] = [path];
+    if (await store.isCollection(path)) {
+      for (const child of await store.list(path)) {
+        out.push(...(await collectSubtree(child.path)));
+      }
+    }
+    return out;
+  }
+
+  // True when any path in a tree is locked and its token is not shown.
+  async function subtreeLocked(req: Request, path: string): Promise<boolean> {
+    for (const p of await collectSubtree(path)) {
+      if (lockBlocks(req, p)) return true;
+    }
+    return false;
   }
 
   async function deleteTree(path: string): Promise<void> {
@@ -283,7 +311,7 @@ export function createWebDAVHandler(
       if (!(await store.exists(path)) && !(await store.isCollection(path))) {
         return new Response("Not Found", { status: 404 });
       }
-      if (lockBlocks(req, path)) {
+      if (await subtreeLocked(req, path)) {
         return new Response("Locked", { status: 423 });
       }
       await deleteTree(path);
@@ -297,8 +325,10 @@ export function createWebDAVHandler(
       }
       const dst = dstSegments.join("/");
       const isMove = method === "MOVE";
-      if (isMove && lockBlocks(req, path)) {
-        return new Response("Source is locked", { status: 423 });
+      if (isMove) {
+        if (await subtreeLocked(req, path)) {
+          return new Response("Source is locked", { status: 423 });
+        }
       }
       if (lockBlocks(req, dst)) {
         return new Response("Destination is locked", { status: 423 });
