@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { rmSync } from "node:fs";
+import { rmSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { SQLiteJobStore } from "../types/job";
 
@@ -136,8 +138,11 @@ describe("The claim query is served by an index built for it", () => {
   });
 
   it("migrates a database that already has the old index", async () => {
-    const file = `/tmp/opencode/yatta-index-upgrade-${Date.now()}.db`;
-    rmSync(file, { force: true });
+    // A fresh temp dir every run: the old code hardcoded /tmp/opencode, a
+    // directory nothing creates, so this test failed wherever that dir was
+    // absent (CI) and passed only where it happened to exist.
+    const dir = mkdtempSync(join(tmpdir(), "yatta-index-upgrade-"));
+    const file = join(dir, "test.db");
 
     try {
       // Build a database the way the previous version would have: old index, no v2.
@@ -181,9 +186,7 @@ describe("The claim query is served by an index built for it", () => {
 
       expect(steps.filter((d) => d.includes("COVERING INDEX"))).not.toEqual([]);
     } finally {
-      rmSync(file, { force: true });
-      rmSync(`${file}-wal`, { force: true });
-      rmSync(`${file}-shm`, { force: true });
+      rmSync(dir, { force: true, recursive: true });
     }
   });
 });
