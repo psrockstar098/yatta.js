@@ -3,6 +3,14 @@ import path from "node:path";
 import { API } from "../types/api";
 import { realtime } from "./realtime";
 import { storage } from "./storage";
+import { createWebDAVHandler, createStorageDavStore } from "./webdav";
+
+// One shared handler so WebDAV locks survive across requests.
+// storage.disk() is the raw disk API (upload/download/head/list);
+// the manager facade on its own does not expose those methods.
+const webdavHandler = createWebDAVHandler(createStorageDavStore(storage.disk()), {
+  basePath: "/dav",
+});
 
 // Always resolve relative to this file to guarantee correct path regardless of current working directory
 const backendDir = path.resolve(import.meta.dir, "../backend");
@@ -85,6 +93,11 @@ export default async function routers(
   if (url.pathname.startsWith("/storage")) {
     const res = await storage.handleRequest(req, "/storage");
     return withSecurityHeaders(res, isHttps);
+  }
+
+  // 2b. WebDAV file operations (1.0.5), backed by the storage engine.
+  if (url.pathname === "/dav" || url.pathname.startsWith("/dav/")) {
+    return withSecurityHeaders(await webdavHandler(req), isHttps);
   }
 
   // 3. Hot-reload routes in development mode so new files (e.g. user/index.ts) are instantly detected
