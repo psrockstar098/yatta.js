@@ -1,10 +1,6 @@
 {
   "name": "yatta.js",
-<<<<<<< Updated upstream
   "version": "1.0.5",
-=======
-  "version": "1.0.1",
->>>>>>> Stashed changes
   "description": "Production-grade backend framework for Bun: hardware-aware worker runtime, type-safe SQLite ORM, auth, jobs, cache, storage, mail, and realtime.",
   "keywords": [
     "bun",
