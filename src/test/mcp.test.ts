@@ -270,4 +270,27 @@ describe("MCP server", () => {
     ]);
     expect(((await ok.json()) as Array<unknown>).length).toBe(2);
   });
+
+  it("collections that sanitize to one tool name do not duplicate tools", async () => {
+    // "a.b" and "a_b" both sanitize to "a_b". Before the fix,
+    // tools/list showed each name twice and tools/call always hit
+    // the first collection, silently serving the wrong rows.
+    const { table } = memoryTable();
+    const handler = createMCPHandler({
+      resolveUser: async () => "user-1",
+      getSurface: () =>
+        surfaceFromTables({ "a.b": table, "a_b": table }),
+    });
+    const res = await post(handler, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/list",
+      params: {},
+    });
+    const names = (
+      (await res.json()) as { result: { tools: Array<{ name: string }> } }
+    ).result.tools.map((t) => t.name);
+    expect(new Set(names).size).toBe(names.length);
+    expect(names).toContain("list_a_b");
+  });
 });

@@ -242,6 +242,17 @@ export function createMCPHandler(options: McpOptions) {
     const seen = new Set<string>();
     for (const [name, table] of Object.entries(surface.tables)) {
       for (const tool of collectionTools(name, table)) {
+        // Two collections can sanitize to one tool name ("a.b" and
+        // "a_b" both become "a_b"). Without this, tools/list showed
+        // the name twice and tools/call always hit the first
+        // collection — the second was shadowed, so a client asking
+        // for one collection silently got the other's rows.
+        if (seen.has(tool.name)) {
+          console.warn(
+            `[mcp] skipping tool "${tool.name}" from collection "${name}": name is taken`,
+          );
+          continue;
+        }
         tools.push(tool);
         seen.add(tool.name);
       }
