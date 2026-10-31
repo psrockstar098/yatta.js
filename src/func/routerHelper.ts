@@ -5,6 +5,7 @@ import { realtime } from "./realtime";
 import { storage } from "./storage";
 import { createWebDAVHandler, createStorageDavStore } from "./webdav";
 import { createGrpcWebHandler } from "./grpcweb";
+import { createDoHHandler } from "./doh";
 
 // One shared handler so WebDAV locks survive across requests.
 // storage.disk() is the raw disk API (upload/download/head/list);
@@ -15,6 +16,9 @@ const webdavHandler = createWebDAVHandler(createStorageDavStore(storage.disk()),
 
 // gRPC-Web services, shared across requests.
 const grpcWebHandler = createGrpcWebHandler();
+
+// DNS over HTTPS (1.0.5) on /dns-query.
+const dohHandler = createDoHHandler();
 
 // Always resolve relative to this file to guarantee correct path regardless of current working directory
 const backendDir = path.resolve(import.meta.dir, "../backend");
@@ -107,6 +111,11 @@ export default async function routers(
   // 2c. gRPC-Web unary calls (1.0.5).
   if (url.pathname === "/grpc-web" || url.pathname.startsWith("/grpc-web/")) {
     return withSecurityHeaders(await grpcWebHandler(req), isHttps);
+  }
+
+  // 2d. DNS over HTTPS (1.0.5).
+  if (url.pathname === "/dns-query") {
+    return withSecurityHeaders(await dohHandler(req), isHttps);
   }
 
   // 3. Hot-reload routes in development mode so new files (e.g. user/index.ts) are instantly detected
