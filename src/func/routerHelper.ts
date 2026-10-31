@@ -118,6 +118,21 @@ export default async function routers(
     return withSecurityHeaders(await dohHandler(req), isHttps);
   }
 
+  // 2e. WebFinger discovery (1.0.5), backed by the auth store.
+  if (url.pathname === "/.well-known/webfinger") {
+    const { createWebFingerHandler, createUserWebFingerLookup } = await import(
+      "./webfinger"
+    );
+    const { SQLiteAuthStore } = await import("./auth");
+    const handler = createWebFingerHandler(
+      createUserWebFingerLookup({
+        findUserByEmail: (email) => new SQLiteAuthStore().findUserByEmail(email),
+        appUrl: process.env.APP_URL || "http://localhost:4000",
+      }),
+    );
+    return withSecurityHeaders(await handler(req), isHttps);
+  }
+
   // 3. Hot-reload routes in development mode so new files (e.g. user/index.ts) are instantly detected
   if (process.env.NODE_ENV !== "production") {
     router.reload();
