@@ -50,6 +50,13 @@
     "./realtime": "./src/types/realtime.ts",
     "./observe": "./src/types/observe.ts",
     "./otel": "./src/types/otel.ts",
+    "./grpcweb": "./src/func/grpcweb.ts",
+    "./webdav": "./src/func/webdav.ts",
+    "./webfinger": "./src/func/webfinger.ts",
+    "./doh": "./src/func/doh.ts",
+    "./oauth": "./src/func/oauth.ts",
+    "./oidc": "./src/func/oidc.ts",
+    "./mcp": "./src/func/mcp.ts",
     "./package.json": "./package.json",
     "./ds": "./src/types/ds.ts"
   },

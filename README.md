@@ -34,6 +34,7 @@ no build step for application code — TypeScript runs directly.
 - [The worker runtime](#the-worker-runtime)
 - [Benchmarks](#benchmarks)
 - [Feature engines](#feature-engines)
+- [Protocols](#protocols)
 - [Write a route once](#write-a-route-once)
 - [Observability](#observability)
 - [Routing](#routing)
@@ -125,6 +126,40 @@ persistent stores, and supports TypeScript module augmentation for typed keys.
 | `yatta/realtime` | Unified SSE + WebSocket, topic pub/sub, AI token streaming, job tracking, backpressure |
 | `yatta/observe` | Tracing, metrics, logs, issue grouping, incident correlation, adaptive baselines, SLOs, N+1 detection, golden traces |
 | `yatta/otel` | OpenTelemetry bridge — Yatta spans flow to any OTel backend (Jaeger, Tempo, Datadog) |
+
+## Protocols
+
+Six wire protocols are mounted before your file routes, so they answer on a
+fresh `yatta init` with nothing configured. Each one is also importable, so you
+can mount it yourself with your own options — seven import paths, because
+OpenID Connect is a layer on top of the OAuth server rather than a server of its
+own.
+
+| Import | Served at | What it does |
+|--------|-----------|--------------|
+| `yatta.js/grpcweb` | `/grpc-web` | gRPC-Web unary calls — protobuf codec, framing, trailers, a client, and a health check |
+| `yatta.js/webdav` | `/dav` | WebDAV (RFC 4918) over the storage engine — Finder, Explorer, Word, davfs2 |
+| `yatta.js/doh` | `/dns-query` | DNS over HTTPS (RFC 8484), wire and JSON shapes, A and AAAA |
+| `yatta.js/webfinger` | `/.well-known/webfinger` | WebFinger (RFC 7033) discovery for auth-store accounts |
+| `yatta.js/oauth` | `/oauth/*` | OAuth 2.0 server — code + PKCE, client credentials, rotating refresh tokens |
+| `yatta.js/oidc` | `/oauth/jwks`, `/oauth/userinfo`, `/.well-known/openid-configuration` | OpenID Connect on top of OAuth — RS256 ID tokens, discovery, JWKS |
+| `yatta.js/mcp` | `/mcp` | MCP server whose tools are generated from your collections |
+
+```ts
+import { createGrpcWebHandler, GrpcError, GrpcStatus } from "yatta.js/grpcweb";
+
+const grpc = createGrpcWebHandler({
+  "shop.Catalog/Get": async () => {
+    throw new GrpcError(GrpcStatus.NOT_FOUND, "no such item");
+  },
+});
+```
+
+Two limits worth knowing before you rely on them. `/dav` has **no
+authentication** of its own: pass `authenticate`, or keep it behind the auth
+wall you already run. WebDAV locks live in the process, so they are not shared
+between nodes and do not survive a restart. OAuth and OIDC state is in memory by
+default for the same reason.
 
 ### Typed keys
 
