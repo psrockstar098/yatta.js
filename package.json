@@ -1,6 +1,6 @@
 {
   "name": "yatta.js",
-  "version": "1.0.1",
+  "version": "1.0.5",
   "description": "Production-grade backend framework for Bun: hardware-aware worker runtime, type-safe SQLite ORM, auth, jobs, cache, storage, mail, and realtime.",
   "keywords": [
     "bun",
