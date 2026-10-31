@@ -69,6 +69,7 @@ describe("gRPC-Web handler", () => {
     const res = await handle(
       new Request("http://x/grpc-web/yatta.Health/Check", {
         method: "POST",
+        headers: { "Content-Type": "application/grpc-web" },
         body: encodeFrame(new Uint8Array()) as BodyInit,
       }),
     );
@@ -81,6 +82,7 @@ describe("gRPC-Web handler", () => {
     const res = await handle(
       new Request("http://x/grpc-web/nope/Nope", {
         method: "POST",
+        headers: { "Content-Type": "application/grpc-web" },
         body: encodeFrame(new Uint8Array()) as BodyInit,
       }),
     );
@@ -97,6 +99,7 @@ describe("gRPC-Web handler", () => {
     const res = await custom(
       new Request("http://x/grpc-web/demo.Math/Double", {
         method: "POST",
+        headers: { "Content-Type": "application/grpc-web" },
         body: encodeFrame(encodeVarintField(1, 21)) as BodyInit,
       }),
     );

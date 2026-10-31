@@ -101,6 +101,15 @@ const dav = (store: DavStore) => createWebDAVHandler(store, { basePath: "/dav" }
 const req = (url: string, init?: RequestInit) =>
   new Request(url, init);
 
+// A LOCK request must say what it wants locked. A body-less LOCK is a
+// refresh of an existing lock, which is why the empty string is not
+// usable here.
+const LOCK_BODY =
+  `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:">` +
+  `<D:lockscope><D:exclusive/></D:lockscope>` +
+  `<D:locktype><D:write/></D:locktype>` +
+  `<D:owner><D:href>tester</D:href></D:owner></D:lockinfo>`;
+
 describe("WebDAV", () => {
   it("PUT then GET returns the same bytes", async () => {
     const handle = dav(memoryStore());
@@ -133,7 +142,11 @@ describe("WebDAV", () => {
       );
       const get = await handle(req(`http://x/dav/${name}`));
       expect(get.status).toBe(200);
-      expect(get.headers.get("content-disposition")).toBe("attachment");
+      // Any "attachment" disposition downloads; the filename is extra.
+      expect(get.headers.get("content-disposition")).toContain("attachment");
+      // And it must not be sniffed or given an origin to run in.
+      expect(get.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(get.headers.get("content-security-policy")).toBe("sandbox");
     }
     await handle(
       req("http://x/dav/x.png", {
@@ -266,7 +279,9 @@ describe("WebDAV", () => {
   it("a lock on a collection blocks writes to its children", async () => {
     const handle = dav(memoryStore());
     await handle(req("http://x/dav/dir", { method: "MKCOL" }));
-    const lock = await handle(req("http://x/dav/dir", { method: "LOCK", body: "" }));
+    const lock = await handle(
+      req("http://x/dav/dir", { method: "LOCK", body: LOCK_BODY }),
+    );
     expect(lock.status).toBe(200);
     const token = lock.headers.get("Lock-Token") ?? "";
     const blocked = await handle(
@@ -283,11 +298,59 @@ describe("WebDAV", () => {
     expect(allowed.status).toBe(201);
   });
 
+  it("a body-less LOCK refreshes the lock only when the token is shown", async () => {
+    // Word and Finder send this before a lock runs out. An empty body
+    // with no token used to create a fresh lock, which hid the fact
+    // that the caller was not the lock holder at all.
+    const handle = dav(memoryStore());
+    await handle(req("http://x/dav/f.txt", { method: "PUT", body: "v" }));
+    const lock = await handle(
+      req("http://x/dav/f.txt", { method: "LOCK", body: LOCK_BODY }),
+    );
+    const token = lock.headers.get("Lock-Token")!;
+
+    const anonymous = await handle(
+      req("http://x/dav/f.txt", { method: "LOCK", body: "" }),
+    );
+    expect(anonymous.status).toBe(400);
+
+    const refreshed = await handle(
+      req("http://x/dav/f.txt", {
+        method: "LOCK",
+        body: "",
+        headers: { If: `(${token})` },
+      }),
+    );
+    expect(refreshed.status).toBe(200);
+    // It is the same lock, not a second one.
+    expect(refreshed.headers.get("Lock-Token")).toBe(token);
+    const xml = await refreshed.text();
+    expect(xml).toContain("<D:timeout>");
+  });
+
+  it("a second exclusive lock on the same tree is refused", async () => {
+    // A collection lock covers everything under it, so locking a file
+    // inside it must fail even though that exact path has no lock.
+    const handle = dav(memoryStore());
+    await handle(req("http://x/dav/dir", { method: "MKCOL" }));
+    await handle(req("http://x/dav/dir/f.txt", { method: "PUT", body: "v" }));
+    expect(
+      (await handle(req("http://x/dav/dir", { method: "LOCK", body: LOCK_BODY })))
+        .status,
+    ).toBe(200);
+    const inner = await handle(
+      req("http://x/dav/dir/f.txt", { method: "LOCK", body: LOCK_BODY }),
+    );
+    expect(inner.status).toBe(423);
+  });
+
   it("deleting a collection with a locked child is refused", async () => {
     const handle = dav(memoryStore());
     await handle(req("http://x/dav/dir", { method: "MKCOL" }));
     await handle(req("http://x/dav/dir/secret.txt", { method: "PUT", body: "s" }));
-    await handle(req("http://x/dav/dir/secret.txt", { method: "LOCK", body: "" }));
+    await handle(
+      req("http://x/dav/dir/secret.txt", { method: "LOCK", body: LOCK_BODY }),
+    );
     const del = await handle(req("http://x/dav/dir", { method: "DELETE" }));
     expect(del.status).toBe(423);
     const kept = await handle(req("http://x/dav/dir/secret.txt"));
@@ -298,7 +361,9 @@ describe("WebDAV", () => {
     const handle = dav(memoryStore());
     await handle(req("http://x/dav/d", { method: "MKCOL" }));
     await handle(req("http://x/dav/d/f.txt", { method: "PUT", body: "f" }));
-    await handle(req("http://x/dav/d/f.txt", { method: "LOCK", body: "" }));
+    await handle(
+      req("http://x/dav/d/f.txt", { method: "LOCK", body: LOCK_BODY }),
+    );
     const move = await handle(
       req("http://x/dav/d", {
         method: "MOVE",
@@ -334,14 +399,14 @@ describe("WebDAV", () => {
         headers: { Destination: "http://x/dav/d/backup" },
       }),
     );
-    expect(copyIn.status).toBe(400);
+    expect(copyIn.status).toBe(403);
     const moveIn = await handle(
       req("http://x/dav/d", {
         method: "MOVE",
         headers: { Destination: "http://x/dav/d/backup" },
       }),
     );
-    expect(moveIn.status).toBe(400);
+    expect(moveIn.status).toBe(403);
     const copyRoot = await handle(
       req("http://x/dav", {
         method: "COPY",

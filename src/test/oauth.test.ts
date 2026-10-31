@@ -14,6 +14,11 @@ function form(body: Record<string, string>, headers: Record<string, string> = {}
   });
 }
 
+// RFC 7636 §4.1: a PKCE verifier is 43–128 characters. The server
+// enforces that, so a shorter string is rejected as a malformed
+// request before the challenge is ever compared.
+const VERIFIER = "yatta-test-verifier-0123456789abcdefghijklmnop";
+
 describe("OAuth 2.0 server", () => {
   const server = createOAuthServer({
     issuer: "http://x",
@@ -54,7 +59,7 @@ describe("OAuth 2.0 server", () => {
   }
 
   it("code flow with PKCE (S256) issues access + refresh tokens", async () => {
-    const verifier = "a-random-verifier-string-long-enough";
+    const verifier = VERIFIER;
     const code = await authorize("mobile-app", {
       code_challenge: sha256b64url(verifier),
       code_challenge_method: "S256",
@@ -78,6 +83,27 @@ describe("OAuth 2.0 server", () => {
 
   it("wrong PKCE verifier fails", async () => {
     const code = await authorize("mobile-app", {
+      code_challenge: sha256b64url(VERIFIER),
+      code_challenge_method: "S256",
+    });
+    const res = await server.handleToken(
+      form({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "myapp://callback",
+        client_id: "mobile-app",
+        // Long enough to be a well-formed verifier, so this fails the
+        // challenge comparison rather than the format check.
+        code_verifier: `${VERIFIER}-wrong`,
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_grant");
+  });
+
+  it("a short PKCE verifier is refused as malformed", async () => {
+    // RFC 7636 fixes the length; a 14-character verifier is not one.
+    const code = await authorize("mobile-app", {
       code_challenge: sha256b64url("correct-verifier"),
       code_challenge_method: "S256",
     });
@@ -91,7 +117,9 @@ describe("OAuth 2.0 server", () => {
       }),
     );
     expect(res.status).toBe(400);
-    expect(((await res.json()) as { error: string }).error).toBe("invalid_grant");
+    expect(((await res.json()) as { error: string }).error).toBe(
+      "invalid_request",
+    );
   });
 
   it("a code works only once", async () => {
@@ -128,7 +156,13 @@ describe("OAuth 2.0 server", () => {
         "http://x/oauth/authorize?response_type=code&client_id=mobile-app&redirect_uri=myapp://callback",
       ),
     );
-    expect(res.status).toBe(400);
+    // The client and its redirect URI are already trusted at this point,
+    // so RFC 6749 §4.1.2.1 sends the error back to the client instead of
+    // showing the user a bare 400.
+    expect(res.status).toBe(302);
+    const location = new URL(res.headers.get("Location")!);
+    expect(location.searchParams.get("error")).toBe("invalid_request");
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
   });
 
   it("client credentials flow issues an access token, no refresh", async () => {
@@ -147,7 +181,7 @@ describe("OAuth 2.0 server", () => {
   });
 
   it("refresh tokens rotate: the old one dies on use", async () => {
-    const verifier = "another-verifier-string-long-enough";
+    const verifier = `${VERIFIER}-refresh`;
     const code = await authorize("mobile-app", {
       code_challenge: sha256b64url(verifier),
       code_challenge_method: "S256",
@@ -182,7 +216,7 @@ describe("OAuth 2.0 server", () => {
   });
 
   it("reusing a rotated refresh token revokes the whole family", async () => {
-    const verifier = "family-verifier-string-long-enough";
+    const verifier = `${VERIFIER}-family`;
     const code = await authorize("mobile-app", {
       code_challenge: sha256b64url(verifier),
       code_challenge_method: "S256",
@@ -249,7 +283,7 @@ describe("OAuth 2.0 server", () => {
   it("revoking a refresh token also kills its access token", async () => {
     // A stolen refresh token is revoked precisely to close the window;
     // leaving its access token live for up to an hour defeats that.
-    const verifier = "another-random-verifier-string-long-enough";
+    const verifier = `${VERIFIER}-revoke`;
     const code = await authorize("mobile-app", {
       code_challenge: sha256b64url(verifier),
       code_challenge_method: "S256",

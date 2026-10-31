@@ -67,7 +67,9 @@ describe("OpenID Connect", () => {
     }
     const header = JSON.parse(Buffer.from(headerB64, "base64url").toString());
     expect(header.alg).toBe("RS256");
-    expect(header.kid).toBe("yatta-1");
+    // The kid is an RFC 7638 thumbprint of the public key, not a fixed
+    // name, so the header has to agree with whatever the JWKS publishes.
+    expect(header.kid).toMatch(/^[A-Za-z0-9_-]{43}$/);
     const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString());
     expect(payload.iss).toBe("http://x");
     expect(payload.sub).toBe("user-1");
@@ -80,6 +82,7 @@ describe("OpenID Connect", () => {
       keys: Array<Record<string, unknown>>;
     };
     expect(jwks.keys[0]!.kty).toBe("RSA");
+    expect(jwks.keys[0]!.kid).toBe(header.kid);
     const publicKey = crypto.createPublicKey({ key: jwks.keys[0]!, format: "jwk" });
     const ok = crypto.verify(
       "RSA-SHA256",
