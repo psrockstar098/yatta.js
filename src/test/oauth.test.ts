@@ -181,6 +181,54 @@ describe("OAuth 2.0 server", () => {
     expect(reused.status).toBe(400);
   });
 
+  it("reusing a rotated refresh token revokes the whole family", async () => {
+    const verifier = "family-verifier-string-long-enough";
+    const code = await authorize("mobile-app", {
+      code_challenge: sha256b64url(verifier),
+      code_challenge_method: "S256",
+    });
+    const first = (await (
+      await server.handleToken(
+        form({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: "myapp://callback",
+          client_id: "mobile-app",
+          code_verifier: verifier,
+        }),
+      )
+    ).json()) as { access_token: string; refresh_token: string };
+    const rotated = (await (
+      await server.handleToken(
+        form({
+          grant_type: "refresh_token",
+          refresh_token: first.refresh_token,
+          client_id: "mobile-app",
+        }),
+      )
+    ).json()) as { access_token: string; refresh_token: string };
+    expect(server.getAccessToken(rotated.access_token)).not.toBeNull();
+    // Showing the old refresh token again means it may have been
+    // stolen: the replacement tokens must die too.
+    const reuse = await server.handleToken(
+      form({
+        grant_type: "refresh_token",
+        refresh_token: first.refresh_token,
+        client_id: "mobile-app",
+      }),
+    );
+    expect(reuse.status).toBe(400);
+    expect(server.getAccessToken(rotated.access_token)).toBeNull();
+    const newRefresh = await server.handleToken(
+      form({
+        grant_type: "refresh_token",
+        refresh_token: rotated.refresh_token,
+        client_id: "mobile-app",
+      }),
+    );
+    expect(newRefresh.status).toBe(400);
+  });
+
   it("revoke kills a token", async () => {
     const res = await server.handleToken(
       form({

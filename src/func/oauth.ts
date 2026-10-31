@@ -209,10 +209,45 @@ export function createOAuthServer(options: OAuthServerOptions) {
     return client;
   }
 
+  // Token families, kept next to the store (not in it, so custom
+  // stores need no change). One family = one login grant: the first
+  // access + refresh pair, plus every pair rotated from it. When a
+  // rotated-out refresh token is presented again, someone may have
+  // stolen it — so the whole family dies, not just that one token.
+  // (After a restart with a persistent custom store, families are
+  // forgotten and reuse falls back to a plain rejection.)
+  const tokenFamily = new Map<string, string>();
+  const families = new Map<string, Set<string>>();
+
+  function revokeFamily(familyId: string): void {
+    const hashes = families.get(familyId);
+    if (!hashes) return;
+    for (const hash of hashes) {
+      const record = store.getToken(hash);
+      if (record && !record.revoked) {
+        record.revoked = true;
+        store.saveToken(record);
+      }
+    }
+  }
+
+  function trackFamily(familyId: string, ...hashes: string[]): void {
+    let set = families.get(familyId);
+    if (!set) {
+      set = new Set();
+      families.set(familyId, set);
+    }
+    for (const hash of hashes) {
+      set.add(hash);
+      tokenFamily.set(hash, familyId);
+    }
+  }
+
   function issueTokens(
     client: OAuthClient,
     userId: string | null,
     scope: string[],
+    familyId: string = randomToken(),
   ): { access: OAuthTokenRecord; refresh: OAuthTokenRecord | null; accessRaw: string; refreshRaw: string | null } {
     const now = Date.now();
     const accessRaw = randomToken();
@@ -241,6 +276,11 @@ export function createOAuthServer(options: OAuthServerOptions) {
       };
       store.saveToken(refresh);
     }
+    trackFamily(
+      familyId,
+      access.tokenHash,
+      ...(refresh ? [refresh.tokenHash] : []),
+    );
     return { access, refresh, accessRaw, refreshRaw };
   }
 
@@ -249,8 +289,9 @@ export function createOAuthServer(options: OAuthServerOptions) {
     userId: string | null,
     scope: string[],
     nonce?: string,
+    familyId?: string,
   ): Promise<Response> {
-    const { accessRaw, refreshRaw } = issueTokens(client, userId, scope);
+    const { accessRaw, refreshRaw } = issueTokens(client, userId, scope, familyId);
     const body: Record<string, unknown> = {
       access_token: accessRaw,
       token_type: "Bearer",
@@ -367,13 +408,19 @@ export function createOAuthServer(options: OAuthServerOptions) {
       if (!client) return oauthError("invalid_client", 401);
       const refreshRaw = params.get("refresh_token") ?? "";
       const record = store.getToken(sha256Hex(refreshRaw));
-      if (
-        !record ||
-        record.type !== "refresh" ||
-        record.revoked ||
-        record.expiresAt <= Date.now()
-      ) {
-        return oauthError("invalid_grant", 400, "Refresh token is unknown, revoked, or expired");
+      if (!record || record.type !== "refresh") {
+        return oauthError("invalid_grant", 400, "Refresh token is unknown");
+      }
+      if (record.revoked) {
+        // A rotated-out refresh token shown again means the token may
+        // have been stolen: kill the whole family, so the replacement
+        // tokens the thief does not have stop working too.
+        const familyId = tokenFamily.get(record.tokenHash);
+        if (familyId) revokeFamily(familyId);
+        return oauthError("invalid_grant", 400, "Refresh token was already used");
+      }
+      if (record.expiresAt <= Date.now()) {
+        return oauthError("invalid_grant", 400, "Refresh token is expired");
       }
       if (record.clientId !== client.id) {
         return oauthError("invalid_grant", 400, "Token belongs to another client");
@@ -381,7 +428,13 @@ export function createOAuthServer(options: OAuthServerOptions) {
       // Rotation: the old refresh token dies the moment it is used.
       record.revoked = true;
       store.saveToken(record);
-      return tokenReply(client, record.userId, record.scope);
+      return tokenReply(
+        client,
+        record.userId,
+        record.scope,
+        undefined,
+        tokenFamily.get(record.tokenHash),
+      );
     }
 
     return oauthError("unsupported_grant_type", 400, `Unknown grant type ${grantType}`);
