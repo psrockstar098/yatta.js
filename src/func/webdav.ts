@@ -308,6 +308,9 @@ export function createWebDAVHandler(
     }
 
     if (method === "DELETE") {
+      if (path === "") {
+        return new Response("Cannot delete the root collection", { status: 403 });
+      }
       if (!(await store.exists(path)) && !(await store.isCollection(path))) {
         return new Response("Not Found", { status: 404 });
       }
@@ -325,6 +328,15 @@ export function createWebDAVHandler(
       }
       const dst = dstSegments.join("/");
       const isMove = method === "MOVE";
+      // The root collection cannot be copied, moved, or replaced: copying
+      // it would copy the whole tree, and a destination inside the source
+      // would recurse forever (the copy creates the folder it then copies).
+      if (path === "" || dst === "") {
+        return new Response("Cannot copy or move the root collection", { status: 403 });
+      }
+      if (dst === path || dst.startsWith(`${path}/`)) {
+        return new Response("Destination is inside the source", { status: 400 });
+      }
       if (isMove) {
         if (await subtreeLocked(req, path)) {
           return new Response("Source is locked", { status: 423 });

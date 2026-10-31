@@ -274,4 +274,49 @@ describe("WebDAV", () => {
     );
     expect(move.status).toBe(423);
   });
+
+  it("deleting or moving the root collection is refused", async () => {
+    const handle = dav(memoryStore());
+    await handle(req("http://x/dav/a.txt", { method: "PUT", body: "a" }));
+    const del = await handle(req("http://x/dav", { method: "DELETE" }));
+    expect(del.status).toBe(403);
+    const kept = await handle(req("http://x/dav/a.txt"));
+    expect(kept.status).toBe(200);
+    const move = await handle(
+      req("http://x/dav", {
+        method: "MOVE",
+        headers: { Destination: "http://x/dav/moved" },
+      }),
+    );
+    expect(move.status).toBe(403);
+  });
+
+  it("COPY and MOVE refuse a destination inside the source", async () => {
+    const handle = dav(memoryStore());
+    await handle(req("http://x/dav/d", { method: "MKCOL" }));
+    await handle(req("http://x/dav/d/f.txt", { method: "PUT", body: "f" }));
+    const copyIn = await handle(
+      req("http://x/dav/d", {
+        method: "COPY",
+        headers: { Destination: "http://x/dav/d/backup" },
+      }),
+    );
+    expect(copyIn.status).toBe(400);
+    const moveIn = await handle(
+      req("http://x/dav/d", {
+        method: "MOVE",
+        headers: { Destination: "http://x/dav/d/backup" },
+      }),
+    );
+    expect(moveIn.status).toBe(400);
+    const copyRoot = await handle(
+      req("http://x/dav", {
+        method: "COPY",
+        headers: { Destination: "http://x/dav/backup" },
+      }),
+    );
+    expect(copyRoot.status).toBe(403);
+    const kept = await handle(req("http://x/dav/d/f.txt"));
+    expect(kept.status).toBe(200);
+  });
 });
