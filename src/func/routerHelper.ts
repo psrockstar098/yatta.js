@@ -180,6 +180,41 @@ export default async function routers(
     return withSecurityHeaders(oidc.handleDiscovery(), isHttps);
   }
 
+  // 2g. MCP server (1.0.5): every app serves /mcp, on by default.
+  // One line turns it off: MCP_ENABLED=0. Tools come from the app's
+  // own database collections (auth tables are never exposed); the
+  // caller must be signed in with a Yatta session or an OAuth token
+  // from this same server.
+  if (url.pathname === "/mcp" && process.env.MCP_ENABLED !== "0") {
+    const { createMCPHandler, surfaceFromTables } = await import("./mcp");
+    const { db } = await import("./db");
+    const handler = createMCPHandler({
+      resolveUser: async (req) => {
+        const { auth } = await import("./auth");
+        const user = await auth.getUser(req);
+        if (user) return user.id;
+        const bearer = (req.headers.get("authorization") ?? "").match(
+          /^Bearer\s+(.+)$/i,
+        );
+        const token = bearer?.[1];
+        if (token) {
+          const info = oauthServer.getAccessToken(token);
+          if (info?.userId) return info.userId;
+        }
+        return null;
+      },
+      getSurface: () => {
+        const tables: Record<string, never> = {};
+        const schema = (db as unknown as { schema?: Record<string, unknown> }).schema ?? {};
+        for (const name of Object.keys(schema)) {
+          tables[name] = (db as unknown as { table: (n: string) => never }).table(name);
+        }
+        return surfaceFromTables(tables);
+      },
+    });
+    return withSecurityHeaders(await handler(req), isHttps);
+  }
+
   // 3. Hot-reload routes in development mode so new files (e.g. user/index.ts) are instantly detected
   if (process.env.NODE_ENV !== "production") {
     router.reload();

@@ -1,6 +1,6 @@
 # New in 1.0.5: protocols
 
-Six small protocols, all on by default, all with no extra setup.
+Seven small pieces, all on by default, all with no extra setup.
 Full guides with examples live on the docs site (yatta.js.org).
 
 ## WebDAV — files over HTTP
@@ -70,6 +70,29 @@ curl http://localhost:4000/.well-known/openid-configuration
 curl http://localhost:4000/oauth/userinfo \
   -H "Authorization: Bearer ACCESS_TOKEN"
 ```
+
+## MCP — AI agents use your app
+
+On `/mcp`. An AI client points at your Yatta URL and gets tools
+made from your own app: one tool per database collection operation
+(`list_posts`, `get_posts`, `create_posts`, `update_posts`,
+`delete_posts`) plus one tool per function you register. On by
+default; off with one line: `MCP_ENABLED=0`.
+
+```bash
+curl http://localhost:4000/mcp \
+  -H "Authorization: Bearer <redacted>" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+The caller must be signed in (a Yatta session or an OAuth token
+from this same server). A caller who is not signed in gets a 401
+and learns nothing, not even the tool names. Auth tables (users,
+sessions, api keys) are never turned into tools. One honest limit:
+any signed-in user can use the exposed collection tools, so
+row-level rules belong in registered functions, which get the
+user id and can say no.
 
 ## Notes, kept short
 
