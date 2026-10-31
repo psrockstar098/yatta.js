@@ -113,6 +113,39 @@ describe("WebDAV", () => {
     expect(await get.text()).toBe("hello dav");
   });
 
+  it("active content downloads instead of executing on this origin", async () => {
+    // WebDAV takes no login, so anyone can PUT HTML/SVG/JS. Serving it
+    // back inline would run it on the app origin (stored XSS); the
+    // storage route already forces these types to download, and WebDAV
+    // must do the same. Plain types are unaffected.
+    const handle = dav(memoryStore());
+    for (const [name, ct] of [
+      ["x.html", "text/html"],
+      ["x.svg", "image/svg+xml"],
+      ["x.js", "text/javascript"],
+    ] as const) {
+      await handle(
+        req(`http://x/dav/${name}`, {
+          method: "PUT",
+          headers: { "content-type": ct },
+          body: "<script>alert(1)</script>",
+        }),
+      );
+      const get = await handle(req(`http://x/dav/${name}`));
+      expect(get.status).toBe(200);
+      expect(get.headers.get("content-disposition")).toBe("attachment");
+    }
+    await handle(
+      req("http://x/dav/x.png", {
+        method: "PUT",
+        headers: { "content-type": "image/png" },
+        body: "png-bytes",
+      }),
+    );
+    const png = await handle(req("http://x/dav/x.png"));
+    expect(png.headers.get("content-disposition")).toBeNull();
+  });
+
   it("PUT over an existing file answers 204", async () => {
     const handle = dav(memoryStore());
     await handle(req("http://x/dav/a.txt", { method: "PUT", body: "one" }));

@@ -80,6 +80,13 @@ function hrefFor(basePath: string, path: string): string {
   return path === "" ? `${basePath}/` : `${basePath}/${path}`;
 }
 
+// Content types a browser will execute when navigated to. The storage
+// route forces these to download; WebDAV must do the same, or an
+// unauthenticated PUT of HTML/SVG/JS comes back executable on the
+// app origin (stored XSS through /dav).
+const ACTIVE_CONTENT_TYPES =
+  /^(text\/html|application\/xhtml\+xml|image\/svg\+xml|text\/xml|application\/xml|text\/javascript|application\/javascript)\b/i;
+
 export interface WebDAVOptions {
   // URL prefix the handler is mounted on, without a trailing slash.
   basePath?: string;
@@ -272,13 +279,18 @@ export function createWebDAVHandler(
       }
       const file = await store.get(path);
       if (!file) return new Response("Not Found", { status: 404 });
+      const headers: Record<string, string> = {
+        "Content-Type": file.contentType,
+        "Content-Length": String(file.body.byteLength),
+        "Last-Modified": file.lastModified.toUTCString(),
+      };
+      // Active content must download, never execute on this origin.
+      if (ACTIVE_CONTENT_TYPES.test(file.contentType)) {
+        headers["Content-Disposition"] = "attachment";
+      }
       return new Response(method === "HEAD" ? null : (file.body as BodyInit), {
         status: 200,
-        headers: {
-          "Content-Type": file.contentType,
-          "Content-Length": String(file.body.byteLength),
-          "Last-Modified": file.lastModified.toUTCString(),
-        },
+        headers,
       });
     }
 
