@@ -13,7 +13,6 @@ CLAUDE.md
 STRATEGY_REVIEW_TAKEAWAYS.md
 playground
 .npmrc
-
 # code coverage
 coverage
 *.lcov

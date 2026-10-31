@@ -101,9 +101,13 @@ export const defaultStringHasher: StringHasher = (str: string): number => {
     h1 = Math.imul(h1 ^ ch, 2654435761);
     h2 = Math.imul(h2 ^ ch, 1597334677);
   }
-  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-  return (h2 >>> 0) || (h1 >>> 0);
+  h1 =
+    Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^
+    Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 =
+    Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^
+    Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return h2 >>> 0 || h1 >>> 0;
 };
 
 export interface StringMapOptions {
@@ -148,7 +152,9 @@ export class StringMap<V> {
     this.mask = cap - 1;
     this.loadFactor = options.loadFactor ?? 0.75;
     if (this.loadFactor <= 0 || this.loadFactor >= 1) {
-      throw new RangeError(`loadFactor must be in (0, 1), got ${this.loadFactor}`);
+      throw new RangeError(
+        `loadFactor must be in (0, 1), got ${this.loadFactor}`,
+      );
     }
     this.hasher = options.hasher ?? defaultStringHasher;
   }
@@ -284,7 +290,8 @@ export class StringMap<V> {
 
   *entries(): IterableIterator<[string, V]> {
     for (let i = 0; i < this.keysArr.length; i++) {
-      if (this.states[i] === SLOT_FULL) yield [this.keysArr[i]!, this.valsArr[i]!];
+      if (this.states[i] === SLOT_FULL)
+        yield [this.keysArr[i]!, this.valsArr[i]!];
     }
   }
 
@@ -336,7 +343,15 @@ type FieldValue<T extends FieldType> = T extends "string"
     ? unknown
     : number;
 
-const typedArrayCtor: Record<string, new (n: number) => ArrayLike<number> & { set(a: ArrayLike<number>, o?: number): void; subarray(s: number, e: number): any }> = {
+const typedArrayCtor: Record<
+  string,
+  new (
+    n: number,
+  ) => ArrayLike<number> & {
+    set(a: ArrayLike<number>, o?: number): void;
+    subarray(s: number, e: number): any;
+  }
+> = {
   u8: Uint8Array,
   u16: Uint16Array,
   u32: Uint32Array,
@@ -381,7 +396,9 @@ export class ColumnStore<S extends FieldSchema> {
 
   constructor(schema: S, initialCapacity = 8) {
     if (Object.keys(schema).length === 0) {
-      throw new RangeError("ColumnStore schema must declare at least one field");
+      throw new RangeError(
+        "ColumnStore schema must declare at least one field",
+      );
     }
     this.schema = schema;
     this.fieldNames = Object.keys(schema) as (keyof S & string)[];
@@ -413,7 +430,7 @@ export class ColumnStore<S extends FieldSchema> {
       const col = this.columns[name];
       this.columns[name] = isTypedField(t)
         ? growTyped(col, next)
-        : (col.length = next, col);
+        : ((col.length = next), col);
     }
     this.cap = next;
   }
@@ -425,7 +442,8 @@ export class ColumnStore<S extends FieldSchema> {
     for (const name of this.fieldNames) {
       const t = this.schema[name]!;
       const v = (row as any)[name];
-      this.columns[name][i] = v === undefined ? (isTypedField(t) ? 0 : undefined) : v;
+      this.columns[name][i] =
+        v === undefined ? (isTypedField(t) ? 0 : undefined) : v;
     }
     this._len++;
   }
@@ -476,10 +494,14 @@ export class ColumnStore<S extends FieldSchema> {
    * typed-array subarray (zero-copy); string/any fields return the backing
    * array sliced to length. Mutating the view mutates the list.
    */
-  field<K extends keyof S & string>(name: K): S[K] extends "string" ? string[] : S[K] extends "any" ? unknown[] : any {
+  field<K extends keyof S & string>(
+    name: K,
+  ): S[K] extends "string" ? string[] : S[K] extends "any" ? unknown[] : any {
     const t = this.schema[name]!;
     const col = this.columns[name];
-    return (isTypedField(t) ? col.subarray(0, this._len) : col.slice(0, this._len)) as any;
+    return (
+      isTypedField(t) ? col.subarray(0, this._len) : col.slice(0, this._len)
+    ) as any;
   }
 
   clear(): void {
@@ -496,7 +518,9 @@ export class ColumnStore<S extends FieldSchema> {
 
   private checkIndex(i: number): void {
     if (!Number.isInteger(i) || i < 0 || i >= this._len) {
-      throw new RangeError(`ColumnStore index ${i} out of bounds (len ${this._len})`);
+      throw new RangeError(
+        `ColumnStore index ${i} out of bounds (len ${this._len})`,
+      );
     }
   }
 }
@@ -551,7 +575,9 @@ export class TaskGroup {
   constructor(options: TaskGroupOptions = {}) {
     this.limit = options.concurrency ?? Infinity;
     if (!(this.limit >= 1)) {
-      throw new RangeError(`concurrency must be >= 1, got ${options.concurrency}`);
+      throw new RangeError(
+        `concurrency must be >= 1, got ${options.concurrency}`,
+      );
     }
   }
 
@@ -568,8 +594,11 @@ export class TaskGroup {
 
     const controller = new AbortController();
     this.controllers.add(controller);
-    const onGroupAbort = () => controller.abort(this.groupController.signal.reason);
-    this.groupController.signal.addEventListener("abort", onGroupAbort, { once: true });
+    const onGroupAbort = () =>
+      controller.abort(this.groupController.signal.reason);
+    this.groupController.signal.addEventListener("abort", onGroupAbort, {
+      once: true,
+    });
 
     const index = this.tasks.length;
     let resolve!: (v: T | PromiseLike<T>) => void;
@@ -632,7 +661,10 @@ export class TaskGroup {
       else errors.push(s.reason);
     });
     if (errors.length > 0) {
-      throw new AggregateError(errors, `${errors.length} task(s) failed in TaskGroup`);
+      throw new AggregateError(
+        errors,
+        `${errors.length} task(s) failed in TaskGroup`,
+      );
     }
     return results;
   }
@@ -643,7 +675,10 @@ export class TaskGroup {
    */
   cancel(reason?: unknown): void {
     if (this.cancelled) return;
-    this.cancelled = reason instanceof Error ? reason : new Error(String(reason ?? "TaskGroup cancelled"));
+    this.cancelled =
+      reason instanceof Error
+        ? reason
+        : new Error(String(reason ?? "TaskGroup cancelled"));
     this.groupController.abort(this.cancelled);
   }
 
@@ -704,7 +739,9 @@ export class Batch {
   constructor(options: BatchOptions = {}) {
     this.concurrency = options.concurrency ?? Infinity;
     if (!(this.concurrency >= 1)) {
-      throw new RangeError(`concurrency must be >= 1, got ${options.concurrency}`);
+      throw new RangeError(
+        `concurrency must be >= 1, got ${options.concurrency}`,
+      );
     }
     this.timeoutMs = options.timeoutMs;
     this.signal = options.signal;
@@ -727,7 +764,9 @@ export class Batch {
 
   /** Queue a file write. */
   write(path: string, data: string | Uint8Array | ArrayBuffer): this {
-    return this.op(() => Bun.write(path, data as any).then((n) => n as unknown));
+    return this.op(() =>
+      Bun.write(path, data as any).then((n) => n as unknown),
+    );
   }
 
   /** Queue a file stat. */
@@ -737,19 +776,22 @@ export class Batch {
 
   /** Queue a directory listing. */
   listDir(path: string): this {
-    const { readdir } = require("node:fs/promises") as typeof import("node:fs/promises");
+    const { readdir } =
+      require("node:fs/promises") as typeof import("node:fs/promises");
     return this.op(() => readdir(path));
   }
 
   /** Queue a recursive mkdir. */
   mkdir(path: string): this {
-    const { mkdir } = require("node:fs/promises") as typeof import("node:fs/promises");
+    const { mkdir } =
+      require("node:fs/promises") as typeof import("node:fs/promises");
     return this.op(() => mkdir(path, { recursive: true }));
   }
 
   /** Queue a recursive remove. */
   rm(path: string): this {
-    const { rm } = require("node:fs/promises") as typeof import("node:fs/promises");
+    const { rm } =
+      require("node:fs/promises") as typeof import("node:fs/promises");
     return this.op(() => rm(path, { recursive: true, force: true }));
   }
 
@@ -783,19 +825,21 @@ export class Batch {
         while (inFlight < limit && next < this.ops.length) {
           const i = next++;
           inFlight++;
-          this.runOp(this.ops[i]!).then(
-            (value) => {
-              results[i] = { ok: true, value };
-            },
-            (error) => {
-              results[i] = { ok: false, error };
-              if (firstError === undefined) firstError = error;
-            },
-          ).finally(() => {
-            inFlight--;
-            if (next >= this.ops.length && inFlight === 0) resolve();
-            else pump();
-          });
+          this.runOp(this.ops[i]!)
+            .then(
+              (value) => {
+                results[i] = { ok: true, value };
+              },
+              (error) => {
+                results[i] = { ok: false, error };
+                if (firstError === undefined) firstError = error;
+              },
+            )
+            .finally(() => {
+              inFlight--;
+              if (next >= this.ops.length && inFlight === 0) resolve();
+              else pump();
+            });
         }
         if (next >= this.ops.length && inFlight === 0) resolve();
       };
@@ -814,7 +858,8 @@ export class Batch {
         fn(),
         new Promise<never>((_, reject) => {
           timer = setTimeout(
-            () => reject(new Error(`Batch op timed out after ${this.timeoutMs}ms`)),
+            () =>
+              reject(new Error(`Batch op timed out after ${this.timeoutMs}ms`)),
             this.timeoutMs,
           );
         }),
