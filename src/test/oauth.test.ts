@@ -245,4 +245,33 @@ describe("OAuth 2.0 server", () => {
     expect(revoked.status).toBe(200);
     expect(server.getAccessToken(access_token)).toBeNull();
   });
+
+  it("revoking a refresh token also kills its access token", async () => {
+    // A stolen refresh token is revoked precisely to close the window;
+    // leaving its access token live for up to an hour defeats that.
+    const verifier = "another-random-verifier-string-long-enough";
+    const code = await authorize("mobile-app", {
+      code_challenge: sha256b64url(verifier),
+      code_challenge_method: "S256",
+    });
+    const res = await server.handleToken(
+      form({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "myapp://callback",
+        client_id: "mobile-app",
+        code_verifier: verifier,
+      }),
+    );
+    const { access_token, refresh_token } = (await res.json()) as {
+      access_token: string;
+      refresh_token: string;
+    };
+    expect(server.getAccessToken(access_token)).not.toBeNull();
+    const revoked = await server.handleRevoke(
+      form({ token: refresh_token, client_id: "mobile-app" }),
+    );
+    expect(revoked.status).toBe(200);
+    expect(server.getAccessToken(access_token)).toBeNull();
+  });
 });

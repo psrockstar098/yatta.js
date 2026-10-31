@@ -450,6 +450,12 @@ export function createOAuthServer(options: OAuthServerOptions) {
     if (record) {
       record.revoked = true;
       store.saveToken(record);
+      // Revoking one token of a grant must kill the whole grant. Before
+      // this, revoking a refresh token left its access token live for
+      // up to an hour — exactly the window a stolen-token revocation
+      // is supposed to close.
+      const familyId = tokenFamily.get(record.tokenHash);
+      if (familyId) revokeFamily(familyId);
     }
     return new Response(null, { status: 200 });
   }
