@@ -110,6 +110,10 @@ interface ToolDef {
 const KNOWN_PROTOCOLS = new Set(["2025-06-18", "2025-03-26", "2024-11-05"]);
 const LATEST_PROTOCOL = "2025-06-18";
 const MAX_LIST = 100;
+// One request must not run an unbounded number of calls: a batch of
+// thousands of list calls turns one HTTP request into a full table
+// scan per call. 100 is far above anything a real client batches.
+const MAX_BATCH = 100;
 
 function safeToolName(value: string): string {
   return value.replace(/[^A-Za-z0-9_-]/g, "_");
@@ -338,6 +342,12 @@ export function createMCPHandler(options: McpOptions) {
       );
     }
     if (Array.isArray(body)) {
+      if (body.length > MAX_BATCH) {
+        return Response.json(
+          rpcError(null, -32600, `Batch too large: at most ${MAX_BATCH} requests`),
+          { status: 400 },
+        );
+      }
       const out: Record<string, unknown>[] = [];
       for (const item of body) {
         if (item === null || typeof item !== "object") {

@@ -252,4 +252,22 @@ describe("MCP server", () => {
     const ping = await post(handler, { jsonrpc: "2.0", id: 2, method: "ping" });
     expect(ping.status).toBe(200);
   });
+
+  it("oversize batches are refused instead of running unbounded", async () => {
+    const { handler } = rpc(null);
+    const big = Array.from({ length: 101 }, (_, i) => ({
+      jsonrpc: "2.0",
+      id: i,
+      method: "ping",
+    }));
+    const res = await post(handler, big);
+    expect(res.status).toBe(400);
+    expect((await res.json() as { error: { code: number } }).error.code).toBe(-32600);
+    // A normal batch still runs.
+    const ok = await post(handler, [
+      { jsonrpc: "2.0", id: 1, method: "ping" },
+      { jsonrpc: "2.0", id: 2, method: "ping" },
+    ]);
+    expect(((await ok.json()) as Array<unknown>).length).toBe(2);
+  });
 });
