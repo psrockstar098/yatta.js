@@ -69,8 +69,15 @@ export function createUserWebFingerLookup(deps: {
 }): WebFingerLookup {
   return async (resource) => {
     if (!resource.startsWith("acct:")) return null;
-    const email = resource.slice("acct:".length).split("@")[0];
-    if (!email) return null;
+    // The whole address is the lookup key ("ada@example.com"), not
+    // just the part before "@". Looking up only the local part never
+    // matched a real stored email, so every real user answered 404.
+    // Note what this means: anyone can ask about an address and learn
+    // whether it exists here (200 = yes, 404 = no). That is how
+    // WebFinger works — it is a discovery protocol — so only run it
+    // on an app where account existence is not a secret.
+    const email = resource.slice("acct:".length);
+    if (!email || !email.includes("@")) return null;
     const user = await deps.findUserByEmail(email);
     if (!user) return null;
     return {

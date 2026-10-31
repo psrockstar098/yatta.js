@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { createWebFingerHandler } from "../func/webfinger";
+import { createWebFingerHandler, createUserWebFingerLookup } from "../func/webfinger";
 
 const lookup = async (resource: string) => {
   if (resource !== "acct:ada@example.com") return null;
@@ -59,5 +59,31 @@ describe("WebFinger", () => {
         )
       ).status,
     ).toBe(404);
+  });
+
+  it("the production lookup uses the full address", async () => {
+    const users = new Map([
+      ["ada@example.com", { id: "u1", email: "ada@example.com" }],
+    ]);
+    const prod = createWebFingerHandler(
+      createUserWebFingerLookup({
+        findUserByEmail: async (email) => users.get(email.toLowerCase()) ?? null,
+        appUrl: "http://x",
+      }),
+    );
+    const found = await prod(
+      new Request("http://x/.well-known/webfinger?resource=acct:ada@example.com"),
+    );
+    expect(found.status).toBe(200);
+    const json = (await found.json()) as { subject: string };
+    expect(json.subject).toBe("acct:ada@example.com");
+    const otherHost = await prod(
+      new Request("http://x/.well-known/webfinger?resource=acct:ada@other.com"),
+    );
+    expect(otherHost.status).toBe(404);
+    const nonAcct = await prod(
+      new Request("http://x/.well-known/webfinger?resource=https://example.com/users/ada"),
+    );
+    expect(nonAcct.status).toBe(404);
   });
 });
