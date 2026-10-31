@@ -94,6 +94,32 @@ describe("DNS over HTTPS", () => {
     expect(decodeResponse(new Uint8Array(await missing.arrayBuffer())).rcode).toBe(3);
   });
 
+  it("an unknown named type is not silently answered as A", async () => {
+    const handle = createDoHHandler(stubResolver);
+    const res = await handle(
+      new Request("http://x/dns-query?name=example.com&type=MX", {
+        headers: { Accept: "application/dns-json" },
+      }),
+    );
+    const json = (await res.json()) as { Status: number };
+    expect(json.Status).toBe(2);
+  });
+
+  it("a bad address from the resolver becomes SERVFAIL, not a throw", async () => {
+    const badResolver = async (name: string, type: "A" | "AAAA") => [
+      { name, type, ttl: 60, address: "1:2:3:4:5:6:7:8:9" },
+    ];
+    const handle = createDoHHandler(badResolver);
+    const res = await handle(
+      new Request("http://x/dns-query", {
+        method: "POST",
+        body: encodeQuery(7, "bad.example", 28) as BodyInit,
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(decodeResponse(new Uint8Array(await res.arrayBuffer())).rcode).toBe(2);
+  });
+
   it("resolveDoH works against the handler over HTTP", async () => {
     const handle = createDoHHandler(stubResolver);
     const server = Bun.serve({ port: 0, fetch: (req) => handle(req) });

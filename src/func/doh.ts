@@ -267,8 +267,18 @@ export function createDoHHandler(
       if (url.searchParams.has("name")) {
         const name = url.searchParams.get("name")!;
         const typeParam = (url.searchParams.get("type") ?? "A").toUpperCase();
+        // A named type we do not know is "not supported", not silently
+        // answered as A: answering A for "MX" would lie to the caller.
+        // Type code 0 matches nothing, so it flows into the rcode 4
+        // answer below.
         const typeCode =
-          typeParam === "AAAA" ? 28 : /^\d+$/.test(typeParam) ? Number(typeParam) : 1;
+          typeParam === "A"
+            ? 1
+            : typeParam === "AAAA"
+              ? 28
+              : /^\d+$/.test(typeParam)
+                ? Number(typeParam)
+                : 0;
         query = { id: 0, name, type: typeCode };
       } else if (req.method === "POST") {
         query = decodeQuery(new Uint8Array(await req.arrayBuffer()));
@@ -307,10 +317,20 @@ export function createDoHHandler(
       });
     }
     if (wantsJson) return jsonResponse(query, 0, answers);
-    return new Response(encodeResponse(query, 0, answers) as BodyInit, {
-      status: 200,
-      headers: { "Content-Type": "application/dns-message" },
-    });
+    // A resolver can hand back a bad address (for example a mangled
+    // IPv6 string). Encoding it would throw out of the handler, so a
+    // broken answer becomes a clean server-failure reply instead.
+    try {
+      return new Response(encodeResponse(query, 0, answers) as BodyInit, {
+        status: 200,
+        headers: { "Content-Type": "application/dns-message" },
+      });
+    } catch {
+      return new Response(encodeResponse(query, 2, []) as BodyInit, {
+        status: 200,
+        headers: { "Content-Type": "application/dns-message" },
+      });
+    }
   };
 }
 
