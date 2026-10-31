@@ -811,7 +811,16 @@ export function createWebDAVHandler(
       if (depth === "1" && entry.isCollection) {
         entries.push(...(await store.list(path)));
       }
-      return new Response(propfindXml(basePath, entries, liveLock), {
+      // Never hand a lock token to a caller that did not show it: PROPFIND
+      // used to emit every live token, so any stranger could lift the
+      // token and unlock or overwrite someone else's locked file. The
+      // locker already received the token in the LOCK response, so
+      // withholding it here loses nothing legitimate.
+      const shownLocks = (p: string) => {
+        const lock = liveLock(p);
+        return lock && shown.has(lock.token) ? lock : null;
+      };
+      return new Response(propfindXml(basePath, entries, shownLocks), {
         status: 207,
         headers: { "Content-Type": "application/xml; charset=utf-8" },
       });

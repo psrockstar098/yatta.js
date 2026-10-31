@@ -255,6 +255,35 @@ describe("WebDAV", () => {
     expect(ok.status).toBe(204);
   });
 
+  it("PROPFIND hides the lock token from callers that did not show it", async () => {
+    const handle = dav(memoryStore());
+    await handle(req("http://x/dav/f.txt", { method: "PUT", body: "v1" }));
+    const lock = await handle(
+      req("http://x/dav/f.txt", {
+        method: "LOCK",
+        body: `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner><D:href>tester</D:href></D:owner></D:lockinfo>`,
+      }),
+    );
+    expect(lock.status).toBe(200);
+    const token = (lock.headers.get("Lock-Token") ?? "").replace(/[<>]/g, "");
+    expect(token).toContain("opaquelocktoken:");
+    const stranger = await handle(
+      req("http://x/dav/f.txt", {
+        method: "PROPFIND",
+        headers: { Depth: "0" },
+      }),
+    );
+    expect(stranger.status).toBe(207);
+    expect(await stranger.text()).not.toContain(token);
+    const holder = await handle(
+      req("http://x/dav/f.txt", {
+        method: "PROPFIND",
+        headers: { Depth: "0", If: `(<${token}>)` },
+      }),
+    );
+    expect(await holder.text()).toContain(token);
+  });
+
   it("paths that escape the tree are refused", async () => {
     const handle = dav(memoryStore());
     const res = await handle(
