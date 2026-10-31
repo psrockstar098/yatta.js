@@ -1586,6 +1586,11 @@ export class LocalStorageDriver implements IStorageDriver {
     const scanRoot = prefixDir
       ? path.join(this.baseDir, prefixDir)
       : this.baseDir;
+    // A prefix like "f.txt/" (WebDAV asking whether f.txt is a collection)
+    // points the scan at the file itself, and globbing a file throws
+    // ENOTDIR. A file is not a directory, so there is nothing to list.
+    const rootStat = await statFile(scanRoot);
+    if (rootStat && !rootStat.isDirectory()) return results;
 
     const glob = new Bun.Glob("**/*");
     try {
@@ -1621,7 +1626,9 @@ export class LocalStorageDriver implements IStorageDriver {
         if (results.length >= limit) break;
       }
     } catch (err: any) {
-      if (err?.code !== "ENOENT") throw err; // prefix directory doesn't exist yet
+      // Prefix directory doesn't exist yet, or a path component stopped
+      // being a directory mid-scan — either way there is nothing to list.
+      if (err?.code !== "ENOENT" && err?.code !== "ENOTDIR") throw err;
     }
 
     return results;
