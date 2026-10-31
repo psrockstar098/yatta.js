@@ -319,4 +319,25 @@ describe("WebDAV", () => {
     const kept = await handle(req("http://x/dav/d/f.txt"));
     expect(kept.status).toBe(200);
   });
+
+  it("Destination on another host or outside the mount is refused", async () => {
+    const handle = dav(memoryStore());
+    await handle(req("http://x/dav/src.txt", { method: "PUT", body: "data" }));
+    const crossHost = await handle(
+      req("http://x/dav/src.txt", {
+        method: "COPY",
+        headers: { Destination: "http://evil.example/dav/dst.txt" },
+      }),
+    );
+    expect(crossHost.status).toBe(400);
+    const prefixTrick = await handle(
+      req("http://x/dav/src.txt", {
+        method: "COPY",
+        headers: { Destination: "http://x/davx" },
+      }),
+    );
+    expect(prefixTrick.status).toBe(400);
+    const kept = await handle(req("http://x/dav/src.txt"));
+    expect(kept.status).toBe(200);
+  });
 });

@@ -167,17 +167,29 @@ export function createWebDAVHandler(
 
   // Reads the Destination header and turns it into a DAV path.
   // Accepts a full URL ("http://host/dav/a.txt") or a plain path.
+  // Two guards: the path must be exactly under the mount point (so
+  // "/davx" cannot sneak in as "x"), and an absolute URL must point
+  // at this same server (another host's path is not silently reused
+  // as a local path).
   function destinationPath(req: Request): string[] | null {
     const raw = req.headers.get("destination");
     if (!raw) return null;
+    let absolute: URL | null = null;
+    try {
+      absolute = new URL(raw);
+    } catch {
+      absolute = null;
+    }
+    if (absolute && absolute.origin !== new URL(req.url).origin) return null;
     let pathname: string;
     try {
       pathname = new URL(raw, "http://dav.local").pathname;
     } catch {
       return null;
     }
-    if (!pathname.startsWith(basePath)) return null;
-    return cleanSegments(pathname.slice(basePath.length));
+    if (pathname !== basePath && !pathname.startsWith(`${basePath}/`)) return null;
+    const rest = pathname === basePath ? "" : pathname.slice(basePath.length + 1);
+    return cleanSegments(rest);
   }
 
   function propfindXml(
