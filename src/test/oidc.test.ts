@@ -113,6 +113,38 @@ describe("OpenID Connect", () => {
     expect(res.status).toBe(401);
   });
 
+  it("userinfo refuses a token without openid scope", async () => {
+    const authRes = await oauth.handleAuthorize(
+      new Request(
+        "http://x/oauth/authorize?response_type=code&client_id=web-app" +
+          "&redirect_uri=http://localhost:3000/callback&scope=profile",
+      ),
+    );
+    expect(authRes.status).toBe(302);
+    const code = new URL(authRes.headers.get("Location")!).searchParams.get("code")!;
+    const tokenRes = await oauth.handleToken(
+      new Request("http://x/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: "http://localhost:3000/callback",
+          client_id: "web-app",
+          client_secret: "s3cret",
+        }).toString(),
+      }),
+    );
+    expect(tokenRes.status).toBe(200);
+    const json = (await tokenRes.json()) as { access_token: string };
+    const res = await oidc.handleUserinfo(
+      new Request("http://x/oauth/userinfo", {
+        headers: { Authorization: `Bearer ${json.access_token}` },
+      }),
+    );
+    expect(res.status).toBe(403);
+  });
+
   it("discovery lists every endpoint", async () => {
     const doc = (await oidc.handleDiscovery().json()) as Record<string, unknown>;
     expect(doc.issuer).toBe("http://x");

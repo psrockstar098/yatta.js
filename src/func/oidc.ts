@@ -147,6 +147,14 @@ export function createOIDC(options: OidcOptions) {
     if (!info || !info.userId) {
       return Response.json({ error: "invalid_token" }, { status: 401 });
     }
+    // userinfo is an OpenID Connect endpoint: a token without the
+    // openid scope is not an identity token, even if it is valid for
+    // other parts of the app. Without this check, any app token (for
+    // example one made for plain API access) could read the user's
+    // profile here.
+    if (!info.scope.includes("openid")) {
+      return Response.json({ error: "insufficient_scope" }, { status: 403 });
+    }
     const user = await options.findUser(info.userId);
     if (!user) {
       return Response.json({ error: "invalid_token" }, { status: 401 });
