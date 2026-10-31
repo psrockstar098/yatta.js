@@ -41,7 +41,9 @@ export function decodeVarint(
   let i = offset;
   for (;;) {
     if (i >= data.length) throw new Error("Truncated varint");
-    const b = data[i++];
+    const b = data[i];
+    if (b === undefined) throw new Error("Truncated varint");
+    i++;
     result |= BigInt(b & 0x7f) << shift;
     if ((b & 0x80) === 0) break;
     shift += 7n;
@@ -142,7 +144,7 @@ export function decodeFrames(data: Uint8Array): GrpcFrame[] {
   let i = 0;
   while (i < data.length) {
     if (i + 5 > data.length) throw new Error("Truncated gRPC-Web frame");
-    const trailer = (data[i] & 0x80) !== 0;
+    const trailer = (data[i]! & 0x80) !== 0;
     const length = new DataView(data.buffer, data.byteOffset + i + 1, 4).getUint32(0, false);
     i += 5;
     if (i + length > data.length) throw new Error("Truncated gRPC-Web frame");
@@ -201,7 +203,7 @@ export function createGrpcWebHandler(
     const name = url.pathname.slice(basePath.length + 1);
     const fn = services[name];
     const fail = (status: number, message: string) =>
-      new Response(concat(trailerFrame(status, message)), {
+      new Response(concat(trailerFrame(status, message)) as BodyInit, {
         status: 200,
         headers: {
           "Content-Type": "application/grpc-web",
@@ -223,7 +225,7 @@ export function createGrpcWebHandler(
     } catch (err) {
       return fail(13, err instanceof Error ? err.message : "Service failed");
     }
-    return new Response(concat(encodeFrame(reply), trailerFrame(0)), {
+    return new Response(concat(encodeFrame(reply), trailerFrame(0)) as BodyInit, {
       status: 200,
       headers: { "Content-Type": "application/grpc-web", "grpc-status": "0" },
     });

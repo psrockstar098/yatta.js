@@ -38,9 +38,9 @@ describe("gRPC-Web codec", () => {
     );
     const frames = decodeFrames(packed);
     expect(frames.length).toBe(2);
-    expect(frames[0].trailer).toBe(false);
-    expect([...frames[0].data]).toEqual([1, 2, 3]);
-    expect(frames[1].trailer).toBe(true);
+    expect(frames[0]!.trailer).toBe(false);
+    expect([...frames[0]!.data]).toEqual([1, 2, 3]);
+    expect(frames[1]!.trailer).toBe(true);
   });
 
   it("bad frames throw", () => {

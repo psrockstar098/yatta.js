@@ -6,6 +6,8 @@ import { storage } from "./storage";
 import { createWebDAVHandler, createStorageDavStore } from "./webdav";
 import { createGrpcWebHandler } from "./grpcweb";
 import { createDoHHandler } from "./doh";
+import { createOAuthServer, clientsFromEnv } from "./oauth";
+import { createOIDC } from "./oidc";
 
 // One shared handler so WebDAV locks survive across requests.
 // storage.disk() is the raw disk API (upload/download/head/list);
@@ -19,6 +21,31 @@ const grpcWebHandler = createGrpcWebHandler();
 
 // DNS over HTTPS (1.0.5) on /dns-query.
 const dohHandler = createDoHHandler();
+
+// OAuth 2.0 + OpenID Connect (1.0.5), shared across requests.
+// Clients come from OAUTH_CLIENTS (JSON) when set; more can be
+// registered in code. The auth engine is loaded lazily inside the
+// callbacks so importing this router never pulls the DB in early.
+const oauthIssuer = process.env.APP_URL || "http://localhost:4000";
+const oauthServer = createOAuthServer({
+  issuer: oauthIssuer,
+  clients: clientsFromEnv(process.env),
+  resolveUser: async (req) => {
+    const { auth } = await import("./auth");
+    const user = await auth.getUser(req);
+    return user?.id ?? null;
+  },
+});
+const oidc = createOIDC({
+  issuer: oauthIssuer,
+  oauth: oauthServer,
+  findUser: async (id) => {
+    const { SQLiteAuthStore } = await import("./auth");
+    const user = await new SQLiteAuthStore().findUserById(id);
+    return user ? { id: user.id, email: user.email } : null;
+  },
+});
+oauthServer.setIdTokenIssuer(oidc.issueIdToken);
 
 // Always resolve relative to this file to guarantee correct path regardless of current working directory
 const backendDir = path.resolve(import.meta.dir, "../backend");
@@ -131,6 +158,26 @@ export default async function routers(
       }),
     );
     return withSecurityHeaders(await handler(req), isHttps);
+  }
+
+  // 2f. OAuth 2.0 + OpenID Connect (1.0.5).
+  if (url.pathname === "/oauth/authorize") {
+    return withSecurityHeaders(await oauthServer.handleAuthorize(req), isHttps);
+  }
+  if (url.pathname === "/oauth/token") {
+    return withSecurityHeaders(await oauthServer.handleToken(req), isHttps);
+  }
+  if (url.pathname === "/oauth/revoke") {
+    return withSecurityHeaders(await oauthServer.handleRevoke(req), isHttps);
+  }
+  if (url.pathname === "/oauth/userinfo") {
+    return withSecurityHeaders(await oidc.handleUserinfo(req), isHttps);
+  }
+  if (url.pathname === "/oauth/jwks") {
+    return withSecurityHeaders(oidc.handleJWKS(), isHttps);
+  }
+  if (url.pathname === "/.well-known/openid-configuration") {
+    return withSecurityHeaders(oidc.handleDiscovery(), isHttps);
   }
 
   // 3. Hot-reload routes in development mode so new files (e.g. user/index.ts) are instantly detected

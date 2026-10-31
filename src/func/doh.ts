@@ -48,7 +48,9 @@ function decodeName(data: Uint8Array, offset: number): { name: string; next: num
   let i = offset;
   for (;;) {
     if (i >= data.length) throw new Error("Truncated DNS name");
-    const len = data[i++];
+    const len = data[i];
+    if (len === undefined) throw new Error("Truncated DNS name");
+    i++;
     if (len === 0) break;
     // Compressed names (top bits set) never appear in queries we build,
     // and we refuse them rather than guess.

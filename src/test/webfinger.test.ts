@@ -45,7 +45,7 @@ describe("WebFinger", () => {
     );
     const json = (await res.json()) as { links: Array<{ rel: string }> };
     expect(json.links.length).toBe(1);
-    expect(json.links[0].rel).toBe("self");
+    expect(json.links[0]!.rel).toBe("self");
   });
 
   it("missing ?resource= is 400, unknown user is 404", async () => {

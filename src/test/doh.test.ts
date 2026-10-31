@@ -31,11 +31,11 @@ describe("DNS over HTTPS", () => {
     ]);
     const decoded = decodeResponse(bytes);
     expect(decoded.rcode).toBe(0);
-    expect(decoded.answers[0].address).toBe("93.184.215.14");
+    expect(decoded.answers[0]!.address).toBe("93.184.215.14");
     const v6 = encodeResponse({ id: 8, name: "example.com", type: 28 }, 0, [
       { name: "example.com", type: "AAAA", ttl: 60, address: "2606:2800:220:1:248:1893:25c8:1946" },
     ]);
-    expect(decodeResponse(v6).answers[0].address).toBe("2606:2800:220:1:248:1893:25c8:1946");
+    expect(decodeResponse(v6).answers[0]!.address).toBe("2606:2800:220:1:248:1893:25c8:1946");
   });
 
   it("POST wire query answers with the stub address", async () => {
@@ -50,7 +50,7 @@ describe("DNS over HTTPS", () => {
     expect(res.headers.get("Content-Type")).toBe("application/dns-message");
     const decoded = decodeResponse(new Uint8Array(await res.arrayBuffer()));
     expect(decoded.rcode).toBe(0);
-    expect(decoded.answers[0].address).toBe("93.184.215.14");
+    expect(decoded.answers[0]!.address).toBe("93.184.215.14");
   });
 
   it("GET ?name= answers JSON", async () => {
@@ -61,7 +61,7 @@ describe("DNS over HTTPS", () => {
       Answer: Array<{ data: string }>;
     };
     expect(json.Status).toBe(0);
-    expect(json.Answer[0].data).toBe("93.184.215.14");
+    expect(json.Answer[0]!.data).toBe("93.184.215.14");
   });
 
   it("GET ?dns= base64url wire query works", async () => {
@@ -73,7 +73,7 @@ describe("DNS over HTTPS", () => {
       .replace(/=+$/, "");
     const res = await handle(new Request(`http://x/dns-query?dns=${wire}`));
     const decoded = decodeResponse(new Uint8Array(await res.arrayBuffer()));
-    expect(decoded.answers[0].address).toBe("2606:2800:220:1:248:1893:25c8:1946");
+    expect(decoded.answers[0]!.address).toBe("2606:2800:220:1:248:1893:25c8:1946");
   });
 
   it("unknown type answers rcode 4, missing name rcode 3", async () => {
@@ -103,7 +103,7 @@ describe("DNS over HTTPS", () => {
         "example.com",
         "A",
       );
-      expect(answers[0].address).toBe("93.184.215.14");
+      expect(answers[0]!.address).toBe("93.184.215.14");
     } finally {
       server.stop();
     }
