@@ -12,13 +12,27 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { cmdDoctor } from "./cli_doctor";
 import { cmdMigrate, cmdMigrateMake, cmdMigrateStatus } from "./cli_migrate";
 import { cmdDbBackup, cmdDbRestore } from "./cli_backup";
 
-const VERSION = "1.0.0";
+/**
+ * The version `version` and `help` print.
+ *
+ * This used to be a hardcoded "1.0.0" that went stale the moment package.json
+ * moved to 1.0.5, while `info` correctly read the package version — so two
+ * commands in the same CLI disagreed about what version you were running.
+ * Read it from package.json like `info` does, so it can never drift again.
+ */
+function pkgVersion(): string {
+  try {
+    return pkg().version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
 
 const C: Record<string, string> = {
   reset: "\x1b[0m",
@@ -420,7 +434,7 @@ const TEMPLATE_PKG = (name: string) =>
       scripts: {
         dev: "bun --watch yatta/main.ts",
         start: "bun yatta/main.ts",
-        check: "bunx tsc --noEmit",
+        check: "bun x tsc --noEmit",
       },
       devDependencies: { "@types/bun": "latest" },
     },
@@ -2234,7 +2248,7 @@ function cmdUsage(): number {
   const root = frameworkRoot();
 
   log("");
-  log(`  ${c.bold}yatta${c.reset} v${VERSION}`);
+  log(`  ${c.bold}yatta${c.reset} v${pkgVersion()}`);
   log(`  ${c.dim}Production-grade backend framework for Bun${c.reset}`);
   log("");
   log(`${c.bold}Commands${c.reset}`);
@@ -2355,10 +2369,22 @@ export async function main(argv: string[]): Promise<number> {
     }
     case "cluster": {
       const entry = requireProject("cluster");
-      return entry ? run("bun", ["run", join(dirname(entry), "..", "core_runtime", "cluster.ts")]) : 1;
+      if (!entry) return 1;
+      // Resolve cluster.ts from the framework root, not from the project
+      // entrypoint: the old path built from the project entry only worked
+      // from the framework checkout (src/main.ts) and looked for a
+      // core_runtime folder inside a scaffolded project, where it does not
+      // exist. Point the workers at the project entry too, or they
+      // fall back to src/main.ts, which a scaffold does not have either.
+      // An explicitly set CLUSTER_ENTRY wins over the project entry.
+      process.env.CLUSTER_ENTRY ??= entry;
+      return run("bun", ["run", join(frameworkRoot(), "core_runtime", "cluster.ts")]);
     }
     case "check":
-      return run("bunx", ["tsc", "--noEmit"]) || run("bun", ["test"]);
+      // `bunx` is not on PATH in every Bun install (this VM's Bun ships
+      // without it), which made `yatta check` fail before running anything.
+      // `bun x` is the same mechanism and always exists alongside `bun`.
+      return run("bun", ["x", "tsc", "--noEmit"]) || run("bun", ["test"]);
     case "info":
       return cmdInfo();
     case "doctor":
@@ -2376,7 +2402,7 @@ export async function main(argv: string[]): Promise<number> {
     case "version":
     case "--version":
     case "-v":
-      log(VERSION);
+      log(pkgVersion());
       return 0;
     case undefined:
     case "help":

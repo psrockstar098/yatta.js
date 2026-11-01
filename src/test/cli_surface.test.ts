@@ -110,4 +110,40 @@ describe("Every command is discoverable", () => {
     expect(code).toBe(0);
     expect(lines.join("\n")).toMatch(/Commands/);
   });
+
+  it("version and help banner agree with package.json (never a hardcoded stale version)", async () => {
+    const pkgVersion = JSON.parse(
+      readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+    ).version as string;
+    expect(pkgVersion).not.toBe("1.0.0");
+
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (msg = "") => void lines.push(String(msg));
+    try {
+      expect(await main(["version"])).toBe(0);
+      expect(lines).toContain(pkgVersion);
+      lines.length = 0;
+      expect(await main(["help"])).toBe(0);
+      expect(lines.join("\n")).toContain(`v${pkgVersion}`);
+    } finally {
+      console.log = original;
+    }
+  });
+
+  it("never shells out to bunx: check uses bun x, and the scaffold check script does too", () => {
+    expect(cliSource).not.toContain('run("bunx"');
+    expect(cliSource).toContain('run("bun", ["x", "tsc", "--noEmit"])');
+    expect(cliSource).toContain('check: "bun x tsc --noEmit"');
+  });
+
+  it("cluster resolves cluster.ts from the framework root, not the project entrypoint", () => {
+    const clusterCase = cliSource.slice(
+      cliSource.indexOf('case "cluster"'),
+      cliSource.indexOf('case "check"'),
+    );
+    expect(clusterCase).toContain('join(frameworkRoot(), "core_runtime", "cluster.ts")');
+    expect(clusterCase).not.toContain('join(dirname(entry)');
+    expect(clusterCase).toContain("CLUSTER_ENTRY");
+  });
 });
