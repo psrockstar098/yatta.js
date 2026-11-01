@@ -284,6 +284,46 @@ describe("WebDAV", () => {
     expect(await holder.text()).toContain(token);
   });
 
+  it("MOVE transfers the lock to the destination", async () => {
+    const handle = dav(memoryStore());
+    await handle(req("http://x/dav/f.txt", { method: "PUT", body: "v1" }));
+    const lock = await handle(
+      req("http://x/dav/f.txt", { method: "LOCK", body: LOCK_BODY }),
+    );
+    expect(lock.status).toBe(200);
+    const token = (lock.headers.get("Lock-Token") ?? "").replace(/[<>]/g, "");
+    const moved = await handle(
+      req("http://x/dav/f.txt", {
+        method: "MOVE",
+        headers: { Destination: "http://x/dav/g.txt", If: `(<${token}>)` },
+      }),
+    );
+    expect(moved.status).toBe(201);
+    const blocked = await handle(
+      req("http://x/dav/g.txt", { method: "PUT", body: "v2" }),
+    );
+    expect(blocked.status).toBe(423);
+    const ok = await handle(
+      req("http://x/dav/g.txt", {
+        method: "PUT",
+        headers: { If: `(<${token}>)` },
+        body: "v2",
+      }),
+    );
+    expect(ok.status).toBe(204);
+    const unlock = await handle(
+      req("http://x/dav/g.txt", {
+        method: "UNLOCK",
+        headers: { "Lock-Token": `<${token}>` },
+      }),
+    );
+    expect(unlock.status).toBe(204);
+    const free = await handle(
+      req("http://x/dav/g.txt", { method: "PUT", body: "v3" }),
+    );
+    expect(free.status).toBe(204);
+  });
+
   it("paths that escape the tree are refused", async () => {
     const handle = dav(memoryStore());
     const res = await handle(

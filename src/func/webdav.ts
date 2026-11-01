@@ -279,6 +279,21 @@ export function createWebDAVHandler(
     }
   }
 
+  // Moves the locks on a path and everything under it to a new path.
+  // RFC 4918: a lock moves with the resource. Before, MOVE dropped the
+  // source locks, so a moved file silently lost its protection.
+  function moveLocks(src: string, dst: string): void {
+    const moved: [string, Lock][] = [];
+    for (const key of [...locks.keys()]) {
+      if (key === src || key.startsWith(`${src}/`)) {
+        const lock = liveLock(key);
+        if (lock) moved.push([dst + key.slice(src.length), lock]);
+      }
+    }
+    dropLocks(src);
+    for (const [key, lock] of moved) locks.set(key, lock);
+  }
+
   // Lock tokens the caller shows, from the If header (and Lock-Token).
   // Parsed as tokens, not searched as text, and a negated condition
   // like (Not <token>) does not count as showing it.
@@ -716,8 +731,10 @@ export function createWebDAVHandler(
         await copyTree(path, dst);
         if (isMove) await deleteTree(path);
       }
-      if (isMove) dropLocks(path);
+      // A replaced destination loses its old locks with the resource;
+      // the source locks then move onto the destination (RFC 4918).
       if (dstExists) dropLocks(dst);
+      if (isMove) moveLocks(path, dst);
       return new Response(null, { status: dstExists ? 204 : 201 });
     }
 
