@@ -15,6 +15,7 @@ import { join } from "node:path";
 
 import { detectProject } from "./detect";
 import { dockerAdapter } from "./docker";
+import { railwayAdapter } from "./railway";
 import { gitBranch, gitRemote, gitSha, gitTreeState } from "./git";
 import { buildManifest, MANIFEST_PATH, readManifest, writeManifest } from "./manifest";
 import { buildPlan, previewLines } from "./plan";
@@ -26,8 +27,8 @@ export interface DeployOutcome {
 }
 
 /** Adapters that exist today. The rest of Dominic's list is planned, not faked. */
-const ADAPTERS: DeployAdapter[] = [dockerAdapter];
-const PLANNED = ["northflank", "railway", "render"];
+const ADAPTERS: DeployAdapter[] = [dockerAdapter, railwayAdapter];
+const PLANNED = ["northflank", "render"];
 
 function adapterFor(id: string): DeployAdapter | null {
   return ADAPTERS.find((adapter) => adapter.id === id) ?? null;
@@ -80,7 +81,7 @@ function usageLines(): string[] {
   return [
     "",
     "Usage:",
-    "  yatta deploy [--platform docker] [--registry ghcr|dockerhub] [--dry-run] [--yes]",
+    "  yatta deploy [--platform docker|railway] [--registry ghcr|dockerhub] [--dry-run] [--yes]",
     "  yatta deploy providers",
     "  yatta deploy config",
     "  yatta deploy status",
@@ -229,7 +230,7 @@ export function runDeploy(root: string, args: string[]): DeployOutcome {
     if (PLANNED.includes(platform)) {
       return {
         code: 1,
-        lines: ["", `✗ The ${platform} adapter is planned but not built yet. Available now: docker.`, ""],
+        lines: ["", `✗ The ${platform} adapter is planned but not built yet. Available now: docker, railway.`, ""],
       };
     }
     return { code: 1, lines: ["", `✗ Unknown platform "${platform}".`, ...providersLines()] };
@@ -298,14 +299,22 @@ export function runDeploy(root: string, args: string[]): DeployOutcome {
     "✓ Deployment configured.",
     "Next steps:",
     "  1. Review the generated files, then commit and push.",
-    "  2. On push, CI builds the commit-SHA image and pushes it to your registry.",
   ];
   if (platform === "docker") {
     next.push(
+      "  2. On push, CI builds the commit-SHA image and pushes it to your registry.",
       "  3. Run it on a Docker host, mounting a volume at /data:",
       // The image reference stays a placeholder: the developer's repo path
       // is theirs, and guessing it here would print a wrong command.
       "     docker run -d -p 3000:3000 -v yatta-data:/data ghcr.io/<owner>/<repo>:<sha>",
+    );
+  }
+  if (platform === "railway") {
+    next.push(
+      "  2. Install the Railway SDK in your project: bun add railway (plan/apply need it to evaluate .railway/railway.ts; Railway CLI 5.42.1+ required).",
+      "  3. Link the project (railway link, or set RAILWAY_TOKEN), then preview and apply: railway config plan, then railway config apply.",
+      "  4. On the service dashboard, enable Wait for CI so a push deploys only after the check workflow passes, and generate a public domain under Networking.",
+      "  5. Point your app's SQLite path at the /data volume (change the volumeMounts key if your app stores SQLite elsewhere).",
     );
   }
   next.push("");

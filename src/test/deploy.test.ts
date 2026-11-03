@@ -3,19 +3,24 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { spawnSync } from "node:child_process";
+
 import { detectProject } from "../deploy/detect";
 import { dockerAdapter } from "../deploy/docker";
 import { buildManifest, readManifest } from "../deploy/manifest";
 import { buildPlan } from "../deploy/plan";
 import { runDeploy } from "../deploy/cli";
+import { railwayAdapter } from "../deploy/railway";
 
 /*
- * `yatta deploy` Phase 1: engine + Docker adapter.
+ * `yatta deploy`: engine + Docker adapter + Railway adapter.
  *
  * The engine's promises, each pinned here:
  * - detection refuses directories that are not Yatta projects;
  * - the Docker adapter generates a Bun Dockerfile, a .dockerignore, and a
  *   CI workflow that builds exactly one commit-SHA image;
+ * - the Railway adapter generates .railway/railway.ts (Infrastructure as
+ *   Code — never the deprecated railway.json) plus a check-only workflow;
  * - no generated file ever contains a credential value, only references;
  * - planning refuses to overwrite an existing file that differs;
  * - configuring twice is idempotent (the second run writes nothing new).
@@ -129,6 +134,61 @@ describe("docker adapter", () => {
   });
 });
 
+describe("railway adapter", () => {
+  it("generates .railway/railway.ts with Railpack, liveness healthcheck, one replica, and a data volume", () => {
+    const root = track(fixture(SCAFFOLD));
+    const detected = detectProject(root);
+    expect("error" in detected).toBe(false);
+    if ("error" in detected) return;
+    const manifest = buildManifest("railway", "native", "main", "/health/z");
+    const files = railwayAdapter.generate(detected.project, manifest);
+    // No Config as Code: railway.json is deprecated and unread after 2026-12-01.
+    expect(files.map((f) => f.path)).not.toContain("railway.json");
+    expect(files.map((f) => f.path)).not.toContain("railway.toml");
+    const railwayTs = files.find((f) => f.path === ".railway/railway.ts")!;
+    expect(railwayTs.content).toContain('from "railway/iac"');
+    expect(railwayTs.content).toContain("defineRailway");
+    expect(railwayTs.content).toContain('builder: "RAILPACK"');
+    expect(railwayTs.content).toContain('start: "bun yatta/main.ts"');
+    expect(railwayTs.content).toContain('healthcheck: "/health/z"');
+    expect(railwayTs.content).toContain("replicas: 1");
+    expect(railwayTs.content).toContain('volume("my-api-data")');
+    expect(railwayTs.content).toContain('volumeMounts: { "/data": data }');
+    // No Git remote in the fixture, so no source is declared — and the file
+    // says so instead of guessing a repository. (The comment mentions the
+    // source line as an example, so match a real code line, not the word.)
+    expect(railwayTs.content).not.toContain('\n    source: github(');
+    expect(railwayTs.content).toContain("No GitHub remote was found");
+    const workflow = files.find((f) => f.path === ".github/workflows/deploy.yml")!;
+    expect(workflow.content).toContain("name: Check");
+    expect(workflow.content).toContain("bun x tsc --noEmit");
+    expect(workflow.content).toContain("bun test");
+    expect(workflow.content).toContain("contents: read");
+    // Check only: no deploy job, no registry write permission.
+    expect(workflow.content).not.toContain("packages: write");
+    expect(workflow.content).not.toContain("build-and-push");
+    expect(railwayAdapter.getDeploymentMode()).toBe("native");
+    expect(railwayAdapter.getRequiredSecrets(manifest)).toEqual([]);
+    expect(railwayAdapter.getPersistentStorage().singleInstance).toBe(true);
+    expect(railwayAdapter.getPersistentStorage().mountPath).toBe("/data");
+    expect(railwayAdapter.getHealthcheckConfig().path).toBe("/health/z");
+    expect(railwayAdapter.getRollbackCapabilities().kind).toBe("platform-deployment");
+  });
+
+  it("declares the GitHub source when a GitHub remote exists", () => {
+    const root = track(fixture(SCAFFOLD));
+    spawnSync("git", ["-C", root, "init", "-q"]);
+    spawnSync("git", ["-C", root, "remote", "add", "origin", "https://github.com/acme/web.git"]);
+    const detected = detectProject(root);
+    expect("error" in detected).toBe(false);
+    if ("error" in detected) return;
+    const manifest = buildManifest("railway", "native", "main", "/health/z");
+    const files = railwayAdapter.generate(detected.project, manifest);
+    const railwayTs = files.find((f) => f.path === ".railway/railway.ts")!;
+    expect(railwayTs.content).toContain('source: github("acme/web")');
+  });
+});
+
 describe("planning", () => {
   it("refuses an existing file that differs, skips one that matches", () => {
     const root = track(fixture({ ...SCAFFOLD, Dockerfile: "MY OWN DOCKERFILE\n" }));
@@ -158,6 +218,7 @@ describe("deploy command", () => {
     expect(outcome.code).toBe(0);
     expect(outcome.lines.join("\n")).toContain("docker");
     expect(outcome.lines.join("\n")).toContain("railway");
+    expect(outcome.lines.join("\n")).toContain("northflank — planned, adapter not built yet");
   });
 
   it("dry-run writes nothing", () => {
@@ -186,10 +247,27 @@ describe("deploy command", () => {
 
   it("refuses a planned-but-unbuilt platform honestly", () => {
     const root = track(fixture(SCAFFOLD));
-    const outcome = runDeploy(root, ["--yes", "--platform", "railway"]);
+    const outcome = runDeploy(root, ["--yes", "--platform", "northflank"]);
     expect(outcome.code).toBe(1);
     expect(outcome.lines.join("\n")).toContain("not built yet");
     expect(existsSync(join(root, "Dockerfile"))).toBe(false);
+  });
+
+  it("configures railway with --yes and writes the IaC file", () => {
+    const root = track(fixture(SCAFFOLD));
+    const outcome = runDeploy(root, ["--yes", "--platform", "railway"]);
+    expect(outcome.code).toBe(0);
+    expect(existsSync(join(root, ".railway/railway.ts"))).toBe(true);
+    expect(existsSync(join(root, ".github/workflows/deploy.yml"))).toBe(true);
+    expect(existsSync(join(root, "railway.json"))).toBe(false);
+    const manifest = readManifest(root);
+    expect(manifest?.platform).toBe("railway");
+    expect(manifest?.deployment.mode).toBe("native");
+    expect(outcome.lines.join("\n")).toContain("railway config plan");
+
+    const second = runDeploy(root, ["--yes", "--platform", "railway"]);
+    expect(second.code).toBe(0);
+    expect(second.lines.join("\n")).toContain("already configured");
   });
 
   it("doctor reports a configured project", () => {
