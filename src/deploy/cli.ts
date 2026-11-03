@@ -17,6 +17,7 @@ import { detectProject } from "./detect";
 import { dockerAdapter } from "./docker";
 import { northflankAdapter } from "./northflank";
 import { railwayAdapter } from "./railway";
+import { renderAdapter } from "./render";
 import { gitBranch, gitRemote, gitSha, gitTreeState } from "./git";
 import { buildManifest, MANIFEST_PATH, readManifest, writeManifest } from "./manifest";
 import { buildPlan, previewLines } from "./plan";
@@ -28,8 +29,9 @@ export interface DeployOutcome {
 }
 
 /** Adapters that exist today. The rest of Dominic's list is planned, not faked. */
-const ADAPTERS: DeployAdapter[] = [dockerAdapter, railwayAdapter, northflankAdapter];
-const PLANNED = ["render"];
+const ADAPTERS: DeployAdapter[] = [dockerAdapter, railwayAdapter, northflankAdapter, renderAdapter];
+/** Dominic's target set is fully built; anything else is unknown, not planned. */
+const PLANNED: string[] = [];
 
 function adapterFor(id: string): DeployAdapter | null {
   return ADAPTERS.find((adapter) => adapter.id === id) ?? null;
@@ -82,7 +84,7 @@ function usageLines(): string[] {
   return [
     "",
     "Usage:",
-    "  yatta deploy [--platform docker|railway|northflank] [--registry ghcr|dockerhub] [--dry-run] [--yes]",
+    "  yatta deploy [--platform docker|railway|northflank|render] [--registry ghcr|dockerhub] [--dry-run] [--yes]",
     "  yatta deploy providers",
     "  yatta deploy config",
     "  yatta deploy status",
@@ -231,7 +233,7 @@ export function runDeploy(root: string, args: string[]): DeployOutcome {
     if (PLANNED.includes(platform)) {
       return {
         code: 1,
-        lines: ["", `✗ The ${platform} adapter is planned but not built yet. Available now: docker, railway, northflank.`, ""],
+        lines: ["", `✗ The ${platform} adapter is planned but not built yet. Available now: docker, railway, northflank, render.`, ""],
       };
     }
     return { code: 1, lines: ["", `✗ Unknown platform "${platform}".`, ...providersLines()] };
@@ -324,6 +326,14 @@ export function runDeploy(root: string, args: string[]): DeployOutcome {
       "  3. On push, CI checks the code, builds the commit-SHA image, pushes it to GHCR, and the Deploy to Northflank action deploys it to your service.",
       "  4. In Northflank, point the service's healthcheck at /health/z, mount a volume at /data for SQLite, and keep replicas at 1.",
       "  5. Make sure Northflank has GHCR pull credentials configured under the name \"github\" (the workflow references them).",
+    );
+  }
+  if (platform === "render") {
+    next.push(
+      "  2. Create the Blueprint in Render (Dashboard → New → Blueprint) and point it at this repo — committing render.yaml alone deploys nothing.",
+      "  3. On push, the check workflow runs; Render deploys only after its checks pass (autoDeployTrigger: checksPass).",
+      "  4. Point your app's SQLite path at the /data disk (change mountPath if your app stores SQLite elsewhere); keep instances at 1 — a disk forbids scaling.",
+      "  5. The free tier cannot use this file (disks need a paid plan); Render defaults a new web service to 0.5c-512mb, and a disk disables zero-downtime deploys.",
     );
   }
   next.push("");

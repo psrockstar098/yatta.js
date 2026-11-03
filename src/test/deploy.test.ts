@@ -12,9 +12,10 @@ import { buildPlan } from "../deploy/plan";
 import { runDeploy } from "../deploy/cli";
 import { northflankAdapter } from "../deploy/northflank";
 import { railwayAdapter } from "../deploy/railway";
+import { renderAdapter } from "../deploy/render";
 
 /*
- * `yatta deploy`: engine + Docker, Railway, and Northflank adapters.
+ * `yatta deploy`: engine + Docker, Railway, Northflank, and Render adapters.
  *
  * The engine's promises, each pinned here:
  * - detection refuses directories that are not Yatta projects;
@@ -24,6 +25,9 @@ import { railwayAdapter } from "../deploy/railway";
  *   Code — never the deprecated railway.json) plus a check-only workflow;
  * - the Northflank adapter generates the same Bun Dockerfile plus a
  *   check-then-deploy workflow using the first-party Deploy action;
+ * - the Render adapter generates a native render.yaml Blueprint (Bun via
+ *   the node runtime, checksPass gate, persistent disk) plus a check-only
+ *   workflow;
  * - no generated file ever contains a credential value, only references;
  * - planning refuses to overwrite an existing file that differs;
  * - configuring twice is idempotent (the second run writes nothing new).
@@ -236,6 +240,47 @@ describe("northflank adapter", () => {
   });
 });
 
+describe("render adapter", () => {
+  it("generates a native render.yaml Blueprint with checksPass gate and a persistent disk", () => {
+    const root = track(fixture(SCAFFOLD));
+    const detected = detectProject(root);
+    expect("error" in detected).toBe(false);
+    if ("error" in detected) return;
+    const manifest = buildManifest("render", "native", "main", "/health/z");
+    const files = renderAdapter.generate(detected.project, manifest);
+    // Native mode: no Dockerfile, no image — Render builds Bun itself.
+    expect(files.map((f) => f.path)).not.toContain("Dockerfile");
+    const yaml = files.find((f) => f.path === "render.yaml")!;
+    expect(yaml.content).toContain("type: web");
+    expect(yaml.content).toContain("name: my-api");
+    // Render has no `bun` runtime value; Bun is preinstalled in the
+    // JavaScript runtime, so the commands just use `bun`.
+    expect(yaml.content).toContain("runtime: node");
+    expect(yaml.content).toContain("buildCommand: bun install");
+    expect(yaml.content).toContain("startCommand: bun yatta/main.ts");
+    expect(yaml.content).toContain("healthCheckPath: /health/z");
+    expect(yaml.content).toContain("autoDeployTrigger: checksPass");
+    expect(yaml.content).toContain("name: my-api-data");
+    expect(yaml.content).toContain("mountPath: /data");
+    expect(yaml.content).toContain("sizeGB: 1");
+    expect(yaml.content).toContain("NODE_ENV");
+    const workflow = files.find((f) => f.path === ".github/workflows/deploy.yml")!;
+    expect(workflow.content).toContain("name: Check");
+    expect(workflow.content).toContain("bun x tsc --noEmit");
+    expect(workflow.content).toContain("bun test");
+    expect(workflow.content).toContain("contents: read");
+    // Check only: no deploy job, no registry write permission.
+    expect(workflow.content).not.toContain("packages: write");
+    expect(workflow.content).not.toContain("build-and-push");
+    expect(renderAdapter.getDeploymentMode()).toBe("native");
+    expect(renderAdapter.getRequiredSecrets(manifest)).toEqual([]);
+    expect(renderAdapter.getPersistentStorage().singleInstance).toBe(true);
+    expect(renderAdapter.getPersistentStorage().mountPath).toBe("/data");
+    expect(renderAdapter.getHealthcheckConfig().path).toBe("/health/z");
+    expect(renderAdapter.getRollbackCapabilities().kind).toBe("platform-deployment");
+  });
+});
+
 describe("planning", () => {
   it("refuses an existing file that differs, skips one that matches", () => {
     const root = track(fixture({ ...SCAFFOLD, Dockerfile: "MY OWN DOCKERFILE\n" }));
@@ -259,14 +304,15 @@ describe("planning", () => {
 });
 
 describe("deploy command", () => {
-  it("lists providers, including planned ones it does not fake", () => {
+  it("lists all four built providers", () => {
     const root = track(fixture(SCAFFOLD));
     const outcome = runDeploy(root, ["providers"]);
     expect(outcome.code).toBe(0);
-    expect(outcome.lines.join("\n")).toContain("docker");
-    expect(outcome.lines.join("\n")).toContain("railway");
-    expect(outcome.lines.join("\n")).toContain("northflank");
-    expect(outcome.lines.join("\n")).toContain("render — planned, adapter not built yet");
+    expect(outcome.lines.join("\n")).toContain("docker — Docker (mode: github-actions)");
+    expect(outcome.lines.join("\n")).toContain("railway — Railway (mode: native)");
+    expect(outcome.lines.join("\n")).toContain("northflank — Northflank (mode: github-actions)");
+    expect(outcome.lines.join("\n")).toContain("render — Render (mode: native)");
+    expect(outcome.lines.join("\n")).not.toContain("planned");
   });
 
   it("dry-run writes nothing", () => {
@@ -293,12 +339,29 @@ describe("deploy command", () => {
     expect(second.lines.join("\n")).toContain("already configured");
   });
 
-  it("refuses a planned-but-unbuilt platform honestly", () => {
+  it("rejects an unknown platform instead of faking it", () => {
     const root = track(fixture(SCAFFOLD));
-    const outcome = runDeploy(root, ["--yes", "--platform", "render"]);
+    const outcome = runDeploy(root, ["--yes", "--platform", "fly"]);
     expect(outcome.code).toBe(1);
-    expect(outcome.lines.join("\n")).toContain("not built yet");
+    expect(outcome.lines.join("\n")).toContain("Unknown platform");
     expect(existsSync(join(root, "Dockerfile"))).toBe(false);
+  });
+
+  it("configures render with --yes and is idempotent on the second run", () => {
+    const root = track(fixture(SCAFFOLD));
+    const first = runDeploy(root, ["--yes", "--platform", "render"]);
+    expect(first.code).toBe(0);
+    expect(existsSync(join(root, "render.yaml"))).toBe(true);
+    expect(existsSync(join(root, ".github/workflows/deploy.yml"))).toBe(true);
+    expect(existsSync(join(root, "Dockerfile"))).toBe(false);
+    expect(readFileSync(join(root, "render.yaml"), "utf8")).toContain("autoDeployTrigger: checksPass");
+    const manifest = readManifest(root);
+    expect(manifest?.platform).toBe("render");
+    expect(manifest?.deployment.mode).toBe("native");
+
+    const second = runDeploy(root, ["--yes", "--platform", "render"]);
+    expect(second.code).toBe(0);
+    expect(second.lines.join("\n")).toContain("already configured");
   });
 
   it("configures northflank with --yes and is idempotent on the second run", () => {
