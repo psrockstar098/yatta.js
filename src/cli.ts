@@ -17,6 +17,7 @@ import { spawnSync } from "node:child_process";
 import { cmdDoctor } from "./cli_doctor";
 import { cmdMigrate, cmdMigrateMake, cmdMigrateStatus } from "./cli_migrate";
 import { cmdDbBackup, cmdDbRestore } from "./cli_backup";
+import { cmdDeploy } from "./deploy/cli";
 
 /**
  * The version `version` and `help` print.
@@ -2262,6 +2263,7 @@ function cmdUsage(): number {
   log(`  ${c.cyan}yatta check${c.reset}        Typecheck and run tests`);
   log(`  ${c.cyan}yatta info${c.reset}         Show paths and versions`);
   log(`  ${c.cyan}yatta doctor${c.reset}       Diagnose project health and configuration`);
+  log(`  ${c.cyan}yatta deploy${c.reset}       Configure one-command deployment (docker today)`);
   log(`  ${c.cyan}yatta version${c.reset}      Print the version`);
   log(`  ${c.cyan}yatta help${c.reset}         Show this`);
   log("");
@@ -2345,7 +2347,10 @@ export async function main(argv: string[]): Promise<number> {
   if (firstArg === "-h" || firstArg === "--help") {
     return cmdUsage();
   }
-  if (firstArg !== undefined && firstArg.startsWith("-")) {
+  // Deploy is the one command that takes flags (--platform, --dry-run,
+  // --yes, --registry), so it parses its own arguments instead of being
+  // refused here. Every other command still takes no flags, by design.
+  if (command !== "deploy" && firstArg !== undefined && firstArg.startsWith("-")) {
     fail(`Unknown option "${firstArg}".`);
     return cmdUsage();
   }
@@ -2389,6 +2394,8 @@ export async function main(argv: string[]): Promise<number> {
       return cmdInfo();
     case "doctor":
       return cmdDoctor();
+    case "deploy":
+      return cmdDeploy(rest);
     case "migrate":
       return await cmdMigrate();
     case "migrate:make":
