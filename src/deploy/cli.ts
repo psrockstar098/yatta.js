@@ -15,6 +15,7 @@ import { join } from "node:path";
 
 import { detectProject } from "./detect";
 import { dockerAdapter } from "./docker";
+import { northflankAdapter } from "./northflank";
 import { railwayAdapter } from "./railway";
 import { gitBranch, gitRemote, gitSha, gitTreeState } from "./git";
 import { buildManifest, MANIFEST_PATH, readManifest, writeManifest } from "./manifest";
@@ -27,8 +28,8 @@ export interface DeployOutcome {
 }
 
 /** Adapters that exist today. The rest of Dominic's list is planned, not faked. */
-const ADAPTERS: DeployAdapter[] = [dockerAdapter, railwayAdapter];
-const PLANNED = ["northflank", "render"];
+const ADAPTERS: DeployAdapter[] = [dockerAdapter, railwayAdapter, northflankAdapter];
+const PLANNED = ["render"];
 
 function adapterFor(id: string): DeployAdapter | null {
   return ADAPTERS.find((adapter) => adapter.id === id) ?? null;
@@ -81,7 +82,7 @@ function usageLines(): string[] {
   return [
     "",
     "Usage:",
-    "  yatta deploy [--platform docker|railway] [--registry ghcr|dockerhub] [--dry-run] [--yes]",
+    "  yatta deploy [--platform docker|railway|northflank] [--registry ghcr|dockerhub] [--dry-run] [--yes]",
     "  yatta deploy providers",
     "  yatta deploy config",
     "  yatta deploy status",
@@ -230,7 +231,7 @@ export function runDeploy(root: string, args: string[]): DeployOutcome {
     if (PLANNED.includes(platform)) {
       return {
         code: 1,
-        lines: ["", `✗ The ${platform} adapter is planned but not built yet. Available now: docker, railway.`, ""],
+        lines: ["", `✗ The ${platform} adapter is planned but not built yet. Available now: docker, railway, northflank.`, ""],
       };
     }
     return { code: 1, lines: ["", `✗ Unknown platform "${platform}".`, ...providersLines()] };
@@ -315,6 +316,14 @@ export function runDeploy(root: string, args: string[]): DeployOutcome {
       "  3. Link the project (railway link, or set RAILWAY_TOKEN), then preview and apply: railway config plan, then railway config apply.",
       "  4. On the service dashboard, enable Wait for CI so a push deploys only after the check workflow passes, and generate a public domain under Networking.",
       "  5. Point your app's SQLite path at the /data volume (change the volumeMounts key if your app stores SQLite elsewhere).",
+    );
+  }
+  if (platform === "northflank") {
+    next.push(
+      "  2. Create the project and service in Northflank (a Dockerfile service), then set three repo secrets: NORTHFLANK_API_KEY, NORTHFLANK_PROJECT_ID, NORTHFLANK_SERVICE_ID.",
+      "  3. On push, CI checks the code, builds the commit-SHA image, pushes it to GHCR, and the Deploy to Northflank action deploys it to your service.",
+      "  4. In Northflank, point the service's healthcheck at /health/z, mount a volume at /data for SQLite, and keep replicas at 1.",
+      "  5. Make sure Northflank has GHCR pull credentials configured under the name \"github\" (the workflow references them).",
     );
   }
   next.push("");

@@ -10,10 +10,11 @@ import { dockerAdapter } from "../deploy/docker";
 import { buildManifest, readManifest } from "../deploy/manifest";
 import { buildPlan } from "../deploy/plan";
 import { runDeploy } from "../deploy/cli";
+import { northflankAdapter } from "../deploy/northflank";
 import { railwayAdapter } from "../deploy/railway";
 
 /*
- * `yatta deploy`: engine + Docker adapter + Railway adapter.
+ * `yatta deploy`: engine + Docker, Railway, and Northflank adapters.
  *
  * The engine's promises, each pinned here:
  * - detection refuses directories that are not Yatta projects;
@@ -21,6 +22,8 @@ import { railwayAdapter } from "../deploy/railway";
  *   CI workflow that builds exactly one commit-SHA image;
  * - the Railway adapter generates .railway/railway.ts (Infrastructure as
  *   Code — never the deprecated railway.json) plus a check-only workflow;
+ * - the Northflank adapter generates the same Bun Dockerfile plus a
+ *   check-then-deploy workflow using the first-party Deploy action;
  * - no generated file ever contains a credential value, only references;
  * - planning refuses to overwrite an existing file that differs;
  * - configuring twice is idempotent (the second run writes nothing new).
@@ -189,6 +192,50 @@ describe("railway adapter", () => {
   });
 });
 
+describe("northflank adapter", () => {
+  it("generates the Bun Dockerfile plus a check-then-deploy workflow using the first-party action", () => {
+    const root = track(fixture(SCAFFOLD));
+    const detected = detectProject(root);
+    expect("error" in detected).toBe(false);
+    if ("error" in detected) return;
+    const manifest = buildManifest("northflank", "github-actions", "main", "/health/z");
+    const files = northflankAdapter.generate(detected.project, manifest);
+    const dockerfile = files.find((f) => f.path === "Dockerfile")!;
+    expect(dockerfile.content).toContain("oven/bun");
+    expect(dockerfile.content).toContain('CMD ["bun", "yatta/main.ts"]');
+    expect(dockerfile.content).toContain("/health/z");
+    expect(dockerfile.content).toContain('VOLUME ["/data"]');
+    const workflow = files.find((f) => f.path === ".github/workflows/deploy.yml")!;
+    expect(workflow.content).toContain("production-deploy");
+    expect(workflow.content).toContain("cancel-in-progress: false");
+    expect(workflow.content).toContain("packages: write");
+    // Check job gates the deploy job, per the Mode B design.
+    expect(workflow.content).toContain("bun x tsc --noEmit");
+    expect(workflow.content).toContain("bun test");
+    expect(workflow.content).toContain("needs: check");
+    // First-party action, exactly as its action.yml defines it.
+    expect(workflow.content).toContain("northflank/deploy-to-northflank@v1");
+    expect(workflow.content).toContain("northflank-api-key: ${{ secrets.NORTHFLANK_API_KEY }}");
+    expect(workflow.content).toContain("project-id: ${{ secrets.NORTHFLANK_PROJECT_ID }}");
+    expect(workflow.content).toContain("service-id: ${{ secrets.NORTHFLANK_SERVICE_ID }}");
+    expect(workflow.content).toContain("image-path: ghcr.io/${{ github.repository }}:${{ github.sha }}");
+    expect(workflow.content).toContain("credentials-id: github");
+    // References only: no credential value may appear in generated files.
+    for (const file of files) {
+      expect(file.content).not.toContain("nf_");
+    }
+    expect(northflankAdapter.getDeploymentMode()).toBe("github-actions");
+    expect(northflankAdapter.getRequiredSecrets(manifest).map((s) => s.name)).toEqual([
+      "NORTHFLANK_API_KEY",
+      "NORTHFLANK_PROJECT_ID",
+      "NORTHFLANK_SERVICE_ID",
+    ]);
+    expect(northflankAdapter.getPersistentStorage().singleInstance).toBe(true);
+    expect(northflankAdapter.getHealthcheckConfig().path).toBe("/health/z");
+    expect(northflankAdapter.getRollbackCapabilities().kind).toBe("image-tag");
+  });
+});
+
 describe("planning", () => {
   it("refuses an existing file that differs, skips one that matches", () => {
     const root = track(fixture({ ...SCAFFOLD, Dockerfile: "MY OWN DOCKERFILE\n" }));
@@ -218,7 +265,8 @@ describe("deploy command", () => {
     expect(outcome.code).toBe(0);
     expect(outcome.lines.join("\n")).toContain("docker");
     expect(outcome.lines.join("\n")).toContain("railway");
-    expect(outcome.lines.join("\n")).toContain("northflank — planned, adapter not built yet");
+    expect(outcome.lines.join("\n")).toContain("northflank");
+    expect(outcome.lines.join("\n")).toContain("render — planned, adapter not built yet");
   });
 
   it("dry-run writes nothing", () => {
@@ -247,10 +295,28 @@ describe("deploy command", () => {
 
   it("refuses a planned-but-unbuilt platform honestly", () => {
     const root = track(fixture(SCAFFOLD));
-    const outcome = runDeploy(root, ["--yes", "--platform", "northflank"]);
+    const outcome = runDeploy(root, ["--yes", "--platform", "render"]);
     expect(outcome.code).toBe(1);
     expect(outcome.lines.join("\n")).toContain("not built yet");
     expect(existsSync(join(root, "Dockerfile"))).toBe(false);
+  });
+
+  it("configures northflank with --yes and is idempotent on the second run", () => {
+    const root = track(fixture(SCAFFOLD));
+    const first = runDeploy(root, ["--yes", "--platform", "northflank"]);
+    expect(first.code).toBe(0);
+    expect(existsSync(join(root, "Dockerfile"))).toBe(true);
+    expect(existsSync(join(root, ".github/workflows/deploy.yml"))).toBe(true);
+    expect(readFileSync(join(root, ".github/workflows/deploy.yml"), "utf8")).toContain(
+      "northflank/deploy-to-northflank@v1",
+    );
+    const manifest = readManifest(root);
+    expect(manifest?.platform).toBe("northflank");
+    expect(manifest?.deployment.mode).toBe("github-actions");
+
+    const second = runDeploy(root, ["--yes", "--platform", "northflank"]);
+    expect(second.code).toBe(0);
+    expect(second.lines.join("\n")).toContain("already configured");
   });
 
   it("configures railway with --yes and writes the IaC file", () => {
