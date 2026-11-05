@@ -147,6 +147,7 @@ describe("cloud backups: scheduled run and restore", () => {
       outDir: join(dir, "staged"),
     });
     const stagedApp = restored.files.find((file) => file.name === "app.db")!;
+    expect(stagedApp).toBeDefined();
     expect(readEmails(stagedApp.path)).toEqual(["ada@example.com", "grace@example.com"]);
 
     // The staged file must also survive Yatta's own restore path, which
@@ -211,7 +212,8 @@ describe("cloud backups: scheduled run and restore", () => {
 
     // Flip a byte deep in the ciphertext: GCM authentication must catch it.
     const tampered = Buffer.from(original);
-    tampered[tampered.length - 5] ^= 0xff;
+    const flipAt = tampered.length - 5;
+    tampered[flipAt] = (tampered[flipAt] ?? 0) ^ 0xff;
     bucket.objects.set(result.key, tampered);
     await expect(
       restoreCloudBackup({
@@ -364,5 +366,51 @@ describe("cloud backups: configuration", () => {
     await expect(runner.run()).rejects.toThrow(/already in progress/);
     await first;
     expect(existsSync(join(dir, "app.db"))).toBe(true);
+  });
+
+  it("bucket credentials never reach the logs, even inside an error message", async () => {
+    seedDb(join(dir, "app.db"), ["ada@example.com"]);
+    const secret = "test-secret-value-1234";
+    const bucket = fakeBucket();
+    // A bucket that fails every upload with an error echoing the secret:
+    // the worst case for log leakage, and the runner must still not print it.
+    bucket.put = async () => {
+      throw new Error(`upload refused for key material ${secret}`);
+    };
+    const config = testConfig({ s3: { secretAccessKey: secret } });
+    const runner = new CloudBackupRunner({ config, bucket, log: (message) => logs.push(message) });
+    // The run fails, but the failure must be reported without the secret.
+    // The runner rethrows the raw error here; what matters is the logs.
+    await expect(runner.run()).rejects.toThrow();
+    // The upload failure happens before the runner logs success, so force a
+    // log line through the prune path instead: a listing failure is logged.
+    const listingBucket = fakeBucket();
+    listingBucket.list = async () => {
+      throw new Error(`listing refused ${secret}`);
+    };
+    const listingRunner = new CloudBackupRunner({
+      config,
+      bucket: listingBucket,
+      log: (message) => logs.push(message),
+    });
+    await listingRunner.run();
+    expect(logs.join("\n")).not.toContain(secret);
+    expect(logs.join("\n")).toContain("[redacted]");
+  });
+
+  it("retention never touches a neighbour prefix that shares the name", async () => {
+    seedDb(join(dir, "app.db"), ["ada@example.com"]);
+    const bucket = fakeBucket();
+    // An old snapshot under "backups2/" — a bare "backups" prefix listing
+    // would match it, and pruning it would delete another app's backup.
+    const neighbour = makeSnapshotKey("backups2", new Date("2026-01-01T02:00:00.000Z"));
+    bucket.objects.set(neighbour, Buffer.from("neighbour"));
+    const runner = new CloudBackupRunner({
+      config: testConfig({ keepCount: 1, keepDays: 0 }),
+      bucket,
+      log: () => {},
+    });
+    await runner.run(new Date("2026-11-05T02:00:00.000Z"));
+    expect(bucket.objects.has(neighbour)).toBe(true);
   });
 });

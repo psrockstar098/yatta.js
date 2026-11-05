@@ -52,6 +52,7 @@ import {
   readFileSync,
   rmSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -498,7 +499,7 @@ const SNAPSHOT_KEY_PATTERN = /^(.+)\/(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z
 
 export function snapshotTimestampFromKey(key: string): number | null {
   const match = SNAPSHOT_KEY_PATTERN.exec(key);
-  if (!match) return null;
+  if (!match || !match[2]) return null;
   // The stamp uses dashes where ISO uses colons, so it stays a safe object
   // key on every provider. Rebuild ISO form before parsing.
   const stamp = match[2];
@@ -530,7 +531,8 @@ export function selectSnapshotsToPrune(
     .filter((entry) => entry.time !== null)
     .sort((a, b) => (b.time as number) - (a.time as number));
   if (dated.length === 0) return [];
-  const newest = dated[0].key;
+  const newest = dated[0]?.key;
+  if (!newest) return [];
   const prune: string[] = [];
   dated.forEach((entry, index) => {
     if (entry.key === newest) return;
@@ -547,7 +549,30 @@ export function makeSnapshotKey(prefix: string, now: Date = new Date()): string 
   // ISO already ends in Z; the replaces above turn "02:00:00.000Z" into
   // "02-00-00-000Z", which is safe in an object key.
   const cleanPrefix = prefix.replace(/\/+$/, "");
-  return `${cleanPrefix}/${stamp}-${randomBytes(4).toString("hex")}.ybk`;
+  // 8 random bytes: two runs in the same millisecond must not share a key,
+  // or the second upload would silently overwrite the first snapshot.
+  return `${cleanPrefix}/${stamp}-${randomBytes(8).toString("hex")}.ybk`;
+}
+
+/**
+ * Removes bucket credential values from a log line, if they ever appear in
+ * one. Error messages from a storage driver are not expected to carry them,
+ * but a log line is the wrong place to find out otherwise: the runner and
+ * the scheduler both log through this, so no failure path can print a
+ * credential even when the underlying error text does contain one.
+ */
+export function scrubBackupSecrets(message: string, config: CloudBackupConfig): string {
+  let scrubbed = message;
+  for (const value of [
+    config.s3.accessKeyId,
+    config.s3.secretAccessKey,
+    config.s3.sessionToken,
+  ]) {
+    if (value && value.length >= 4) {
+      scrubbed = scrubbed.split(value).join("[redacted]");
+    }
+  }
+  return scrubbed;
 }
 
 // ── Runner ──────────────────────────────────────────────────────────────────
@@ -578,7 +603,10 @@ export class CloudBackupRunner {
   constructor(options: CloudBackupRunnerOptions) {
     this.config = options.config;
     this.bucket = options.bucket;
-    this.log = options.log ?? ((message: string) => console.log(message));
+    const rawLog = options.log ?? ((message: string) => console.log(message));
+    // Every log line the runner emits passes through the scrubber, so a
+    // credential that slips into an error message never reaches the logs.
+    this.log = (message: string) => rawLog(scrubBackupSecrets(message, this.config));
   }
 
   /** True while a run is in flight. The cron scheduler also skips overlaps. */
@@ -613,7 +641,14 @@ export class CloudBackupRunner {
         }
         const dest = join(workDir, entry.name);
         snapshotSqliteFile(entry.path, dest);
-        files.push({ name: entry.name, bytes: readFileSync(dest) });
+        const bytes = readFileSync(dest);
+        // Plaintext snapshots live on disk only until they are read: delete
+        // each one as soon as its bytes are in memory, instead of leaving
+        // the whole set lying in the scratch directory until the run ends.
+        // A crash mid-run can still leave a snapshot behind in the OS temp
+        // directory — that is the residual risk, noted in the docs.
+        unlinkSync(dest);
+        files.push({ name: entry.name, bytes });
       }
       if (files.length === 0) {
         throw new CloudBackupError("No database files found to back up");
@@ -644,12 +679,17 @@ export class CloudBackupRunner {
   private async prune(justUploadedKey: string): Promise<string[]> {
     let keys: string[];
     try {
-      keys = await this.bucket.list(this.config.prefix);
+      // List under `<prefix>/`, not `<prefix>`: a bare prefix would also
+      // match a neighbour like `backups2/`, and the pruner must never delete
+      // objects outside its own prefix directory.
+      const dirPrefix = `${this.config.prefix.replace(/\/+$/, "")}/`;
+      keys = await this.bucket.list(dirPrefix);
     } catch (err) {
       // Listing failed, so pruning cannot know what is safe to delete. Skip
-      // it and keep every snapshot; the next run retries.
+      // it and keep every snapshot; the next run retries. The message is
+      // scrubbed by the runner's log wrapper before it is emitted.
       this.log(
-        `[cloud-backup] retention skipped: could not list snapshots (${err instanceof Error ? err.name : "error"})`,
+        `[cloud-backup] retention skipped: could not list snapshots (${err instanceof Error ? err.message : "error"})`,
       );
       return [];
     }
@@ -696,6 +736,8 @@ export interface RestoredSnapshot {
  * its own integrity check and atomic swap; jobs.db and cache.db can be put
  * back while their owners are stopped, or left staged for inspection. A
  * tampered or wrong-key object fails here, before any live file is touched.
+ * The staged files are PLAINTEXT databases: the caller owns deleting them
+ * once the restore is done, and must not leave them in a shared directory.
  */
 export async function restoreCloudBackup(options: {
   bucket: BackupBucket;
@@ -739,8 +781,12 @@ export function scheduleCloudBackups(
     } catch (err) {
       // Log the message only, never the error object: a driver error object
       // can carry request details, and this path must never become a place
-      // where credentials or key material reach the logs.
-      log(`[cloud-backup] scheduled run failed: ${err instanceof Error ? err.message : "unknown error"}`);
+      // where credentials or key material reach the logs. The message is
+      // scrubbed the same way the runner scrubs its own lines.
+      log(scrubBackupSecrets(
+        `[cloud-backup] scheduled run failed: ${err instanceof Error ? err.message : "unknown error"}`,
+        config,
+      ));
     }
   };
   if (config.interval) {
