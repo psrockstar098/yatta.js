@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from "bun:test";
 import { createDatabase, col, YattaError, type TypedDatabase } from "../types/db";
 import { createCron } from "../types/job";
 import {
+  parseRollupPolicyConfig,
   normalizeRollupPolicy,
   ensureRollupTables,
   runRollupPolicy,
@@ -330,6 +331,44 @@ describe("rollup policy validation", () => {
     const db = memDb();
     db.rawRun(`CREATE TABLE "readings_hourly" (something TEXT)`);
     expect(() => ensureRollupTables(db as any, policy)).toThrow(YattaError);
+  });
+});
+
+describe("JSON5 policy config", () => {
+  it("parses comments, trailing commas, unquoted keys, and single quotes", () => {
+    const parsed = parseRollupPolicyConfig(`
+      {
+        // Summarize old readings by the hour.
+        source: 'readings',
+        measures: ['value'],
+        groupBy: ['region'],
+        tiers: [
+          { name: 'hourly', window: 'hour', olderThan: '1d', },
+        ],
+      }
+    `);
+    expect(parsed.source).toBe("readings");
+    expect(parsed.measures).toEqual(["value"]);
+    expect(parsed.tiers[0]!.name).toBe("hourly");
+    // The parsed config runs end to end, so parsing is not just shaping.
+    const db = memDb();
+    seed(db);
+    const result = runRollupPolicy(db as any, parsed, { now: BASE + 10 * DAY });
+    expect(result.tiers[0]!.rowsWritten).toBe(3);
+  });
+
+  it("accepts plain JSON too, since JSON5 is a superset of it", () => {
+    const parsed = parseRollupPolicyConfig(
+      `{"source": "readings", "measures": ["value"], "tiers": [{"name": "hourly", "window": "hour", "olderThan": "1d"}]}`,
+    );
+    expect(parsed.source).toBe("readings");
+  });
+
+  it("rejects empty, malformed, and non-object configs", () => {
+    expect(() => parseRollupPolicyConfig("")).toThrow(YattaError);
+    expect(() => parseRollupPolicyConfig("{ source: }")).toThrow(YattaError);
+    expect(() => parseRollupPolicyConfig(`["readings"]`)).toThrow(YattaError);
+    expect(() => parseRollupPolicyConfig(`"readings"`)).toThrow(YattaError);
   });
 });
 

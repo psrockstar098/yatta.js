@@ -201,6 +201,48 @@ export function parseRollupDuration(value: string | number): number {
 }
 
 /**
+ * Parses a rollup policy from hand-edited config text.
+ *
+ * The text is JSON5, not strict JSON: comments, trailing commas,
+ * unquoted keys, and single-quoted strings are all accepted, so a
+ * policy file stays readable. Plain JSON parses too, since JSON5 is a
+ * superset of it. This only parses; it does not validate the policy
+ * against a schema. Passing the result to {@link normalizeRollupPolicy}
+ * or {@link runRollupPolicy} does that, and those throw on the first
+ * problem before any table is created or row is touched.
+ *
+ * @example
+ * ```ts
+ * const policy = parseRollupPolicyConfig(`
+ *   {
+ *     // Summarize old readings by the hour.
+ *     source: "readings",
+ *     measures: ["value"],
+ *     tiers: [{ name: "hourly", window: "hour", olderThan: "30d" }],
+ *   }
+ * `);
+ * runRollupPolicy(db, policy);
+ * ```
+ */
+export function parseRollupPolicyConfig(text: string): RollupPolicyConfig {
+  if (typeof text !== "string" || text.trim() === "") {
+    throw new YattaError("Rollup policy config is empty. Provide a JSON5 object describing the policy.");
+  }
+  let value: unknown;
+  try {
+    value = Bun.JSON5.parse(text);
+  } catch (err) {
+    throw new YattaError(
+      `Invalid rollup policy config: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new YattaError("Rollup policy config must be a JSON5 object, not an array or a scalar.");
+  }
+  return value as RollupPolicyConfig;
+}
+
+/**
  * Name of the table's `.timeSeries()` column, or null when the table
  * marks no timestamp column.
  */
