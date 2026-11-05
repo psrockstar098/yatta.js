@@ -75,6 +75,7 @@ import { Database, type Statement } from "bun:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import type { OutboxEntry, RecordOutboxInput } from "./outbox";
 
 // ──────────────────────────────────────────────────────────────────────────
 // 0. Global Schema Registry & Utility Types
@@ -2388,6 +2389,32 @@ export class YattaDB {
     })();
 
     return result;
+  }
+
+  /**
+   * Records one outbox entry in this database file, in the caller's
+   * transaction when called inside `transaction()`. That is the point:
+   * the user write and its log entry commit or roll back together, in
+   * the same file, so a crash between them cannot drop the event.
+   * See `src/types/outbox.ts` and docs/roadmap-14/shared-change-log.md.
+   *
+   * @example
+   * ```ts
+   * db.transaction((tx) => {
+   *   tx.users.insert({ email: "ada@example.com", name: "Ada" });
+   *   tx.recordOutbox({ eventType: "user.registered", payload: { email: "ada@example.com" } });
+   * });
+   * ```
+   */
+  recordOutbox(input: RecordOutboxInput): OutboxEntry {
+    // Lazy on purpose: the outbox module is loaded only on the first
+    // recordOutbox() call, never when this database module loads. An app
+    // that never records an outbox entry pays nothing for the feature:
+    // no module load, no table, no extra statement on any write. The
+    // same file already uses bare require() for lazy loading elsewhere.
+    const { ensureOutboxTable, recordOutbox: recordOutboxRow } = require("./outbox");
+    ensureOutboxTable(this);
+    return recordOutboxRow(this, input);
   }
 
   // ── Raw SQL Suite ────────────────────────────────────────────────────────
