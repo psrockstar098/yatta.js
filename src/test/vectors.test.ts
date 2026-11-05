@@ -178,6 +178,18 @@ describe("vectors: store and search ranking (plain-SQLite backend)", () => {
     expect(db.vectors.listCollections()).toEqual([]);
   });
 
+  it("interleaved searches over different-width collections never leak query components", () => {
+    const db = fresh();
+    seed(db);
+    db.vectors.upsert("flat", { id: "p", embedding: [1, 0] });
+    db.vectors.upsert("flat", { id: "q", embedding: [0, 1] });
+    // The SQL backend stages each query vector in one temp table: a
+    // 2-dim query after a 3-dim query must not see stale components.
+    expect(db.vectors.search("docs", [1, 0, 0]).map((h) => h.id)).toEqual(["a", "b", "c"]);
+    expect(db.vectors.search("flat", [0, 1]).map((h) => h.id)).toEqual(["q", "p"]);
+    expect(db.vectors.search("docs", [0, 1, 0]).map((h) => h.id)).toEqual(["c", "b", "a"]);
+  });
+
   it("vector writes roll back with the surrounding transaction", () => {
     const db = fresh();
     expect(() =>

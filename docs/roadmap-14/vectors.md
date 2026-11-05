@@ -118,15 +118,59 @@ bundled with Yatta, so pick a small one for your width — the width is
 whatever the model returns, and the collection is created at that width
 on first write.
 
+## Bun runtime notes
+
+- The search hot path is fully typed (strict TypeScript, including
+  `noUncheckedIndexedAccess`, and clean under both `tsc` and
+  `bun check`), which is what AOT compilation rewards: typed code
+  compiles to fixed-offset access, while untyped code can run slower
+  than the JIT. The remaining cost is the SQLite scan itself, not JS
+  shapes — so if a search ever needs profiling, `bun compile
+  --explain` is the tool, but the fix will be in the query or the
+  backend, not in the JS types.
+- The feature generates no code from strings: no `eval`, no
+  `Function`, no `vm`. Its only dynamic loads are file imports with
+  literal specifiers (`require("./vectors")`, `import("./vectors_embed")`,
+  `import("@xenova/transformers")`), which keep working under both
+  `--disallow-code-generation-from-strings` and `=strict` — verified by
+  running vector search under both flags. One AOT caveat: in a
+  compiled executable with `=strict`, files on disk are not part of
+  the program, so the optional transformers package must be bundled
+  into the executable to be loadable there.
+- `--smol` is an explicit operator knob, never a default: it trades
+  speed for memory by collecting more often. Vector search allocates
+  per search (rows, scores), so it runs slower under `--smol` and
+  nothing in the feature needs to change for it.
+- No C helper is shipped for the SQL path, deliberately. The measured
+  cost is the full scan plus JSON parsing per row, not JS arithmetic,
+  so a TinyCC dot-product helper would still pay the scan and add an
+  FFI boundary per row — plus an experimental API that
+  `--no-ffi-cc`/`--no-addons` can disable. TinyCC is also not an
+  optimizing compiler. The fast path at scale is the vec0 index
+  above, not C arithmetic.
+- The feature reads no hand-edited config files — configuration is
+  environment variables only — so there is no JSON5 surface in v1.
+  If a model config file is added later, it should accept JSON5 via
+  `Bun.JSON5.parse` (comments, trailing commas) rather than strict
+  JSON. Likewise the feature has no code-generation or temp-file
+  paths, so the bundler's `files` map has nothing to replace today;
+  it is the right tool if a codegen step ever appears.
+
 ## Gotchas
 
 - Zero vectors have no cosine similarity and are refused at write and
   at query time. A query of all zeros is an error, not an empty result.
 - Search ranks by cosine similarity, not by insertion order. Equal
   scores tie-break by id, so ranking is deterministic.
-- The plain-SQLite backend scans the whole collection per search. It
-  is fine for thousands of vectors and the honest choice without vec0;
-  for much larger collections, install vec0 and let `auto` pick it.
+- The plain-SQLite backend scans the whole collection per search.
+  Measured on this VM (unit vectors, limit 10): about 85ms at
+  2,000 x 128 dimensions, about 0.5s at 10,000 x 128, and about 2.5s at
+  10,000 x 384 — against about 8ms for sqlite-vec at 10,000 x 384 with
+  the same top hit. The SQL path is the honest choice without vec0 up
+  to a few thousand vectors; past that, install vec0 and let `auto`
+  pick it. The query stages the query vector once in a temp table and
+  joins on component index: an earlier correlated-subquery shape took
+  about 5s at 2,000 x 128 and was replaced for that reason.
 - `threshold` on the vec0 backend fetches the whole collection before
   filtering, because vec0 returns only its k nearest — a thresholded
   search over `k = limit` could drop qualifying rows past the cutoff.
