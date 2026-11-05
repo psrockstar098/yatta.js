@@ -125,3 +125,7 @@ db.rebuildSearchIndex(); // every searchable table
   outside the Table paths is only fixed by a rebuild, not by that repair.
 - Search returns full rows, including non-searchable columns — the same as
   `findMany`. Non-searchable means "never matched on", not "hidden".
+- Search is opt-in and lazy: a table with no `.searchable()` column gets no
+  FTS table and no extra work on any write — its write path runs exactly
+  the statements it ran before. Only tables that declare searchable columns
+  pay for index maintenance, and only from the moment they declare it.

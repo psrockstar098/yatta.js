@@ -1353,6 +1353,15 @@ function pageCount(value: number | undefined, fallback: number): number {
 export class Table<T extends Record<string, any> = Record<string, any>, TInsert extends Record<string, any> = Partial<T>> {
   /** Map of column definitions belonging to this table. */
   readonly columns: Map<string, ColumnDefinition> = new Map();
+  /**
+   * Searchable column names for this table, fixed at construction.
+   *
+   * Cached here, not re-derived per write, so a table with no searchable
+   * columns takes its old write path with one length check and nothing
+   * else: no schema scan, no SQL, no FTS table. Search is opt-in by
+   * declaration, and undeclared tables pay nothing for it.
+   */
+  private readonly ftsColumns: string[] = [];
   /** The primary key column name for this table (defaults to `"id"`). */
   readonly primaryKeyColumn: string = "id";
   /** Inferred relational foreign key aliases (e.g. `userId` -> `user`). */
@@ -1373,6 +1382,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     if (schema) {
       for (const [colName, builder] of Object.entries(schema)) {
         this.columns.set(colName, builder.def);
+        if (builder.def.isSearchable) this.ftsColumns.push(colName);
         if (builder.def.primaryKey) this.primaryKeyColumn = colName;
         if (builder.def.references) {
           const alias = deriveAlias(colName);
@@ -1625,7 +1635,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * ```
    */
   search(query: string, options: SearchOptions<T> = {}): SearchHit<T>[] {
-    const searchable = this.db.searchableColumns(this.name);
+    const searchable = this.ftsColumns;
     if (searchable.length === 0) {
       throw new YattaError(
         `Table "${this.name}" has no searchable columns. ` +
@@ -1743,13 +1753,13 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
   /** Writes one row into the FTS index, or does nothing when the table is not searchable. */
   private syncFtsRow(row: T | null | undefined): void {
     if (!row) return;
-    if (this.db.searchableColumns(this.name).length === 0) return;
+    if (this.ftsColumns.length === 0) return;
     this.db.ftsUpsert(this.name, (row as any)[this.primaryKeyColumn], row as any);
   }
 
   /** Removes one primary key from the FTS index, or does nothing when the table is not searchable. */
   private syncFtsDelete(pk: string | number): void {
-    if (this.db.searchableColumns(this.name).length === 0) return;
+    if (this.ftsColumns.length === 0) return;
     this.db.ftsDelete(this.name, pk);
   }
 
@@ -1820,7 +1830,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     // the affected keys are captured before the write: afterwards the old
     // filter may no longer match the updated rows, and their keys would be
     // unrecoverable. Keys only, not full rows.
-    const searchable = this.db.searchableColumns(this.name).length > 0;
+    const searchable = this.ftsColumns.length > 0;
     const affectedPks = searchable ? this.ftsPkValuesForWhere(options.where) : [];
 
     const sql = `UPDATE "${this.name.replace(/"/g, '""')}" SET ${setSql}${clause ? ` WHERE ${clause}` : ""};`;
@@ -1947,7 +1957,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     // one statement, same parameters, so a row deleted here cannot leave a
     // searchable ghost behind. Keys are cast to text because the index
     // stores every primary key as text.
-    if (this.db.searchableColumns(this.name).length > 0 && this.db.ftsTableExists(this.name)) {
+    if (this.ftsColumns.length > 0 && this.db.ftsTableExists(this.name)) {
       const fts = this.db.ftsTableName(this.name);
       const qfts = `"${fts.replace(/"/g, '""')}"`;
       const pkCol = `"${this.primaryKeyColumn.replace(/"/g, '""')}"`;

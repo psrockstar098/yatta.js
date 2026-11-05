@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "bun:test";
-import { createDatabase, col, YattaError, type TypedDatabase } from "../types/db";
+import { createDatabase, col, YattaError, YattaDB, type TypedDatabase } from "../types/db";
 
 const schema = {
   products: {
@@ -322,6 +322,54 @@ describe("FTS search", () => {
     });
     dbs.push(db as unknown as TypedDatabase<Schema>);
     expect(() => (db as any).tags.search("hello")).toThrow(YattaError);
+  });
+
+  it("performs zero FTS work on writes to a table with no searchable columns", () => {
+    const db = fresh();
+    // Count every statement the engine runs that touches an FTS table, by
+    // watching YattaDB.run. The counter starts after open, so schema sync
+    // is excluded and only the write path itself is measured.
+    const originalRun = YattaDB.prototype.run;
+    let ftsStatements = 0;
+    (YattaDB.prototype as any).run = function (sql: string, params: any[] = [], mode: any) {
+      if (sql.includes("_fts")) ftsStatements++;
+      return originalRun.call(this, sql, params, mode);
+    };
+    try {
+      const row = db.plain.insert({ name: "plain row" });
+      db.plain.updateById(row.id, { name: "plain row v2" });
+      db.plain.update({ where: { id: row.id }, data: { name: "plain row v3" } });
+      db.plain.deleteById(row.id);
+      expect(ftsStatements).toBe(0);
+      // And no FTS table was ever created for the unconfigured table.
+      const tables = db.rawAll<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '_fts_plain%';`,
+      );
+      expect(tables).toEqual([]);
+    } finally {
+      (YattaDB.prototype as any).run = originalRun;
+    }
+
+    // Control: the same writes on a searchable table do touch the index,
+    // so the counter above is measuring something real, not nothing.
+    const originalRun2 = YattaDB.prototype.run;
+    let ftsStatements2 = 0;
+    (YattaDB.prototype as any).run = function (sql: string, params: any[] = [], mode: any) {
+      if (sql.includes("_fts")) ftsStatements2++;
+      return originalRun2.call(this, sql, params, mode);
+    };
+    try {
+      const row = db.products.insert({
+        title: "Counted widget",
+        description: "counted",
+        secret: "x",
+        price: 1,
+      });
+      db.products.deleteById(row.id);
+      expect(ftsStatements2).toBeGreaterThan(0);
+    } finally {
+      (YattaDB.prototype as any).run = originalRun2;
+    }
   });
 
   it("does not let a search term match the primary key text", () => {
