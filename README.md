@@ -97,13 +97,13 @@ Bun's `smol` heap. Queued tasks are micro-batched — up to 32 per IPC message
 <!-- BENCHMARKS:START -->
 | Framework | Requests/sec | vs Yatta | Spread | p50 | p95 | p99 |
 |-----------|-------------:|---------:|-------:|----:|----:|----:|
-| Yatta     |      70,559 |     1.00x |    21% | 1.57ms | 2.95ms | 5.17ms |
-| Raw Bun   |      59,884 |     0.85x |     9% | 1.45ms | 3.20ms | 3.46ms |
-| Hono      |      69,326 |     0.98x |    18% | 1.47ms | 3.10ms | 3.23ms |
-| Elysia    |      56,731 |     0.80x |    27% | 1.57ms | 3.21ms | 3.34ms |
-| Express   |      36,410 |     0.52x |     6% | 2.69ms | 4.44ms | 6.12ms |
-| Fastify   |      47,122 |     0.67x |    15% | 2.30ms | 5.02ms | 7.01ms |
-| Koa       |      41,661 |     0.59x |    19% | 2.68ms | 5.45ms | 8.14ms |
+| Yatta     |      94,215 |     1.00x |    10% | 0.91ms | 1.66ms | 2.10ms |
+| Raw Bun   |     120,440 |     1.28x |    19% | 0.94ms | 1.89ms | 2.05ms |
+| Hono      |     102,963 |     1.09x |    19% | 1.06ms | 2.13ms | 2.89ms |
+| Elysia    |     112,927 |     1.20x |     3% | 0.99ms | 1.28ms | 1.71ms |
+| Express   |      43,454 |     0.46x |     3% | 2.25ms | 4.36ms | 7.15ms |
+| Fastify   |      56,595 |     0.60x |    10% | 1.66ms | 3.08ms | 3.98ms |
+| Koa       |      47,301 |     0.50x |     7% | 1.98ms | 4.02ms | 5.73ms |
 <!-- BENCHMARKS:END -->
 
 `GET /json` head-to-head, 20,000 requests at 100 concurrent connections.
