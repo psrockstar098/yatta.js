@@ -187,6 +187,19 @@ by age freely.
 - A duplicate `event_id` or `dedupe_key` is rejected at record time.
   That is the write-time dedupe working, not a bug: the caller is
   recording an event that already exists.
+- Durability scope, verified against Bun's current SQLite docs
+  (bun.sh/docs/api/sqlite, checked 2026-11-05): a committed
+  transaction survives a process crash, and the transaction rules the
+  outbox relies on hold — the wrapped function must be synchronous,
+  the driver commits when it returns, rolls back when it throws, and
+  nested transactions become savepoints. One limit carries over from
+  the existing database layer: it runs WAL with
+  `PRAGMA synchronous = NORMAL`, and Bun's docs state that under
+  NORMAL a power loss can lose the last commits (without corrupting
+  the database). So "committed" here means durable across a process
+  crash, not proven against power loss. If a deployment needs
+  power-loss durability, that is a change to the database layer's
+  synchronous setting, not to the outbox.
 - `payload` must survive `JSON.stringify`. Functions, `undefined`,
   symbols, and circular objects are rejected at record time, not at
   publish time, so a bad payload fails the user's transaction
