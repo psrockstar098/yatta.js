@@ -587,7 +587,7 @@ describe("raft — auth, signatures, and config", () => {
       prevLogSeq: 0,
       prevLogTerm: 0,
       entries: [
-        { seq: 1, term: 1, eventId: "evt-1", eventType: "user.registered", payload: { n: 1 }, occurredAt: 1, createdAt: 1 },
+        { seq: 1, term: 1, eventId: "evt-1", eventType: "user.registered", payload: { n: 1 }, occurredAt: 1, createdAt: 1, status: "pending", attempts: 0, nextAttemptAt: 1, publishedAt: null, lastError: null },
       ],
       leaderCommit: 0,
     };
@@ -653,8 +653,8 @@ describe("raft — auth, signatures, and config", () => {
 
   it("env config is fail-closed: unset is off, enabled without secret or quorum throws", () => {
     expect(raftConfigFromEnv({})).toBeNull();
-    expect(raftConfigFromEnv({ YATTA_RAFT_ENABLED: "true", YATTA_RAFT_NODE_ID: "a" })).toThrow(RaftError);
-    expect(raftConfigFromEnv({
+    expect(() => raftConfigFromEnv({ YATTA_RAFT_ENABLED: "true", YATTA_RAFT_NODE_ID: "a" })).toThrow(RaftError);
+    expect(() => raftConfigFromEnv({
       YATTA_RAFT_ENABLED: "true",
       YATTA_RAFT_NODE_ID: "a",
       YATTA_RAFT_SECRET: SECRET,
