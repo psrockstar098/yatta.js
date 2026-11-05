@@ -289,9 +289,14 @@ export class VectorStore {
   }
 
   /**
-   * The backend this store is actually using, or `"undecided"` before the
-   * first vector call. Reading it does not trigger a load: laziness is
-   * observable, not just promised.
+   * The backend this process resolved for new collections, or
+   * `"undecided"` before anything needed a resolution. Reading it does
+   * not trigger a load: laziness is observable, not just promised.
+   * Note that reads and writes to an existing plain-SQLite collection
+   * deliberately do not resolve anything — they are served by SQL
+   * whether or not vec0 is installed — so the store can stay undecided
+   * after real SQL-backed use. Creating a collection, or touching a
+   * vec-backed one, is what resolves it.
    */
   get backend(): VectorBackend | "undecided" {
     if (this.resolvedBackend !== null && this.resolvedFor === this.db.sqlite) {
