@@ -75,6 +75,7 @@ import { Database, type Statement } from "bun:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { ensureOutboxTable, recordOutbox as recordOutboxRow, type OutboxEntry, type RecordOutboxInput } from "./outbox";
 
 // ──────────────────────────────────────────────────────────────────────────
 // 0. Global Schema Registry & Utility Types
@@ -2388,6 +2389,26 @@ export class YattaDB {
     })();
 
     return result;
+  }
+
+  /**
+   * Records one outbox entry in this database file, in the caller's
+   * transaction when called inside `transaction()`. That is the point:
+   * the user write and its log entry commit or roll back together, in
+   * the same file, so a crash between them cannot drop the event.
+   * See `src/types/outbox.ts` and docs/roadmap-14/shared-change-log.md.
+   *
+   * @example
+   * ```ts
+   * db.transaction((tx) => {
+   *   tx.users.insert({ email: "ada@example.com", name: "Ada" });
+   *   tx.recordOutbox({ eventType: "user.registered", payload: { email: "ada@example.com" } });
+   * });
+   * ```
+   */
+  recordOutbox(input: RecordOutboxInput): OutboxEntry {
+    ensureOutboxTable(this);
+    return recordOutboxRow(this, input);
   }
 
   // ── Raw SQL Suite ────────────────────────────────────────────────────────
