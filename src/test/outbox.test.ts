@@ -118,6 +118,45 @@ describe("outbox — same-transaction atomicity", () => {
   });
 });
 
+describe("outbox — opt-in and lazy: zero cost when unconfigured", () => {
+  it("plain writes create no outbox table and do no log work", () => {
+    const db = memDb();
+    // Creating the database alone creates nothing for the outbox.
+    expect(
+      db.rawAll("SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_yatta_outbox';"),
+    ).toHaveLength(0);
+    db.transaction((tx) => {
+      tx.users.insert({ email: "ada@example.com", name: "Ada" });
+      tx.users.insert({ email: "grace@example.com", name: "Grace" });
+    });
+    db.users.insert({ email: "linus@example.com", name: "Linus" });
+    expect(db.users.count()).toBe(3);
+    // Still nothing: no table, no row, no extra statement on the write path.
+    expect(
+      db.rawAll("SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_yatta_outbox';"),
+    ).toHaveLength(0);
+    // The first recordOutbox call is what creates the table — and only then.
+    db.recordOutbox({ eventType: "user.registered", payload: {} });
+    expect(
+      db.rawAll("SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_yatta_outbox';"),
+    ).toHaveLength(1);
+  });
+
+  it("constructing a relay is what starts relay work; nothing runs before that", async () => {
+    const db = memDb();
+    db.users.insert({ email: "ada@example.com", name: "Ada" });
+    // No relay exists yet, so nothing has been published or marked, and
+    // the outbox table does not even exist until something opts in.
+    expect(
+      db.rawAll("SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_yatta_outbox';"),
+    ).toHaveLength(0);
+    await sleep(30);
+    expect(
+      db.rawAll("SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_yatta_outbox';"),
+    ).toHaveLength(0);
+  });
+});
+
 describe("outbox — relay publish and mark-done-after-ack", () => {
   it("publishes in seq order and marks rows published only after ack", async () => {
     const db = memDb();

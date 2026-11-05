@@ -75,7 +75,7 @@ import { Database, type Statement } from "bun:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { ensureOutboxTable, recordOutbox as recordOutboxRow, type OutboxEntry, type RecordOutboxInput } from "./outbox";
+import type { OutboxEntry, RecordOutboxInput } from "./outbox";
 
 // ──────────────────────────────────────────────────────────────────────────
 // 0. Global Schema Registry & Utility Types
@@ -2407,6 +2407,12 @@ export class YattaDB {
    * ```
    */
   recordOutbox(input: RecordOutboxInput): OutboxEntry {
+    // Lazy on purpose: the outbox module is loaded only on the first
+    // recordOutbox() call, never when this database module loads. An app
+    // that never records an outbox entry pays nothing for the feature:
+    // no module load, no table, no extra statement on any write. The
+    // same file already uses bare require() for lazy loading elsewhere.
+    const { ensureOutboxTable, recordOutbox: recordOutboxRow } = require("./outbox");
     ensureOutboxTable(this);
     return recordOutboxRow(this, input);
   }

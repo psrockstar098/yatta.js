@@ -26,6 +26,18 @@ If the transaction rolls back, the user row and the outbox entry both
 disappear. If it commits, both are durable. There is no window where
 one exists without the other.
 
+## Opt-in and lazy — zero cost when unconfigured
+
+The outbox is fully opt-in. Plain writes do nothing extra: no outbox
+table is created, no log row is written, and the outbox module is not
+even loaded until the first `recordOutbox()` call. Nothing starts a
+relay unless the app constructs one. When replication, replay, and the
+outbox are all unconfigured, the write path is exactly the write path
+that existed before this feature — no fast path with a flag check, no
+work at all. Everything runs on SQLite itself through Bun's own
+`bun:sqlite` primitives; there is no sidecar process and no new native
+dependency.
+
 ## Relay — publish, then mark done
 
 ```ts
