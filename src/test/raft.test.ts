@@ -340,6 +340,31 @@ describe("raft — log consistency and leader completeness", () => {
     expect(c.logs.get("follower")!.snapshot().map((e) => e.eventId)).toEqual(["evt-1-1", "evt-2-1", "evt-3-1"]);
   });
 
+  it("a refused AppendEntries message mutates nothing (pre-validation regression)", () => {
+    const c = cluster(["leader", "follower"], {
+      logs: {
+        leader: [entry(1, 1), entry(2, 1), entry(3, 1)],
+        follower: [entry(1, 1), entry(2, 1, "evt-conflict"), entry(3, 1, "evt-keep")],
+      },
+    });
+    const follower = c.node("follower");
+    // Conflicting seq 2 (would truncate) followed by a gap at seq 4:
+    // the whole message is refused and the follower's log is untouched.
+    const res = follower.handleAppendEntries({
+      term: 1,
+      leaderId: "leader",
+      prevLogSeq: 1,
+      prevLogTerm: 1,
+      entries: [
+        { seq: 2, term: 1, eventId: "evt-2-1", eventType: "user.registered", payload: { n: 2 }, occurredAt: 1002, createdAt: 1002 },
+        { seq: 4, term: 1, eventId: "evt-4-1", eventType: "user.registered", payload: { n: 4 }, occurredAt: 1004, createdAt: 1004 },
+      ],
+      leaderCommit: 0,
+    });
+    expect(res.success).toBe(false);
+    expect(c.logs.get("follower")!.snapshot().map((e) => e.eventId)).toEqual(["evt-1-1", "evt-conflict", "evt-keep"]);
+  });
+
   it("a follower never truncates at or below its commit index, even for a higher-term leader", () => {
     const c = cluster(["leader", "follower"], {
       logs: {

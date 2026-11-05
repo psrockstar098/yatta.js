@@ -991,32 +991,44 @@ export class RaftNode {
         return { term: this.currentTerm, success: false, matchSeq: this.log.lastSeq() };
       }
     }
-    // Apply entries in order. A conflicting entry (same seq, different
-    // event) truncates the suffix from that seq — unless that seq is
-    // already committed, in which case the whole message is refused
-    // and nothing is applied, so a half-applied prefix cannot hide a
-    // committed-history rewrite.
-    let expectedSeq = req.prevLogSeq + 1;
-    for (const entry of req.entries) {
-      if (entry.seq !== expectedSeq) {
+    // Pre-validate the whole message BEFORE mutating anything, so a
+    // message that fails late (a gap, or a conflict at/below the
+    // commit index) cannot leave a half-truncated log behind. An
+    // earlier version truncated during the scan and could return
+    // failure after already dropping a suffix; the follower would
+    // still converge on retry, but a refused message must not mutate.
+    for (let i = 0; i < req.entries.length; i += 1) {
+      const e = req.entries[i]!;
+      if (e.seq !== req.prevLogSeq + 1 + i) {
         return { term: this.currentTerm, success: false, matchSeq: this.log.lastSeq() };
       }
-      const existing = this.log.entryAt(entry.seq);
-      if (existing) {
-        if (existing.eventId === entry.eventId && existing.term === entry.term) {
-          expectedSeq += 1;
-          continue; // Idempotent re-delivery: skip, never duplicate.
-        }
-        if (entry.seq <= this.log.commitIndex()) {
-          return { term: this.currentTerm, success: false, matchSeq: this.log.lastSeq() };
-        }
-        try {
-          this.log.truncateFrom(entry.seq);
-        } catch {
+      const existing = this.log.entryAt(e.seq);
+      if (existing && (existing.eventId !== e.eventId || existing.term !== e.term)) {
+        if (e.seq <= this.log.commitIndex()) {
           return { term: this.currentTerm, success: false, matchSeq: this.log.lastSeq() };
         }
       }
-      expectedSeq += 1;
+    }
+    // Apply entries in order. A conflicting entry (same seq, different
+    // event) truncates the suffix from that seq — the pre-scan above
+    // already proved every conflict sits above the commit index, so
+    // no truncation here can touch committed history.
+    let firstConflict: number | null = null;
+    for (const e of req.entries) {
+      const existing = this.log.entryAt(e.seq);
+      if (existing) {
+        if (existing.eventId === e.eventId && existing.term === e.term) {
+          continue; // Idempotent re-delivery: skip, never duplicate.
+        }
+        if (firstConflict === null) firstConflict = e.seq;
+      }
+    }
+    if (firstConflict !== null) {
+      try {
+        this.log.truncateFrom(firstConflict);
+      } catch {
+        return { term: this.currentTerm, success: false, matchSeq: this.log.lastSeq() };
+      }
     }
     const toAppend = req.entries.filter((e) => this.log.entryAt(e.seq) === null);
     if (toAppend.length > 0) {
