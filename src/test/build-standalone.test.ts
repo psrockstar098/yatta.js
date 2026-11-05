@@ -10,12 +10,13 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { isDataOrSecretPath, runBuild } from "../build_standalone";
+import { entryNeedsPolyfill, isDataOrSecretPath, isInsideDir, runBuild } from "../build_standalone";
 import { main } from "../cli";
 
 /*
@@ -386,6 +387,86 @@ describe("isDataOrSecretPath", () => {
     for (const path of ["server.ts", "public/hello.txt", "extra/extra.txt", "src/main.ts"]) {
       expect(isDataOrSecretPath(path)).toBeNull();
     }
+  });
+});
+
+describe("entryNeedsPolyfill", () => {
+  it("already detects static and dynamic framework imports", () => {
+    expect(entryNeedsPolyfill(`import { createAPI } from "yatta.js/api";`)).toBe(true);
+    expect(entryNeedsPolyfill(`const a = await import("yatta.js/auth");`)).toBe(true);
+    expect(entryNeedsPolyfill(`export * from "yatta.js/api";`)).toBe(true);
+  });
+
+  it("detects require() of the framework", () => {
+    expect(entryNeedsPolyfill(`const { createAPI } = require("yatta.js/api");`)).toBe(true);
+    expect(entryNeedsPolyfill(`const auth = require("yatta.js/auth");`)).toBe(true);
+  });
+
+  it("detects a variable dynamic import bound to the framework", () => {
+    const src = `const pkg = "yatta.js/api";\nconst a = await import(pkg);\n`;
+    expect(entryNeedsPolyfill(src)).toBe(true);
+    const req = `const pkg = "yatta.js/api";\nconst a = require(pkg);\n`;
+    expect(entryNeedsPolyfill(req)).toBe(true);
+  });
+
+  it("follows relative imports transitively, including framework source", () => {
+    // Entry -> local helper -> framework.
+    const proj = mkdtempSync(join(tmpdir(), "yatta-build-polyfill-helper-"));
+    try {
+      writeFileSync(join(proj, "server.ts"), `import { setup } from "./helper";\nsetup();\n`);
+      writeFileSync(join(proj, "helper.ts"), `import { createAPI } from "yatta.js/auth";\nexport const setup = () => createAPI;\n`);
+      expect(entryNeedsPolyfill(readFileSync(join(proj, "server.ts"), "utf8"), proj)).toBe(true);
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+    }
+    // Entry -> relative import of framework source -> framework.
+    // (A monorepo checkout imports the framework by relative path.)
+    const mono = mkdtempSync(join(tmpdir(), "yatta-build-polyfill-mono-"));
+    try {
+      mkdirSync(join(mono, "app"), { recursive: true });
+      mkdirSync(join(mono, "fw", "src"), { recursive: true });
+      writeFileSync(join(mono, "app", "server.ts"), `import { createAPI } from "../fw/src/api";\ncreateAPI;\n`);
+      writeFileSync(join(mono, "fw", "src", "api.ts"), `import { createAPI } from "yatta.js/api";\nexport { createAPI };\n`);
+      expect(
+        entryNeedsPolyfill(readFileSync(join(mono, "app", "server.ts"), "utf8"), join(mono, "app")),
+      ).toBe(true);
+    } finally {
+      rmSync(mono, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores non-framework imports and terminates on cycles", () => {
+    expect(entryNeedsPolyfill(`import { join } from "node:path";\nconsole.log(join);\n`)).toBe(false);
+    expect(entryNeedsPolyfill(`const pkg = "node:path";\nconst a = await import(pkg);\n`)).toBe(false);
+    // A helper that imports the entry back: the scan must terminate
+    // and still answer false when no framework import exists anywhere.
+    const proj = mkdtempSync(join(tmpdir(), "yatta-build-polyfill-cycle-"));
+    try {
+      writeFileSync(join(proj, "server.ts"), `import { helper } from "./helper";\nhelper();\n`);
+      writeFileSync(join(proj, "helper.ts"), `import "./server";\nexport const helper = () => 1;\n`);
+      expect(entryNeedsPolyfill(readFileSync(join(proj, "server.ts"), "utf8"), proj)).toBe(false);
+      // And the same cycle with a framework import one hop in.
+      writeFileSync(join(proj, "helper.ts"), `import "./server";\nimport "yatta.js/api";\nexport const helper = () => 1;\n`);
+      expect(entryNeedsPolyfill(readFileSync(join(proj, "server.ts"), "utf8"), proj)).toBe(true);
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("isInsideDir", () => {
+  it("treats the filesystem root as containing everything", () => {
+    expect(isInsideDir("/", "/")).toBe(true);
+    expect(isInsideDir("/", "/etc/passwd")).toBe(true);
+    expect(isInsideDir("/", "/tmp")).toBe(true);
+  });
+
+  it("keeps the existing inside/outside behavior", () => {
+    expect(isInsideDir("/tmp", "/tmp/foo")).toBe(true);
+    expect(isInsideDir("/tmp", "/tmp")).toBe(true);
+    expect(isInsideDir("/tmp", "/etc/passwd")).toBe(false);
+    expect(isInsideDir("/a/b", "/a/b/c/d")).toBe(true);
+    expect(isInsideDir("/a/b", "/a/bc")).toBe(false);
   });
 });
 
@@ -965,4 +1046,35 @@ describe("standalone reflect-metadata shim and entry-inside-package", () => {
       rmSync(outside, { recursive: true, force: true });
     }
   });
+});
+
+describe("stale shim cleanup", () => {
+  it("a later build removes a stale shim but keeps a fresh one", () => {
+    const proj = mkdtempSync(join(tmpdir(), "yatta-build-stale-shim-"));
+    try {
+      writeFileSync(join(proj, "server.ts"), ENTRY);
+      // A shim left by a build killed mid-compile (see the hack test's
+      // q3-killed repro): same name shape, mtime one hour ago.
+      const stale = join(proj, ".yatta-standalone-entry-abcdef01.ts");
+      writeFileSync(stale, "// leftover from a killed build\n");
+      const hourAgo = new Date(Date.now() - 3_600_000);
+      utimesSync(stale, hourAgo, hourAgo);
+      // A shim from a build that is still running in the same project
+      // (the concurrent-build case): current mtime, must survive.
+      const fresh = join(proj, ".yatta-standalone-entry-abcdef02.ts");
+      writeFileSync(fresh, "// a concurrent build's live shim\n");
+      const outcome = runBuild(proj, ["--standalone", "--entry", "server.ts"]);
+      expect(outcome.code).toBe(0);
+      expect(existsSync(stale)).toBe(false);
+      expect(existsSync(fresh)).toBe(true);
+      expect(existsSync(join(proj, "dist", "app"))).toBe(true);
+      // The build's own shim is gone too: only the fresh planted one
+      // remains, which the next build's sweep will age out.
+      expect(readdirSync(proj).filter((f) => f.startsWith(".yatta-standalone-entry"))).toEqual([
+        ".yatta-standalone-entry-abcdef02.ts",
+      ]);
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+    }
+  }, 180_000);
 });

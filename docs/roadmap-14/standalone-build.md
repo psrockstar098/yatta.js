@@ -279,7 +279,8 @@ data file hiding inside an otherwise innocent asset directory.
   minimal repro) and the binary fails at runtime with "Cannot find
   package 'otplib'", then "'@simplewebauthn/server'". The build
   refuses such an entry instead of shipping that binary — move the
-  entry inside the project and rebuild.
+  entry inside the project and rebuild. The inside check also
+  handles a project rooted at `/`.
 - The build imports `reflect-metadata` first. A binary without it
   crashes at startup with "tsyringe requires a reflect polyfill"
   (thrown from tsyringe's lazy init, reached through
@@ -293,6 +294,32 @@ data file hiding inside an otherwise innocent asset directory.
   imports `reflect-metadata` first, then the real entrypoint, and
   deletes the generated file after the build. If your entry already
   imports it, the duplicate is harmless.
+- Trust assumption on that import: the bare `reflect-metadata`
+  specifier resolves from the project's own `node_modules` first,
+  matching `bun run` — that is trusted code, and a compromised
+  project dependency would execute at this import exactly as it
+  would at runtime. The shim imports the polyfill even for apps
+  that never touch tsyringe, because the entry may reach the
+  framework only through a dynamic import the build cannot see
+  statically.
+- If the polyfill resolves nowhere, the build scans the entry for
+  framework imports before deciding: static and dynamic imports,
+  `require()` calls, dynamic imports through a `const NAME = "..."`
+  binding, and relative imports followed transitively (up to four
+  hops, cycles guarded). An app that reaches the framework any of
+  those ways is refused instead of shipping a binary that crashes
+  at startup; a plain app builds as before. A specifier built at
+  runtime (a template literal, a computed string) is still missed
+  — the scan is a tripwire, not a proof — but that branch is
+  nearly unreachable on a normal machine, since the framework's
+  install always carries the polyfill.
+- A build killed mid-compile leaves its generated entry behind.
+  The next build removes generated entries older than ten minutes
+  — a live concurrent build's entry is seconds old and is never
+  touched — and the generated file is created exclusively, so two
+  concurrent builds can never claim the same name. A leftover is
+  inert (nothing imports it) and its name is distinctive, so it is
+  easy to spot and delete by hand.
 - Worker entrypoints are not auto-detected. Bun compiles the
   entrypoints it is given; a worker spawned from a URL string at
   runtime is not an import, so it is not bundled. A single-entrypoint

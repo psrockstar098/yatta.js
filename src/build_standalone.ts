@@ -74,7 +74,9 @@
 //   runs before the polyfill code, so it is in the bundle but too
 //   late. The build therefore compiles a generated shim entry inside
 //   the project that imports reflect-metadata first, then the real
-//   entrypoint, and deletes the shim after the build.
+//   entrypoint, and deletes the shim after the build. The bare
+//   specifier resolves from the project's node_modules first: trusted
+//   code, the same boundary as `bun run`.
 
 import { randomUUID } from "node:crypto";
 import {
@@ -91,7 +93,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 
 export interface BuildOutcome {
   code: number;
@@ -556,7 +558,7 @@ function resolveEntry(cwd: string, explicit: string | null): string | null {
  * defeat the check, and a path that only looks inside (`..` that
  * stays put) must pass.
  */
-function isInsideDir(dir: string, file: string): boolean {
+export function isInsideDir(dir: string, file: string): boolean {
   let root: string;
   try {
     root = realpathSync(dir);
@@ -569,7 +571,11 @@ function isInsideDir(dir: string, file: string): boolean {
   } catch {
     abs = resolve(file);
   }
-  return abs === root || abs.startsWith(root + sep);
+  // The root itself already ends in the separator ("/" on POSIX,
+  // "C:\" on Windows), so appending another one would require "//"
+  // and nothing would ever pass.
+  const prefix = root.endsWith(sep) ? root : root + sep;
+  return abs === root || abs.startsWith(prefix);
 }
 
 /**
@@ -689,6 +695,45 @@ function guardOutPath(
 const SHIM_PREFIX = ".yatta-standalone-entry-";
 
 /**
+ * A shim is stale when it is older than this: a build takes seconds,
+ * so a shim older than ten minutes cannot belong to a build that is
+ * still running. The age bar is what makes the sweep safe for
+ * concurrent builds in the same project — a live build's shim is
+ * seconds old and is never touched.
+ */
+const STALE_SHIM_MAX_AGE_MS = 10 * 60 * 1000;
+
+/** The exact name shape this tool generates: prefix + 8 hex + ".ts". */
+const STALE_SHIM_RE = /^\.yatta-standalone-entry-[0-9a-f]{8}\.ts$/;
+
+/**
+ * Best-effort removal of shims left by builds that were killed
+ * mid-compile. Only files with the exact generated name and older
+ * than STALE_SHIM_MAX_AGE_MS are removed, so a concurrent build's
+ * live shim (seconds old) is never touched, and nothing the user
+ * wrote is ever matched. Failures are swallowed: a leftover shim is
+ * inert, and the build must not fail for a cleanup it could not do.
+ */
+function sweepStaleShims(cwd: string): void {
+  let names: string[];
+  try {
+    names = readdirSync(cwd);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - STALE_SHIM_MAX_AGE_MS;
+  for (const name of names) {
+    if (!STALE_SHIM_RE.test(name)) continue;
+    const path = join(cwd, name);
+    try {
+      if (statSync(path).mtimeMs < cutoff) rmSync(path, { force: true });
+    } catch {
+      // Best effort only.
+    }
+  }
+}
+
+/**
  * Where `reflect-metadata` resolves from, for the generated entry.
  * Returns the import specifier for the shim — the bare name when the
  * package resolves from inside the project, the absolute file
@@ -730,32 +775,118 @@ function resolveReflectMetadata(cwd: string): string | null {
   return null;
 }
 
+/** Specifiers that need the polyfill: the framework and its passkey stack. */
+function isFrameworkSpecifier(spec: string): boolean {
+  return (
+    spec === "yatta.js" ||
+    spec.startsWith("yatta.js/") ||
+    spec === "@simplewebauthn/server" ||
+    spec.startsWith("@simplewebauthn/server/") ||
+    spec === "tsyringe" ||
+    spec.startsWith("tsyringe/") ||
+    spec.includes("simplewebauthn") ||
+    spec.includes("types/auth") ||
+    spec.includes("func/auth")
+  );
+}
+
+/** How deep the transitive scan follows relative imports (entry + 4 hops). */
+const MAX_POLYFILL_SCAN_DEPTH = 4;
+
 /**
  * Whether the entry source imports the framework (or its passkey
  * stack) — the only callers that need the polyfill. A heuristic,
  * used only when reflect-metadata resolves nowhere: it decides
  * between refusing the build and building without the shim, and a
  * false positive there fails closed with a clear message.
+ *
+ * Beyond static and dynamic imports it also matches `require()`
+ * calls, dynamic imports through a `const NAME = "..."` binding in
+ * the same file, and relative imports followed transitively — an
+ * entry that only reaches the framework through a local helper
+ * still needs the polyfill, and so does one that imports framework
+ * source by relative path (a monorepo checkout). Only real files
+ * are followed, never node_modules, and a missing or unreadable
+ * file simply ends that branch; a visited set keeps cycles from
+ * looping. Anything subtler (a specifier built at runtime, a
+ * template literal) is still missed — the heuristic is a tripwire,
+ * not a proof, and the null branch it guards is nearly unreachable
+ * on a normal machine.
  */
-function entryNeedsPolyfill(source: string): boolean {
-  const re = /(?:from\s+|import\s+|import\(\s*)["']([^"']+)["']/g;
+export function entryNeedsPolyfill(source: string, entryDir?: string): boolean {
+  return scanForFramework(source, entryDir, 0, new Set<string>());
+}
+
+function scanForFramework(
+  source: string,
+  entryDir: string | undefined,
+  depth: number,
+  visited: Set<string>,
+): boolean {
+  // `const NAME = "literal"` bindings, so `import(NAME)` and
+  // `require(NAME)` can be resolved to the string they hold.
+  const bindings = new Map<string, string>();
+  for (const match of source.matchAll(
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*["']([^"']+)["']/g,
+  )) {
+    bindings.set(match[1]!, match[2]!);
+  }
+  const re =
+    /(?:from\s+|import\s+|import\(\s*|require\(\s*)(?:"([^"']+)"|'([^"']+)'|([A-Za-z_$][\w$]*))/g;
   for (const match of source.matchAll(re)) {
-    const spec = match[1]!;
-    if (
-      spec === "yatta.js" ||
-      spec.startsWith("yatta.js/") ||
-      spec === "@simplewebauthn/server" ||
-      spec.startsWith("@simplewebauthn/server/") ||
-      spec === "tsyringe" ||
-      spec.startsWith("tsyringe/") ||
-      spec.includes("simplewebauthn") ||
-      spec.includes("types/auth") ||
-      spec.includes("func/auth")
-    ) {
-      return true;
+    let spec: string | null = match[1] ?? match[2] ?? null;
+    if (spec === null && match[3] !== undefined) {
+      spec = bindings.get(match[3]) ?? null;
+    }
+    if (spec === null) continue;
+    if (isFrameworkSpecifier(spec)) return true;
+    if (entryDir !== undefined && spec.startsWith(".") && depth < MAX_POLYFILL_SCAN_DEPTH) {
+      const resolved = resolveRelativeImport(entryDir, spec);
+      if (resolved !== null && !visited.has(resolved)) {
+        visited.add(resolved);
+        let next = "";
+        try {
+          next = readFileSync(resolved, "utf8");
+        } catch {
+          next = "";
+        }
+        if (next !== "" && scanForFramework(next, dirname(resolved), depth + 1, visited)) {
+          return true;
+        }
+      }
     }
   }
   return false;
+}
+
+/**
+ * Resolve a relative import to a real file, trying the usual
+ * extensions and index files. Never follows into node_modules: a
+ * relative import that lands there is not the app's own code, and
+ * the scan has no business reading dependency sources.
+ */
+function resolveRelativeImport(fromDir: string, spec: string): string | null {
+  const base = resolve(fromDir, spec);
+  if (base.split(sep).includes("node_modules")) return null;
+  const candidates = [
+    base,
+    `${base}.ts`,
+    `${base}.js`,
+    `${base}.mts`,
+    `${base}.cts`,
+    `${base}.tsx`,
+    `${base}.jsx`,
+    join(base, "index.ts"),
+    join(base, "index.js"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {
+      // Not this one; try the next candidate.
+    }
+  }
+  return null;
 }
 
 /**
@@ -773,6 +904,14 @@ function shimSource(polyfillSpecifier: string, entrySpecifier: string): string {
     "// framework's auth imports). Under `bun run` the runtime resolves",
     "// it; a compiled binary without this import crashes at startup",
     "// with \"tsyringe requires a reflect polyfill\".",
+    "//",
+    "// Trust assumption: the bare specifier resolves from the project's",
+    "// node_modules first, and that is trusted code — the same boundary",
+    "// as `bun run`. A compromised project dependency executes at this",
+    "// import exactly as it would at runtime, and the shim imports it",
+    "// even for apps that never touch tsyringe, because the entry may",
+    "// reach the framework only through a dynamic import the build",
+    "// cannot see statically.",
     `import ${JSON.stringify(polyfillSpecifier)};`,
     `import ${JSON.stringify(entrySpecifier)};`,
     "",
@@ -1136,6 +1275,12 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
     gateNote = gate.note;
   }
 
+  // A build killed mid-compile leaves its generated entry behind,
+  // and nothing cleaned it up. Sweep stale ones now (see
+  // sweepStaleShims: exact name, older than ten minutes, so a
+  // concurrent build's live shim is never touched).
+  sweepStaleShims(cwd);
+
   // The standalone entry is a generated shim inside the project that
   // imports reflect-metadata first, then the real entrypoint (see the
   // header comment for why the order matters). The shim lives in the
@@ -1149,30 +1294,43 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
   let shimPath: string | null = null;
   const polyfill = resolveReflectMetadata(cwd);
   if (polyfill !== null) {
+    const rel = relative(cwd, entryAbs).split(sep).join("/");
+    const entrySpecifier = rel.startsWith(".") ? rel : `./${rel}`;
+    // The name is picked and the file is created with "wx" in one
+    // step, so two concurrent builds can never claim the same name:
+    // the loser gets EEXIST and picks another. A partial write (a
+    // throw after the file exists) is removed best-effort here,
+    // because this early return never reaches the finally that
+    // deletes the shim on the normal paths.
     let name = "";
-    for (let attempt = 0; attempt < 3; attempt++) {
+    let wrote = false;
+    for (let attempt = 0; attempt < 3 && !wrote; attempt++) {
       name = `${SHIM_PREFIX}${randomUUID().slice(0, 8)}.ts`;
-      if (!existsSync(join(cwd, name))) break;
-      name = "";
+      shimPath = join(cwd, name);
+      try {
+        writeFileSync(shimPath, shimSource(polyfill, entrySpecifier), { flag: "wx" });
+        wrote = true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "EEXIST") continue;
+        try {
+          rmSync(shimPath, { force: true });
+        } catch {
+          // A partial file may remain; its name is distinctive and
+          // the next build's stale sweep removes it once it ages out.
+        }
+        return {
+          code: 1,
+          lines: [
+            "",
+            `yatta build: could not write the generated entry "${name}": ${err instanceof Error ? err.message : String(err)}`,
+          ],
+        };
+      }
     }
-    if (!name) {
+    if (!wrote) {
       return {
         code: 1,
         lines: ["", "yatta build: could not pick a fresh name for the generated entry."],
-      };
-    }
-    const rel = relative(cwd, entryAbs).split(sep).join("/");
-    const entrySpecifier = rel.startsWith(".") ? rel : `./${rel}`;
-    shimPath = join(cwd, name);
-    try {
-      writeFileSync(shimPath, shimSource(polyfill, entrySpecifier));
-    } catch (err) {
-      return {
-        code: 1,
-        lines: [
-          "",
-          `yatta build: could not write the generated entry "${name}": ${err instanceof Error ? err.message : String(err)}`,
-        ],
       };
     }
     buildEntry = name;
@@ -1183,7 +1341,7 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
     } catch {
       source = "";
     }
-    if (entryNeedsPolyfill(source)) {
+    if (entryNeedsPolyfill(source, dirname(entryAbs))) {
       return {
         code: 1,
         lines: [
