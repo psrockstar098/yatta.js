@@ -483,7 +483,8 @@ describe("storage tiering", () => {
     expect(() => tiered.file("tenant-a/../tenant-b/report.txt")).toThrow();
     await expect(tiered.save("../escape.txt", "nope")).rejects.toThrow();
     await expect(tiered.save("tenant-a/../../escape.txt", "nope")).rejects.toThrow();
-    expect(await tiered.exists("../escape.txt")).toBe(false);
+    // An unsafe key is rejected, not answered as "missing" — fail closed.
+    await expect(tiered.exists("../escape.txt")).rejects.toThrow();
   });
 
   it("tiering moves real local-disk files end to end, verified by content hash", async () => {
