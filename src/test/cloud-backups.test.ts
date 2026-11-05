@@ -10,6 +10,7 @@ import {
   loadCloudBackupConfigFromEnv,
   makeSnapshotKey,
   parseBackupKey,
+  parseCloudBackupFileConfig,
   restoreCloudBackup,
   scheduleCloudBackups,
   selectSnapshotsToPrune,
@@ -412,5 +413,96 @@ describe("cloud backups: configuration", () => {
     });
     await runner.run(new Date("2026-11-05T02:00:00.000Z"));
     expect(bucket.objects.has(neighbour)).toBe(true);
+  });
+});
+
+describe("cloud backups: JSON5 configuration file", () => {
+  // Comments and trailing commas are the whole point of JSON5 for a
+  // hand-edited file: an operator annotating retention choices should not
+  // have to fight the format to do it.
+  const fileText = `{
+    // Nightly snapshots to the archive bucket.
+    bucket: "file-bucket",
+    prefix: "nightly",
+    keepCount: 3,
+    keepDays: 14,
+    schedule: "0 3 * * *",
+  }`;
+
+  it("parses comments and trailing commas, and env wins over the file", () => {
+    const config = loadCloudBackupConfigFromEnv(
+      {
+        YATTA_BACKUP_KEY: TEST_KEY_HEX,
+        YATTA_BACKUP_KEEP_COUNT: "9",
+      },
+      { fileText },
+    );
+    expect(config?.bucket).toBe("file-bucket");
+    expect(config?.prefix).toBe("nightly");
+    expect(config?.schedule).toBe("0 3 * * *");
+    expect(config?.keepDays).toBe(14);
+    // The environment override beats the file's keepCount of 3.
+    expect(config?.keepCount).toBe(9);
+  });
+
+  it("a file naming a bucket, without an env key, is half-configured and errors", () => {
+    // Same rule as a bucket in the environment without a key: a file that
+    // names a bucket is intent to have backups, so a missing key is an
+    // error, not a silent skip. Only a file with no bucket at all, and no
+    // env settings, counts as unconfigured.
+    expect(() => loadCloudBackupConfigFromEnv({}, { fileText })).toThrow(/YATTA_BACKUP_KEY/);
+    expect(
+      loadCloudBackupConfigFromEnv(
+        {},
+        { fileText: `{ prefix: "nightly", keepCount: 3 }` },
+      ),
+    ).toBeNull();
+  });
+
+  it("rejects a key or credentials in the file, and rejects unknown fields", () => {
+    expect(() =>
+      parseCloudBackupFileConfig(`{ bucket: "b", key: "deadbeef" }`),
+    ).toThrow(/environment only/);
+    expect(() =>
+      parseCloudBackupFileConfig(`{ bucket: "b", secretAccessKey: "x" }`),
+    ).toThrow(/environment only/);
+    expect(() =>
+      parseCloudBackupFileConfig(`{ bucket: "b", keep_counts: 3 }`),
+    ).toThrow(/Unknown backup config field/);
+    expect(() =>
+      parseCloudBackupFileConfig(`{ bucket: "b", `),
+    ).toThrow(/not valid JSON5/);
+  });
+
+  it("a file database set must keep a required entry", () => {
+    expect(() =>
+      loadCloudBackupConfigFromEnv(
+        { YATTA_BACKUP_KEY: TEST_KEY_HEX },
+        {
+          fileText: `{ bucket: "b", databases: [{ name: "cache.db", path: "/tmp/c.db" }] }`,
+        },
+      ),
+    ).toThrow(/no required file/);
+  });
+
+  it("runs a backup configured from a file", async () => {
+    seedDb(join(dir, "app.db"), ["ada@example.com"]);
+    const bucket = fakeBucket();
+    const config = loadCloudBackupConfigFromEnv(
+      { YATTA_BACKUP_KEY: TEST_KEY_HEX },
+      {
+        fileText: `{
+          bucket: "file-bucket",
+          prefix: "nightly",
+          databases: [
+            { name: "app.db", path: ${JSON.stringify(join(dir, "app.db"))}, required: true },
+          ],
+        }`,
+      },
+    )!;
+    const runner = new CloudBackupRunner({ config, bucket, log: () => {} });
+    const result = await runner.run(new Date("2026-11-05T03:00:00.000Z"));
+    expect(result.key.startsWith("nightly/")).toBe(true);
+    expect(bucket.objects.size).toBe(1);
   });
 });

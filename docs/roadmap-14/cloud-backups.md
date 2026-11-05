@@ -36,11 +36,39 @@ is built, and no backup work runs at startup. The scheduler check reads
 two strings and returns; that is the entire cost of the feature for apps
 that do not use it.
 
+## Configuration file (JSON5)
+
+Non-secret settings can also live in a hand-edited file, pointed to by
+`YATTA_BACKUP_CONFIG_FILE`. The file is JSON5, so comments and trailing
+commas work:
+
+```json5
+{
+  // Nightly snapshots to the archive bucket.
+  bucket: "my-backups",
+  prefix: "nightly",
+  schedule: "0 3 * * *",
+  keepCount: 3,
+  keepDays: 14,
+}
+```
+
+Environment variables win over the file for every field, so a deploy can
+override the file without editing it. The file may set `bucket`,
+`prefix`, `schedule`, `interval`, `keepCount`, `keepDays`, `endpoint`,
+`region`, and `databases` — and nothing else. The encryption key and
+bucket credentials are environment-only, and a file that tries to set
+them (`key`, `secretAccessKey`, and friends) is rejected outright, as is
+an unknown field, so a typo fails loudly instead of silently doing
+nothing. A file database set must still keep a required entry
+(`app.db`); a set with no required file is a configuration error.
+
 ## Configuration
 
-All settings come from the environment. There is no config file for
-backups, and the encryption key in particular comes from the environment
-only — never from a file, never from code, never from a default.
+Secrets come from the environment only. The encryption key in particular
+comes from the environment — never from a file, never from code, never
+from a default. Non-secret settings may also come from a JSON5 file (see
+above); the variables below win over the file for every field.
 
 ```sh
 # Destination bucket (S3, MinIO, or R2 through the existing S3 driver).
@@ -203,3 +231,36 @@ next run.
   fake in-memory bucket, which proves the runner's logic but not Bun's
   S3Client against a real provider. Verify the first real upload and the
   first real restore against your actual bucket before relying on it.
+
+## Bun runtime notes
+
+- **Compiled binaries (AOT).** Backups use nothing a compiled binary
+  cannot do: no dynamic code loading, no `eval`, no runtime `require`
+  of user paths — just `bun:sqlite`, `node:crypto`, and the S3 client.
+  If backups ever run from a `bun compile` binary and feel slow, run
+  `bun compile --explain` and fix the slow paths it lists worst-first;
+  typed code runs faster compiled, untyped code can run slower than JIT,
+  so the typed engine code here is the right shape already. A
+  compiled-binary backup run has not been verified in this round.
+- **Runtime flags.** The feature sets no runtime flags and needs none.
+  `--smol` trades speed for memory and is an explicit knob only, never
+  a default — it is not recommended here, since a run already holds the
+  snapshot bundle in memory while it encrypts and hashes. The feature
+  uses no FFI and no native addons, so `--no-ffi-cc` / `--no-addons`
+  are compatible with it.
+- **String-to-code paths.** There are none in the backup path, so the
+  feature is compatible with `--disallow-code-generation-from-strings`
+  (including `=strict`, which blocks every string-to-code path). Note
+  the distinction: the `VACUUM INTO '...'` statement is a SQL string
+  with its single quotes doubled for escaping — it is not JavaScript
+  code generation, and the flag does not affect it.
+- **Bundler.** `Bun.build()` and its in-memory `files` map were
+  considered for avoiding temp files and rejected: SQLite's
+  `VACUUM INTO` needs real file paths, so database snapshots cannot be
+  built from memory. Temp snapshot files are the honest mechanism, and
+  each is deleted as soon as its bytes are read.
+- **C under Bun.** `bun:ffi` `cc()` via TinyCC was considered and
+  rejected: there is no profiler-proven hot path here. Encryption,
+  hashing, and SQLite are already native; TinyCC compiles fast but does
+  not optimize, so dropping to C would add FFI surface for no measured
+  gain. Revisit only if a profile says otherwise.

@@ -212,13 +212,24 @@ function parsePositiveInt(
  * Bucket credentials follow the same lookup Bun's S3Client documents: the
  * `S3_*` variables first, then the `AWS_*` fallbacks. The existing storage
  * wiring only reads the `AWS_*` names, so both are accepted here.
+ *
+ * `fileText`, when given, is a JSON5 configuration file (see
+ * `parseCloudBackupFileConfig`): hand-edited settings with comments and
+ * trailing commas. Environment variables win over the file for every field,
+ * and the encryption key and bucket credentials are never read from the
+ * file — a file that tries to set them is rejected outright.
  */
 export function loadCloudBackupConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,
+  opts: { fileText?: string } = {},
 ): CloudBackupConfig | null {
-  const bucket = env.YATTA_BACKUP_BUCKET ?? env.S3_BUCKET ?? "";
+  const file = opts.fileText !== undefined
+    ? parseCloudBackupFileConfig(opts.fileText)
+    : null;
+  const bucket = env.YATTA_BACKUP_BUCKET ?? env.S3_BUCKET ?? file?.bucket ?? "";
   const keyRaw = env.YATTA_BACKUP_KEY ?? "";
-  if (!bucket && !keyRaw) return null;
+  if (!bucket && !keyRaw && !file) return null;
+  if (!bucket && !keyRaw && file) return null;
   if (!bucket) {
     throw new CloudBackupError(
       "YATTA_BACKUP_KEY is set but no backup bucket is configured (YATTA_BACKUP_BUCKET)",
@@ -229,35 +240,192 @@ export function loadCloudBackupConfigFromEnv(
       "YATTA_BACKUP_BUCKET is set but YATTA_BACKUP_KEY is not — backups stay disabled without an encryption key",
     );
   }
-  const keepCount = parsePositiveInt(env.YATTA_BACKUP_KEEP_COUNT, "YATTA_BACKUP_KEEP_COUNT", 7);
+  const keepCount = env.YATTA_BACKUP_KEEP_COUNT !== undefined && env.YATTA_BACKUP_KEEP_COUNT !== ""
+    ? parsePositiveInt(env.YATTA_BACKUP_KEEP_COUNT, "YATTA_BACKUP_KEEP_COUNT", 7)
+    : (file?.keepCount ?? 7);
   if (keepCount < 1) {
     throw new CloudBackupError("YATTA_BACKUP_KEEP_COUNT must be at least 1");
   }
-  const keepDays = parsePositiveInt(env.YATTA_BACKUP_KEEP_DAYS, "YATTA_BACKUP_KEEP_DAYS", 30);
-  const databases = defaultBackupDatabases();
-  // Per-file overrides, for apps that moved the jobs or cache files.
-  if (env.YATTA_BACKUP_JOBS_DB) {
-    databases[1] = { name: "jobs.db", path: resolve(env.YATTA_BACKUP_JOBS_DB), required: false };
-  }
-  if (env.YATTA_BACKUP_CACHE_DB) {
-    databases[2] = { name: "cache.db", path: resolve(env.YATTA_BACKUP_CACHE_DB), required: false };
+  const keepDays = env.YATTA_BACKUP_KEEP_DAYS !== undefined && env.YATTA_BACKUP_KEEP_DAYS !== ""
+    ? parsePositiveInt(env.YATTA_BACKUP_KEEP_DAYS, "YATTA_BACKUP_KEEP_DAYS", 30)
+    : (file?.keepDays ?? 30);
+  const databases: BackupDatabaseFile[] = file?.databases
+    ? file.databases.map((entry) => ({
+      name: entry.name,
+      path: resolve(entry.path),
+      required: entry.required ?? false,
+    }))
+    : defaultBackupDatabases();
+  // Per-file overrides, for apps that moved the jobs or cache files. These
+  // apply on top of a file config too, matched by name.
+  const applyOverride = (name: string, raw: string | undefined): void => {
+    if (!raw) return;
+    const index = databases.findIndex((entry) => entry.name === name);
+    const replacement: BackupDatabaseFile = { name, path: resolve(raw), required: false };
+    if (index >= 0) databases[index] = replacement;
+    else databases.push(replacement);
+  };
+  applyOverride("jobs.db", env.YATTA_BACKUP_JOBS_DB);
+  applyOverride("cache.db", env.YATTA_BACKUP_CACHE_DB);
+  // A file config that replaces the whole set may drop the required app
+  // entry by mistake; that is a configuration error, not a silent skip.
+  if (!databases.some((entry) => entry.required)) {
+    throw new CloudBackupError(
+      "Backup database set has no required file: a config file must keep a required entry (app.db)",
+    );
   }
   return {
     bucket,
-    prefix: env.YATTA_BACKUP_PREFIX ?? "yatta-backups",
-    schedule: env.YATTA_BACKUP_SCHEDULE ?? "0 2 * * *",
-    interval: env.YATTA_BACKUP_INTERVAL || undefined,
+    prefix: env.YATTA_BACKUP_PREFIX ?? file?.prefix ?? "yatta-backups",
+    schedule: env.YATTA_BACKUP_SCHEDULE ?? file?.schedule ?? "0 2 * * *",
+    interval: env.YATTA_BACKUP_INTERVAL || file?.interval || undefined,
     keepCount,
     keepDays,
     databases,
     key: parseBackupKey(keyRaw),
     s3: {
-      endpoint: env.S3_ENDPOINT,
-      region: env.S3_REGION ?? env.AWS_REGION ?? "us-east-1",
+      endpoint: env.S3_ENDPOINT ?? file?.endpoint,
+      region: env.S3_REGION ?? env.AWS_REGION ?? file?.region ?? "us-east-1",
       accessKeyId: env.S3_ACCESS_KEY_ID ?? env.AWS_ACCESS_KEY_ID,
       secretAccessKey: env.S3_SECRET_ACCESS_KEY ?? env.AWS_SECRET_ACCESS_KEY,
       sessionToken: env.S3_SESSION_TOKEN ?? env.AWS_SESSION_TOKEN,
     },
+  };
+}
+
+/**
+ * Reads the JSON5 config file named by `YATTA_BACKUP_CONFIG_FILE`, if set,
+ * and loads configuration from it plus the environment. The file is read
+ * only when the variable is set, so apps without one pay nothing.
+ */
+export function loadCloudBackupConfigFromFileSystem(
+  env: NodeJS.ProcessEnv = process.env,
+): CloudBackupConfig | null {
+  const filePath = env.YATTA_BACKUP_CONFIG_FILE;
+  if (!filePath) return loadCloudBackupConfigFromEnv(env);
+  let text: string;
+  try {
+    text = readFileSync(filePath, "utf8");
+  } catch (err) {
+    throw new CloudBackupError(
+      `Could not read backup config file: ${err instanceof Error ? err.message : "unknown error"}`,
+    );
+  }
+  return loadCloudBackupConfigFromEnv(env, { fileText: text });
+}
+
+// ── JSON5 configuration file ────────────────────────────────────────────────
+// The environment is the right place for secrets, but a schedule, retention
+// policy, and bucket name are hand-edited settings, and hand-edited files
+// want comments and trailing commas. `Bun.JSON5.parse` accepts both, and
+// the bundler inlines JSON5 at build time for code paths that need it —
+// here the file is read at startup, so plain parsing is enough.
+//
+// What the file may NOT contain, by design: the encryption key, and bucket
+// credentials. Those stay environment-only. A file that sets any of them is
+// rejected, because a secret that drifts into a checked-in config file is
+// the exact accident this feature must not enable.
+
+/** Non-secret backup settings, as read from a JSON5 config file. */
+export interface CloudBackupFileConfig {
+  bucket?: string;
+  prefix?: string;
+  schedule?: string;
+  interval?: string;
+  keepCount?: number;
+  keepDays?: number;
+  endpoint?: string;
+  region?: string;
+  databases?: { name: string; path: string; required?: boolean }[];
+}
+
+const FILE_CONFIG_FIELDS = new Set([
+  "bucket", "prefix", "schedule", "interval", "keepCount", "keepDays",
+  "endpoint", "region", "databases",
+]);
+
+const FILE_FORBIDDEN_FIELDS = new Set([
+  "key", "YATTA_BACKUP_KEY", "encryptionKey",
+  "accessKeyId", "secretAccessKey", "sessionToken", "secret", "credentials",
+]);
+
+/**
+ * Parses a JSON5 backup config file. Unknown fields are rejected, so a
+ * typo like `keep_counts` fails loudly instead of silently doing nothing.
+ */
+export function parseCloudBackupFileConfig(text: string): CloudBackupFileConfig {
+  let parsed: unknown;
+  try {
+    parsed = Bun.JSON5.parse(text);
+  } catch (err) {
+    throw new CloudBackupError(
+      `Backup config file is not valid JSON5: ${err instanceof Error ? err.message : "unknown error"}`,
+    );
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new CloudBackupError("Backup config file must contain a JSON object");
+  }
+  const record = parsed as Record<string, unknown>;
+  for (const field of Object.keys(record)) {
+    if (FILE_FORBIDDEN_FIELDS.has(field)) {
+      throw new CloudBackupError(
+        `Backup config file must not set "${field}": encryption keys and bucket credentials come from the environment only`,
+      );
+    }
+    if (!FILE_CONFIG_FIELDS.has(field)) {
+      throw new CloudBackupError(
+        `Unknown backup config field "${field}": allowed fields are ${[...FILE_CONFIG_FIELDS].sort().join(", ")}`,
+      );
+    }
+  }
+  const asString = (field: string): string | undefined => {
+    const value = record[field];
+    if (value === undefined) return undefined;
+    if (typeof value !== "string" || value === "") {
+      throw new CloudBackupError(`Backup config field "${field}" must be a non-empty string`);
+    }
+    return value;
+  };
+  const asCount = (field: string): number | undefined => {
+    const value = record[field];
+    if (value === undefined) return undefined;
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+      throw new CloudBackupError(`Backup config field "${field}" must be a whole number of 0 or more`);
+    }
+    return value;
+  };
+  let databases: CloudBackupFileConfig["databases"];
+  if (record.databases !== undefined) {
+    if (!Array.isArray(record.databases)) {
+      throw new CloudBackupError('Backup config field "databases" must be an array');
+    }
+    databases = record.databases.map((entry, index) => {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        throw new CloudBackupError(`Backup config databases[${index}] must be an object`);
+      }
+      const item = entry as Record<string, unknown>;
+      if (typeof item.name !== "string" || item.name === "") {
+        throw new CloudBackupError(`Backup config databases[${index}].name must be a non-empty string`);
+      }
+      if (typeof item.path !== "string" || item.path === "") {
+        throw new CloudBackupError(`Backup config databases[${index}].path must be a non-empty string`);
+      }
+      if (item.required !== undefined && typeof item.required !== "boolean") {
+        throw new CloudBackupError(`Backup config databases[${index}].required must be a boolean`);
+      }
+      return { name: item.name, path: item.path, required: item.required };
+    });
+  }
+  return {
+    bucket: asString("bucket"),
+    prefix: asString("prefix"),
+    schedule: asString("schedule"),
+    interval: asString("interval"),
+    keepCount: asCount("keepCount"),
+    keepDays: asCount("keepDays"),
+    endpoint: asString("endpoint"),
+    region: asString("region"),
+    databases,
   };
 }
 

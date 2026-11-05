@@ -1,6 +1,6 @@
 import {
   createS3BackupBucket,
-  loadCloudBackupConfigFromEnv,
+  loadCloudBackupConfigFromFileSystem,
   scheduleCloudBackups,
 } from "../types/cloud_backups";
 import type { CronScheduler } from "../types/job";
@@ -22,7 +22,9 @@ import type { CronScheduler } from "../types/job";
 export function maybeScheduleCloudBackups(cron: CronScheduler): boolean {
   let config;
   try {
-    config = loadCloudBackupConfigFromEnv();
+    // Reads YATTA_BACKUP_CONFIG_FILE (JSON5) when set, plus the environment.
+    // The key and bucket credentials still come from the environment only.
+    config = loadCloudBackupConfigFromFileSystem();
   } catch (err) {
     console.error(
       `[cloud-backup] not scheduled: ${err instanceof Error ? err.message : "invalid backup configuration"}`,
