@@ -27,7 +27,10 @@
 //   - There is no consent screen. Any signed-in user who opens an
 //     authorize link for a registered client approves it. Pass
 //     `approve` if third-party clients can exist.
-//   - There is no rate limiting. Put one in front of /oauth/token.
+//   - There is no rate limiting built in. Put one in front of /oauth/token:
+//     `oauthTokenRateLimit()` from yatta.js/ratelimit is a ready-made
+//     middleware for the API pipeline (5 token requests per minute per
+//     IP by default). The server itself stays unchanged.
 
 import crypto from "node:crypto";
 

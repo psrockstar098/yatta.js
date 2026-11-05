@@ -55,6 +55,7 @@
     "./webfinger": "./src/func/webfinger.ts",
     "./doh": "./src/func/doh.ts",
     "./oauth": "./src/func/oauth.ts",
+    "./ratelimit": "./src/func/ratelimit.ts",
     "./oidc": "./src/func/oidc.ts",
     "./mcp": "./src/func/mcp.ts",
     "./package.json": "./package.json",
