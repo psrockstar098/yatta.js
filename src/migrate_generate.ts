@@ -186,11 +186,14 @@ function parseCheckValues(sql: string | null, column: string): readonly string[]
   const escaped = column.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const match = sql.match(new RegExp(`CHECK\\s*\\(\\s*"${escaped}"\\s+IN\\s*\\(([^)]*)\\)\\s*\\)`, "i"));
   if (!match) return null;
+  // Tokenise quoted strings rather than splitting on commas: a value may
+  // itself contain a comma or a parenthesis, and a naive split would then
+  // misread the list and report a phantom change on every run.
   const values: string[] = [];
-  for (const part of match[1]!.split(",")) {
-    const trimmed = part.trim();
-    if (!/^'([^']|'')*'$/.test(trimmed)) return null;
-    values.push(trimmed.slice(1, -1).replace(/''/g, "'"));
+  const tokens = match[1]!.match(/'([^']|'')*'/g);
+  if (!tokens) return null;
+  for (const token of tokens) {
+    values.push(token.slice(1, -1).replace(/''/g, "'"));
   }
   return values;
 }
@@ -834,6 +837,14 @@ export function renderMigrationFile(
   diff: SchemaDiff,
   rendered: RenderedMigration,
 ): string {
+  // Header lines are `//` comments, so a table or column name containing a
+  // newline would end the comment and put raw text into the file — text
+  // that runs when the migration is imported. Names come from the
+  // developer's own models, but a generated file must never be an injection
+  // vector for them, so control characters are stripped from header text.
+  // (Statement text is different: it travels inside template literals with
+  // backticks and `${` escaped, and identifiers are always quoted.)
+  const clean = (line: string): string => line.replace(/[\r\n\x00-\x1f\x7f]/g, " ");
   const header: string[] = [
     `// Migration: ${migrationName}`,
     `// Generated: ${new Date().toISOString()}`,
@@ -841,7 +852,7 @@ export function renderMigrationFile(
     `//`,
   ];
   for (const change of diff.changes) {
-    header.push(`// ${change.destructive ? "DESTRUCTIVE: " : ""}${change.detail}`);
+    header.push(clean(`// ${change.destructive ? "DESTRUCTIVE: " : ""}${change.detail}`));
   }
   if (rendered.needsRebuild) {
     header.push(`//`);

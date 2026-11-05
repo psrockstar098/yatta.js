@@ -298,7 +298,13 @@ export async function cmdMigrateGenerate(
   const loaded = await loadModelSchema(opts, projectRoot);
   if (!loaded) return 1;
   const desired = normalizeModelSchema(loaded.schema);
-  const live = readLiveSchema(path);
+  let live;
+  try {
+    live = readLiveSchema(path);
+  } catch (err: any) {
+    console.log(`  ${c.red(`Could not read the live database at ${path}: ${err?.message ?? String(err)}`)}`);
+    return 1;
+  }
   const diff = diffSchemas(live, desired);
 
   if (diff.changes.length === 0) {
@@ -361,10 +367,20 @@ export async function cmdMigrateGenerate(
     }
   }
 
-  const { filename, migrationName } = migrationFileName(opts.name ?? "auto_generated");
+  const { filename: baseFilename, migrationName: baseName } = migrationFileName(opts.name ?? "auto_generated");
   const rendered = renderStatements(diff, live, desired);
   const dir = migrationsDir(projectRoot);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  // Two generates in the same second share a timestamp, and overwriting the
+  // first file would lose it. Suffix both the filename and the migration
+  // name: status matches applied migrations by filename, so the two must
+  // stay identical.
+  let filename = baseFilename;
+  let migrationName = baseName;
+  for (let n = 2; existsSync(join(dir, filename)); n++) {
+    filename = `${baseName}_${n}.ts`;
+    migrationName = `${baseName}_${n}`;
+  }
   const filepath = join(dir, filename);
   writeFileSync(filepath, renderMigrationFile(migrationName, diff, rendered));
   console.log(`  ${c.green("✓")} Created: ${c.dim(`migrations/${filename}`)}`);

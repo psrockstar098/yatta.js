@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 
 import { cmdMigrate, cmdMigrateGenerate } from "../cli_migrate";
 import { col, createDatabase, YattaDB } from "../types/db";
-import { qIdent } from "../migrate_generate";
+import { diffSchemas, normalizeModelSchema, qIdent, renderMigrationFile, renderStatements } from "../migrate_generate";
 
 /*
  * `yatta migrate:generate` — diff a live database against the models and
@@ -369,5 +369,44 @@ describe("migrate:generate edge cases", () => {
     expect(result).toBe(1);
     expect(migrationFiles(dir)).toEqual([]);
     expect(lines.join("\n")).toMatch(/no value exists/);
+  });
+
+  it("does not report a phantom change for an enum value containing a comma", async () => {
+    const dir = projectDir();
+    seed(dir, { users: [`"id" INTEGER PRIMARY KEY AUTOINCREMENT`, `"role" TEXT NOT NULL CHECK("role" IN ('a,b', 'c'))`] });
+    const schemaFile = writeSchema(dir, `{
+      users: { id: col.id(), role: col.enum(["a,b", "c"]) },
+    }`);
+
+    const { result } = await quiet(() => cmdMigrateGenerate({ schemaPath: schemaFile }, dir));
+    expect(result).toBe(0);
+    expect(migrationFiles(dir)).toEqual([]);
+  });
+
+  it("never overwrites an earlier migration generated in the same second", async () => {
+    const dir = projectDir();
+    seed(dir, { users: [`"id" INTEGER PRIMARY KEY AUTOINCREMENT`, `"name" TEXT NOT NULL`] });
+    let schemaFile = writeSchema(dir, `{
+      users: { id: col.id(), name: col.text(), bio: col.text().nullable() },
+    }`);
+    await quiet(() => cmdMigrateGenerate({ schemaPath: schemaFile }, dir));
+    schemaFile = writeSchema(dir, `{
+      users: { id: col.id(), name: col.text(), bio: col.text().nullable(), bio2: col.text().nullable() },
+    }`);
+    await quiet(() => cmdMigrateGenerate({ schemaPath: schemaFile }, dir));
+    const files = migrationFiles(dir);
+    expect(files.length).toBe(2);
+    expect(new Set(files).size).toBe(2);
+  });
+
+  it("keeps a newline-bearing identifier inside its header comment", () => {
+    const live = { tables: { users: { name: "users", sql: null, columns: [], indexes: [], savedObjectSql: [], rowCount: 0 } } };
+    const desired = normalizeModelSchema({ users: { id: col.id() } });
+    const diff = diffSchemas(live as any, desired);
+    const rendered = renderStatements(diff, live as any, desired);
+    const evil = { ...diff.changes[0]!, detail: "Create table x\n}; evil();//" };
+    const content = renderMigrationFile("test_migration", { ...diff, changes: [evil] }, rendered);
+    const evilLine = content.split("\n").find((l) => l.includes("evil"));
+    expect(evilLine?.trimStart().startsWith("//")).toBe(true);
   });
 });
