@@ -55,6 +55,7 @@
     "./realtime": "./src/types/realtime.ts",
     "./observe": "./src/types/observe.ts",
     "./otel": "./src/types/otel.ts",
+    "./profiler": "./src/types/profiler.ts",
     "./grpcweb": "./src/func/grpcweb.ts",
     "./webdav": "./src/func/webdav.ts",
     "./webfinger": "./src/func/webfinger.ts",
