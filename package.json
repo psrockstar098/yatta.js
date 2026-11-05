@@ -72,6 +72,7 @@
     "src/cli.ts",
     "src/cli_doctor.ts",
     "src/cli_migrate.ts",
+    "src/migrate_generate.ts",
     "src/cli_backup.ts",
     "src/deploy",
     "src/func",
