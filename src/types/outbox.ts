@@ -370,9 +370,12 @@ export function toJobPublish(
       payload: entry.payload,
       occurredAt: entry.occurredAt,
     };
+    // The unique key goes last on purpose: it is the dedupe contract, so
+    // a caller-supplied option must not be able to replace it and
+    // silently turn a redelivery into a duplicate job.
     await sink.enqueue(mapped?.jobName ?? jobName, data, {
-      uniqueKey: `outbox:${entry.eventId}`,
       ...(mapped?.options ?? {}),
+      uniqueKey: `outbox:${entry.eventId}`,
     });
   };
 }
@@ -411,6 +414,14 @@ export interface OutboxRelayOptions {
   retryBaseMs?: number;
   /** Retry delay cap in milliseconds. Defaults to 60000. */
   retryMaxMs?: number;
+  /**
+   * Maximum time a single publish may take, in milliseconds. Unset by
+   * default: a publish function with no timeout of its own can stall a
+   * scan forever, since scans run one row at a time. Set this when the
+   * publish target has no timeout of its own; a timeout counts as a
+   * publish failure, so the row stays pending for retry.
+   */
+  publishTimeoutMs?: number;
   /** Clock override, for tests. Defaults to Date.now. */
   now?: () => number;
 }
@@ -445,7 +456,10 @@ export function outboxBackoffMs(attempts: number, baseMs = 1000, maxMs = 60000):
 export class OutboxRelay {
   private timer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
-  private readonly options: Required<Omit<OutboxRelayOptions, "now">> & { now: () => number };
+  private readonly options: Required<Omit<OutboxRelayOptions, "now" | "publishTimeoutMs">> & {
+    now: () => number;
+    publishTimeoutMs?: number;
+  };
 
   constructor(
     private readonly store: OutboxStore,
@@ -458,9 +472,32 @@ export class OutboxRelay {
       maxAttempts: options.maxAttempts ?? 5,
       retryBaseMs: options.retryBaseMs ?? 1000,
       retryMaxMs: options.retryMaxMs ?? 60000,
+      publishTimeoutMs: options.publishTimeoutMs,
       now: options.now ?? Date.now,
     };
     ensureOutboxTable(store);
+  }
+
+  private async publishWithTimeout(entry: OutboxEntry): Promise<void> {
+    const timeoutMs = this.options.publishTimeoutMs;
+    if (timeoutMs === undefined || timeoutMs <= 0) {
+      await this.publish(entry);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.resolve(this.publish(entry)),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Outbox publish timed out after ${timeoutMs}ms.`)),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /** Whether the interval loop is running. */
@@ -509,7 +546,7 @@ export class OutboxRelay {
       for (const entry of rows) {
         const now = this.options.now();
         try {
-          await this.publish(entry);
+          await this.publishWithTimeout(entry);
         } catch (err) {
           const attempts = entry.attempts + 1;
           const dead = attempts >= this.options.maxAttempts;
