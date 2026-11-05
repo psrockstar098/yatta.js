@@ -170,6 +170,8 @@ export interface ColumnDefinition {
   references?: { table: string; column: string; onDelete?: string };
   /** Whether an index should be created on this column. */
   isIndex?: boolean;
+  /** Whether the column is indexed for full-text search (see `.searchable()`). */
+  isSearchable?: boolean;
   /** Whether column is treated as a boolean (mapped between boolean and 0/1 in SQLite). */
   isBoolean?: boolean;
   /** Whether column stores JSON data (automatically serialized/deserialized). */
@@ -284,6 +286,30 @@ export class ColumnBuilder<V = unknown, Optional extends boolean = false, IsRef 
    */
   index(): ColumnBuilder<V, Optional, IsRef> {
     return this.clone<V, Optional, IsRef>({ isIndex: true });
+  }
+
+  /**
+   * Marks this column as full-text searchable.
+   *
+   * Only plain text columns can be searchable: the FTS5 index tokenizes text,
+   * so a number, boolean, JSON blob, or auto-generated UUID would index
+   * meaningless tokens. Marking one of those is a schema mistake, so it throws
+   * here at definition time instead of silently indexing junk.
+   *
+   * @example
+   * ```ts
+   * title: col.text().searchable(),
+   * body: col.text().searchable(),
+   * ```
+   */
+  searchable(): ColumnBuilder<V, Optional, IsRef> {
+    if (this.def.type !== "TEXT" || this.def.isJson || this.def.isUuid) {
+      throw new YattaError(
+        "searchable() is only for plain text columns. " +
+          "Numbers, booleans, JSON columns, and UUID keys cannot be full-text indexed.",
+      );
+    }
+    return this.clone<V, Optional, IsRef>({ isSearchable: true });
   }
 
   /**
@@ -728,6 +754,56 @@ export interface CursorPaginatedResult<T> {
 }
 
 /**
+ * One ranked full-text search hit.
+ *
+ * `rank` is SQLite FTS5's real `bm25()` value for the match — not a score
+ * invented by Yatta. It is negative, and smaller means more relevant; hits
+ * are returned most relevant first (ascending rank). Do not rescale it into
+ * a 0–1 score: the raw value is only meaningful for ordering within one query.
+ */
+export interface SearchHit<T> {
+  /** The matched row, deserialized like any other query result. */
+  row: T;
+  /** The FTS5 `bm25()` value for this row in this query. Smaller is better. */
+  rank: number;
+}
+
+/**
+ * Options for `table.search()`.
+ */
+export interface SearchOptions<T = any> {
+  /** Maximum hits to return. Omitted means all matches, most relevant first. */
+  limit?: number;
+  /** Hits to skip, for paging through ranked results. Defaults to 0. */
+  offset?: number;
+  /**
+   * Restrict the search to these columns. Every named column must be
+   * searchable; naming a non-searchable column throws instead of silently
+   * searching nothing. Omitted means all searchable columns.
+   */
+  columns?: (keyof T)[];
+  /**
+   * Extra rows the search must match, applied after ranking (an AND filter).
+   * The ranking itself still comes from the FTS5 match alone.
+   */
+  where?: WhereClause<T>;
+  /** Eager-loaded relations, same shape as `findMany({ include })`. */
+  include?: Record<string, boolean>;
+  /**
+   * Synonym map for this query only, merged over the database-level map
+   * (see `DatabaseOptions.searchSynonyms`). A key expands to its values:
+   * searching "laptop" also matches "notebook" when the map says so.
+   */
+  synonyms?: Record<string, string | string[]>;
+  /**
+   * Whether typo correction runs (default `true`). With it off, only exact
+   * FTS5 token matches count — a typo'd query then returns nothing, which
+   * is FTS5's honest behaviour, not a bug.
+   */
+  typo?: boolean;
+}
+
+/**
  * Configuration options for atomic insert-or-update (upsert) operations.
  *
  * @template T Row entity type.
@@ -1141,6 +1217,110 @@ function escapeLike(str: string): string {
   return str.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
 
+// ── Full-text search helpers ───────────────────────────────────────────────
+// These exist so a search query can never become SQL or FTS5 syntax. The
+// query is reduced to plain word tokens first; the MATCH expression is then
+// rebuilt from those tokens only, each one double-quoted. Quote marks,
+// wildcards, `OR`/`AND`, `column:` prefixes, and every other FTS5 operator
+// in the raw input are stripped by tokenization before they can reach the
+// query — they arrive as words, or not at all.
+
+/** Splits text into lowercase word tokens, the way FTS5's unicode61 tokenizer sees them. */
+function tokenizeText(text: string): string[] {
+  return text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+/** Renders one token as a quoted FTS5 term. The doubling is belt-and-braces: tokens carry no quotes by construction. */
+function quoteFtsTerm(term: string): string {
+  return `"${term.replace(/"/g, '""')}"`;
+}
+
+/** Renders a synonym phrase ("notebook computer") as one quoted FTS5 phrase, or a single term. */
+function ftsPhrase(tokens: string[]): string {
+  if (tokens.length === 0) return `""`;
+  if (tokens.length === 1) return quoteFtsTerm(tokens[0]!);
+  return `"${tokens.map((t) => t.replace(/"/g, '""')).join(" ")}"`;
+}
+
+/** Normalizes a synonym map: keys lowercased, values split into token lists (one list per synonym phrase). */
+function normalizeSynonyms(
+  map: Record<string, string | string[]> | undefined,
+): Map<string, string[][]> {
+  const out = new Map<string, string[][]>();
+  if (!map) return out;
+  for (const [key, value] of Object.entries(map)) {
+    const phrases = (Array.isArray(value) ? value : [value])
+      .map((v) => tokenizeText(v))
+      .filter((t) => t.length > 0);
+    if (phrases.length > 0) out.set(key.toLowerCase(), phrases);
+  }
+  return out;
+}
+
+/** The trigrams of a word, padded so short words still get trigrams. */
+function trigrams(word: string): Set<string> {
+  const padded = `  ${word} `;
+  const out = new Set<string>();
+  for (let i = 0; i + 3 <= padded.length; i++) out.add(padded.slice(i, i + 3));
+  return out;
+}
+
+/** Jaccard similarity of two trigram sets: shared trigrams over all trigrams. */
+function trigramSimilarity(a: string, b: string): number {
+  const ta = trigrams(a);
+  const tb = trigrams(b);
+  let shared = 0;
+  for (const t of ta) if (tb.has(t)) shared++;
+  return shared / (ta.size + tb.size - shared || 1);
+}
+
+/** Plain edit distance (insert, delete, substitute), for short vocabulary words. */
+function levenshtein(a: string, b: string): number {
+  const prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = prev[0]!;
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j]!;
+      prev[j] = Math.min(prev[j]! + 1, prev[j - 1]! + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diag = tmp;
+    }
+  }
+  return prev[b.length]!;
+}
+
+/**
+ * Corrects one query token against the indexed vocabulary, or returns null.
+ *
+ * Two gates, both deliberate: the candidate must share enough trigrams with
+ * the query (so unrelated words never qualify), and be within a small edit
+ * distance (1 for short words, 2 for longer ones). The best candidate wins
+ * on edit distance, then trigram similarity. A word with no candidate keeps
+ * its original spelling and simply matches nothing — inventing a correction
+ * for a genuinely unknown word would return wrong rows with confidence.
+ */
+function correctTypo(token: string, vocabulary: Set<string>): string | null {
+  if (token.length < 3) return null;
+  const maxDistance = token.length <= 4 ? 1 : 2;
+  let best: string | null = null;
+  let bestDistance = Infinity;
+  let bestSimilarity = 0;
+  for (const term of vocabulary) {
+    if (term === token) return token;
+    if (Math.abs(term.length - token.length) > maxDistance) continue;
+    const similarity = trigramSimilarity(token, term);
+    if (similarity < 0.3) continue;
+    const distance = levenshtein(token, term);
+    if (distance > maxDistance) continue;
+    if (distance < bestDistance || (distance === bestDistance && similarity > bestSimilarity)) {
+      best = term;
+      bestDistance = distance;
+      bestSimilarity = similarity;
+    }
+  }
+  return best;
+}
+
 /**
  * Clamps a page or limit to a usable positive integer.
  *
@@ -1174,6 +1354,15 @@ function pageCount(value: number | undefined, fallback: number): number {
 export class Table<T extends Record<string, any> = Record<string, any>, TInsert extends Record<string, any> = Partial<T>> {
   /** Map of column definitions belonging to this table. */
   readonly columns: Map<string, ColumnDefinition> = new Map();
+  /**
+   * Searchable column names for this table, fixed at construction.
+   *
+   * Cached here, not re-derived per write, so a table with no searchable
+   * columns takes its old write path with one length check and nothing
+   * else: no schema scan, no SQL, no FTS table. Search is opt-in by
+   * declaration, and undeclared tables pay nothing for it.
+   */
+  private readonly ftsColumns: string[] = [];
   /** The primary key column name for this table (defaults to `"id"`). */
   readonly primaryKeyColumn: string = "id";
   /** Inferred relational foreign key aliases (e.g. `userId` -> `user`). */
@@ -1194,6 +1383,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     if (schema) {
       for (const [colName, builder] of Object.entries(schema)) {
         this.columns.set(colName, builder.def);
+        if (builder.def.isSearchable) this.ftsColumns.push(colName);
         if (builder.def.primaryKey) this.primaryKeyColumn = colName;
         if (builder.def.references) {
           const alias = deriveAlias(colName);
@@ -1250,7 +1440,9 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
      */
     if (keys.length === 0) {
       const sql = `INSERT INTO "${this.name.replace(/"/g, '""')}" DEFAULT VALUES RETURNING *;`;
-      return this.deserializeRow(this.db.run(sql, [], "get") as any);
+      const row = this.deserializeRow(this.db.run(sql, [], "get") as any);
+      this.syncFtsRow(row);
+      return row;
     }
 
     const columns = keys.map((k) => `"${k.replace(/"/g, '""')}"`).join(", ");
@@ -1258,8 +1450,11 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     const values = keys.map((k) => this.serializeValue(k, payload[k]));
 
     const sql = `INSERT INTO "${this.name.replace(/"/g, '""')}" (${columns}) VALUES (${placeholders}) RETURNING *;`;
-    const row = this.db.run(sql, values, "get") as any;
-    return this.deserializeRow(row);
+    const row = this.deserializeRow(this.db.run(sql, values, "get") as any);
+    // Same connection, so a surrounding transaction rollback rolls the
+    // index write back with the row — the index cannot outlive its row.
+    this.syncFtsRow(row);
+    return row;
   }
 
   /**
@@ -1414,6 +1609,168 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     return rows as unknown as R[];
   }
 
+  // ── FULL-TEXT SEARCH ─────────────────────────────────────────────────────
+
+  /**
+   * Full-text search over the table's `.searchable()` columns, ranked by
+   * SQLite FTS5's `bm25()`.
+   *
+   * Honest limits, stated here because they shape results:
+   * - FTS5 has no typo tolerance of its own. With the default `typo: true`,
+   *   each query word that is not in the indexed vocabulary is corrected
+   *   against that vocabulary (trigram similarity plus edit distance) before
+   *   the match runs, so "laptp" finds "laptop". A word with no close
+   *   vocabulary neighbour keeps its spelling and matches nothing.
+   * - The query is tokenized before it reaches FTS5, so FTS5 operators,
+   *   wildcards, and column prefixes typed into the query are treated as
+   *   words or dropped — never as syntax. Search input cannot inject SQL
+   *   or FTS5 query syntax. Operator words (`and`/`or`/`not`) are dropped
+   *   and every remaining term is ANDed, so there is no OR search in v1.
+   * - `rank` on each hit is the raw `bm25()` value: negative, smaller is
+   *   more relevant, meaningful only for ordering within this query.
+   *
+   * @example
+   * ```ts
+   * const hits = db.products.search("laptp");
+   * // hits[0].row is the laptop row, hits[0].rank its bm25 value.
+   * ```
+   */
+  search(query: string, options: SearchOptions<T> = {}): SearchHit<T>[] {
+    const searchable = this.ftsColumns;
+    if (searchable.length === 0) {
+      throw new YattaError(
+        `Table "${this.name}" has no searchable columns. ` +
+          `Mark a text column with .searchable() to make the table searchable.`,
+      );
+    }
+
+    const restricted = options.columns ? options.columns.map(String) : null;
+    if (restricted) {
+      for (const c of restricted) {
+        if (!searchable.includes(c)) {
+          throw new YattaError(
+            `Column "${c}" on table "${this.name}" is not searchable. ` +
+              `Searchable columns: ${searchable.join(", ")}. ` +
+              `Non-searchable columns are never searched, and naming one here is refused rather than silently ignored.`,
+          );
+        }
+        // Column names enter the MATCH expression as an FTS5 column filter,
+        // so they must be plain identifiers — a name carrying syntax could
+        // break out of the filter. Schema names are normally plain already;
+        // this refuses the exotic case loudly instead of building bad syntax.
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(c)) {
+          throw new YattaError(
+            `Column "${c}" on table "${this.name}" cannot be used as a search column filter because its name is not a plain identifier.`,
+          );
+        }
+      }
+    }
+
+    const limit = options.limit !== undefined ? this.rowCount(options.limit, "limit", true) : undefined;
+    const offset = options.offset !== undefined ? this.rowCount(options.offset, "offset", false) : 0;
+
+    // FTS5 operator words carry no meaning here — the query is rebuilt from
+    // tokens, and every remaining token is ANDed. Dropping them (instead of
+    // letting "or" become an unmatchable search term) means "laptop or mouse"
+    // searches for rows matching both words, and a payload like
+    // `" OR 1=1 --` cannot smuggle operators into the MATCH expression.
+    const tokens = tokenizeText(query).filter((t) => t !== "and" && t !== "or" && t !== "not");
+    if (tokens.length === 0) return [];
+
+    // Creates (or repairs) the index on first use, so a table opened with
+    // autoMigrate off, or a database file copied in from elsewhere, still
+    // searches correctly instead of failing on a missing FTS table.
+    this.db.ensureSearchIndex(this.name);
+
+    const useTypo = options.typo !== false;
+    const vocabulary = useTypo ? this.db.ftsVocabulary(this.name) : new Set<string>();
+    const synonyms = new Map([...this.db.searchSynonyms(), ...normalizeSynonyms(options.synonyms)]);
+
+    const groups: string[] = [];
+    for (const token of tokens) {
+      const corrected = useTypo && !vocabulary.has(token) ? correctTypo(token, vocabulary) ?? token : token;
+      const alternatives = new Map<string, string[]>();
+      alternatives.set(corrected, [corrected]);
+      for (const key of [corrected, token]) {
+        for (const phrase of synonyms.get(key) ?? []) alternatives.set(phrase.join(" "), phrase);
+      }
+      const group = [...alternatives.values()].map(ftsPhrase).join(" OR ");
+      const wrapped = alternatives.size > 1 ? `(${group})` : group;
+      groups.push(restricted ? `{${restricted.join(" ")}} : ${wrapped}` : wrapped);
+    }
+    const matchExpr = groups.join(" AND ");
+
+    const fts = this.db.ftsTableName(this.name);
+    const qfts = `"${fts.replace(/"/g, '""')}"`;
+    // SQLite rejects a bare OFFSET with no LIMIT, so an offset-only page
+    // gets LIMIT -1 (SQLite's "no upper bound"), the same idiom findMany uses.
+    const limitSql = limit !== undefined ? `LIMIT ${limit}` : options.offset !== undefined ? "LIMIT -1" : "";
+    const offsetSql = options.offset !== undefined ? `OFFSET ${offset}` : "";
+    const sql = [
+      `SELECT "__yatta_pk" AS pk, bm25(${qfts}) AS rank FROM ${qfts}`,
+      `WHERE ${qfts} MATCH ? ORDER BY rank ASC`,
+      limitSql,
+      offsetSql,
+    ].filter(Boolean).join(" ").concat(";");
+
+    const hits = this.db.run(sql, [matchExpr], "all") as { pk: unknown; rank: number }[];
+    if (hits.length === 0) return [];
+
+    const pks = hits.map((h) => this.coercePk(h.pk));
+    const pkFilter = { [this.primaryKeyColumn]: { in: pks } } as any;
+    const where = options.where && Object.keys(options.where).length > 0
+      ? ({ AND: [options.where, pkFilter] } as WhereClause<T>)
+      : pkFilter;
+    const rows = this.findMany({ where, include: options.include } as any);
+    const byPk = new Map(rows.map((r) => [String((r as any)[this.primaryKeyColumn]), r]));
+
+    const out: SearchHit<T>[] = [];
+    for (const h of hits) {
+      const row = byPk.get(String(h.pk));
+      if (row) out.push({ row, rank: h.rank });
+    }
+    return out;
+  }
+
+  /**
+   * Rebuilds this table's full-text index from its current rows.
+   * The escape hatch for rows changed outside the Table write paths
+   * (raw SQL, a copied database file): those writes do not sync the index.
+   */
+  rebuildSearchIndex(): void {
+    this.db.rebuildSearchIndex(this.name);
+  }
+
+  /** Converts a stored FTS primary key back to the column's type (numbers stay numbers). */
+  private coercePk(stored: unknown): string | number {
+    const def = this.columns.get(this.primaryKeyColumn);
+    if (def?.type === "INTEGER") {
+      const n = Number(stored);
+      return Number.isFinite(n) ? n : String(stored);
+    }
+    return String(stored);
+  }
+
+  /** Writes one row into the FTS index, or does nothing when the table is not searchable. */
+  private syncFtsRow(row: T | null | undefined): void {
+    if (!row) return;
+    if (this.ftsColumns.length === 0) return;
+    this.db.ftsUpsert(this.name, (row as any)[this.primaryKeyColumn], row as any);
+  }
+
+  /** Removes one primary key from the FTS index, or does nothing when the table is not searchable. */
+  private syncFtsDelete(pk: string | number): void {
+    if (this.ftsColumns.length === 0) return;
+    this.db.ftsDelete(this.name, pk);
+  }
+
+  /** Primary keys of the rows a `where` filter matches, without loading the rows. */
+  private ftsPkValuesForWhere(where: WhereClause<T>): (string | number)[] {
+    const { clause, params } = this.buildWhere(where);
+    const sql = `SELECT "${this.primaryKeyColumn.replace(/"/g, '""')}" AS pk FROM "${this.name.replace(/"/g, '""')}"${clause ? ` WHERE ${clause}` : ""};`;
+    return (this.db.run(sql, params, "all") as any[]).map((r) => r.pk);
+  }
+
   // ── UPDATE ───────────────────────────────────────────────────────────────
 
   private buildSetClause(data: Record<string, any>): { setSql: string; params: any[] } {
@@ -1470,9 +1827,34 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
       );
     }
 
+    // The update may change what a row matches (or its searchable text), so
+    // the affected keys are captured before the write: afterwards the old
+    // filter may no longer match the updated rows, and their keys would be
+    // unrecoverable. Keys only, not full rows.
+    const searchable = this.ftsColumns.length > 0;
+    const affectedPks = searchable ? this.ftsPkValuesForWhere(options.where) : [];
+
     const sql = `UPDATE "${this.name.replace(/"/g, '""')}" SET ${setSql}${clause ? ` WHERE ${clause}` : ""};`;
 
     const res = this.db.run(sql, [...setParams, ...whereParams], "run") as { changes: number };
+
+    if (searchable) {
+      // A primary-key change moves the row's index entry: reindex under the
+      // new key and drop the old one, or the old entry would point at a row
+      // that no longer exists under that key.
+      const resolved = this.resolveAliases(options.data as Record<string, any>);
+      const pkChanged = resolved[this.primaryKeyColumn] !== undefined;
+      for (const oldPk of affectedPks) {
+        const newPk = pkChanged ? resolved[this.primaryKeyColumn] : oldPk;
+        const row = this.findById(newPk);
+        if (row) {
+          this.syncFtsRow(row);
+          if (String(newPk) !== String(oldPk)) this.syncFtsDelete(oldPk);
+        } else {
+          this.syncFtsDelete(oldPk);
+        }
+      }
+    }
     return { changes: res.changes };
   }
 
@@ -1494,8 +1876,15 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
 
     const pkCol = `"${this.primaryKeyColumn.replace(/"/g, '""')}"`;
     const sql = `UPDATE "${this.name.replace(/"/g, '""')}" SET ${setSql} WHERE ${pkCol} = ? RETURNING *;`;
-    const row = this.db.run(sql, [...setParams, id], "get") as any;
-    return row ? this.deserializeRow(row) : null;
+    const raw = this.db.run(sql, [...setParams, id], "get") as any;
+    const row = raw ? this.deserializeRow(raw) : null;
+    if (row) {
+      this.syncFtsRow(row);
+      if (String((row as any)[this.primaryKeyColumn]) !== String(id)) this.syncFtsDelete(id);
+    } else {
+      this.syncFtsDelete(id);
+    }
+    return row;
   }
 
   /**
@@ -1563,6 +1952,18 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
       throw new YattaError(
         `delete() on "${this.name}" requires a filter. An empty where would delete every row — pass { allowAll: true } if that is what you mean.`,
       );
+    }
+
+    // Index entries are removed with the same filter, before the rows go:
+    // one statement, same parameters, so a row deleted here cannot leave a
+    // searchable ghost behind. Keys are cast to text because the index
+    // stores every primary key as text.
+    if (this.ftsColumns.length > 0 && this.db.ftsTableExists(this.name)) {
+      const fts = this.db.ftsTableName(this.name);
+      const qfts = `"${fts.replace(/"/g, '""')}"`;
+      const pkCol = `"${this.primaryKeyColumn.replace(/"/g, '""')}"`;
+      const ghostSql = `DELETE FROM ${qfts} WHERE "__yatta_pk" IN (SELECT CAST(${pkCol} AS TEXT) FROM "${this.name.replace(/"/g, '""')}"${clause ? ` WHERE ${clause}` : ""});`;
+      this.db.run(ghostSql, params, "run");
     }
 
     const sql = `DELETE FROM "${this.name.replace(/"/g, '""')}"${clause ? ` WHERE ${clause}` : ""};`;
@@ -2171,6 +2572,13 @@ export interface DatabaseOptions {
   autoMigrate?: boolean;
   /** Whether to log executed SQL queries with millisecond execution durations to stdout. */
   debug?: boolean;
+  /**
+   * Database-level synonym map for full-text search, e.g.
+   * `{ laptop: ["notebook"] }`: searching "laptop" also matches "notebook".
+   * Applied at query time, so changing it needs no reindex. A per-query
+   * `synonyms` option overrides these keys for that query only.
+   */
+  searchSynonyms?: Record<string, string | string[]>;
   /** If `true`, creates a new instance even if a database at this path is already cached in registry. */
   forceNew?: boolean;
 }
@@ -2191,6 +2599,10 @@ export class YattaDB {
   private readonly debug: boolean;
   private tables = new Map<string, Table<any, any>>();
   private stmtCache = new Map<string, Statement>();
+  /** Normalized database-level search synonyms (see `DatabaseOptions.searchSynonyms`). */
+  private dbSearchSynonyms: Map<string, string[][]>;
+  /** Searchable tables whose FTS table is known to exist, so writes skip a lookup. */
+  private ftsReady = new Set<string>();
   private static readonly MAX_STMT_CACHE = 500;
 
   /**
@@ -2222,6 +2634,7 @@ export class YattaDB {
     this.schema = options.schema ?? {};
     this.relations = options.relations ?? {};
     this.debug = options.debug ?? false;
+    this.dbSearchSynonyms = normalizeSynonyms(options.searchSynonyms);
 
     this.applyPragmas();
 
@@ -2670,6 +3083,11 @@ export class YattaDB {
           for (const idx of indexSqls) this._sqlite.run(idx);
         }
 
+        // Full-text indexes are built after the base tables exist, in the
+        // same transaction, so a fresh database and an upgraded one (a new
+        // .searchable() column on an existing table) both end up indexed.
+        this.syncFtsTables();
+
         const violations = this._sqlite.query("PRAGMA foreign_key_check;").all();
         if (violations.length > 0) {
           throw new YattaError(`Foreign key integrity check failed after schema sync: ${JSON.stringify(violations)}`);
@@ -2869,6 +3287,359 @@ export class YattaDB {
     return `'${String(def.defaultValue).replace(/'/g, "''")}'`;
   }
 
+  // ── Full-Text Search (FTS5) ──────────────────────────────────────────────
+  //
+  // One standalone FTS5 table per searchable base table, named `_fts_<table>`,
+  // holding the searchable columns plus `__yatta_pk` (UNINDEXED, so the key
+  // itself is never searchable) storing the base row's primary key as text.
+  // Standalone, not an FTS5 content table, because Yatta primary keys can be
+  // text UUIDs and FTS5 content tables only track an integer rowid.
+  //
+  // Sync: Table write paths (insert, update, updateById, delete, and upsert
+  // through them) maintain the index on the same connection, so a transaction
+  // rollback rolls index writes back with the rows. Writes that bypass Table
+  // (raw SQL, exec, a copied database file) do NOT sync the index — that is
+  // what rebuildSearchIndex() is for, and what ensureSearchIndex() repairs
+  // for missing rows when counts disagree.
+
+  /** FTS5 table name for a base table. */
+  ftsTableName(tableName: string): string {
+    return `_fts_${tableName}`;
+  }
+
+  /** Searchable column names for a table, in schema order. Empty when the table is not searchable. */
+  searchableColumns(tableName: string): string[] {
+    const tableDef = this.schema[tableName];
+    if (!tableDef) return [];
+    return Object.entries(tableDef)
+      .filter(([, builder]) => builder.def.isSearchable)
+      .map(([colName]) => colName);
+  }
+
+  /** Database-level synonym map, normalized (keys lowercased, values tokenized). */
+  searchSynonyms(): Map<string, string[][]> {
+    return new Map(this.dbSearchSynonyms);
+  }
+
+  /** Whether the FTS table for a base table exists right now. */
+  ftsTableExists(tableName: string): boolean {
+    const row = this.run(
+      `SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1;`,
+      [this.ftsTableName(tableName)],
+      "get",
+    ) as { ok: number } | null;
+    return row !== null && row !== undefined;
+  }
+
+  private baseTableExists(tableName: string): boolean {
+    const row = this._sqlite
+      .query(`SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1;`)
+      .get(tableName) as { ok: number } | null;
+    return row !== null && row !== undefined;
+  }
+
+  private ftsVocabTableName(tableName: string): string {
+    return `_fts_${tableName}_vocab`;
+  }
+
+  private createFtsTable(tableName: string, cols: string[]): void {
+    const fts = this.ftsTableName(tableName).replace(/"/g, '""');
+    const colSql = cols.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
+    try {
+      this._sqlite.run(`CREATE VIRTUAL TABLE "${fts}" USING fts5(${colSql}, "__yatta_pk" UNINDEXED, tokenize='unicode61');`);
+    } catch (err: any) {
+      // Bun's docs do not promise FTS5: on Linux/Windows Bun links its own
+      // SQLite build, but on macOS it uses Apple's build, whose compile
+      // options Bun does not control. A build without FTS5 must fail with
+      // this explanation, not SQLite's bare "no such module: fts5".
+      if (String(err?.message ?? err).includes("no such module")) {
+        throw new YattaError(
+          `Full-text search needs SQLite's FTS5 module, which this Bun/SQLite build does not include. ` +
+            `Search cannot be used with this build; every other Yatta feature works without it.`,
+        );
+      }
+      throw err;
+    }
+    // Vocabulary table for typo correction: distinct indexed terms, read at
+    // query time. Best effort — if it cannot be created, search falls back
+    // to scanning the base table's searchable values for terms.
+    try {
+      const vocab = this.ftsVocabTableName(tableName).replace(/"/g, '""');
+      this._sqlite.run(`CREATE VIRTUAL TABLE "${vocab}" USING fts5vocab("${fts}", 'col');`);
+    } catch {
+      // Vocab is an optimization, not the index itself. Search still works.
+    }
+  }
+
+  private dropFtsTable(tableName: string): void {
+    const vocab = this.ftsVocabTableName(tableName).replace(/"/g, '""');
+    const fts = this.ftsTableName(tableName).replace(/"/g, '""');
+    this._sqlite.run(`DROP TABLE IF EXISTS "${vocab}";`);
+    this._sqlite.run(`DROP TABLE IF EXISTS "${fts}";`);
+  }
+
+  private populateFtsTable(tableName: string, cols: string[]): void {
+    const fts = this.ftsTableName(tableName).replace(/"/g, '""');
+    const base = tableName.replace(/"/g, '""');
+    const pkCol = this.tablePkColumn(tableName).replace(/"/g, '""');
+    const colSql = cols.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
+    const selectCols = cols.map((c) => `COALESCE("${c.replace(/"/g, '""')}", '')`).join(", ");
+    this._sqlite.run(
+      `INSERT INTO "${fts}" (${colSql}, "__yatta_pk") SELECT ${selectCols}, CAST("${pkCol}" AS TEXT) FROM "${base}";`,
+    );
+  }
+
+  private tablePkColumn(tableName: string): string {
+    return this.pkColumnName(tableName) ?? "id";
+  }
+
+  /**
+   * A searchable table's primary key column, or null when the table has
+   * none. Search maps index entries back to rows through the key, so a
+   * keyless table cannot be searched — and must not crash schema sync
+   * trying. Sync skips such tables; search and rebuild refuse them plainly.
+   */
+  private pkColumnName(tableName: string): string | null {
+    const tableDef = this.schema[tableName];
+    if (!tableDef) return null;
+    for (const [colName, builder] of Object.entries(tableDef)) {
+      if (builder.def.primaryKey) return colName;
+    }
+    return "id" in tableDef ? "id" : null;
+  }
+
+  private ftsColumnNames(tableName: string): string[] {
+    const fts = this.ftsTableName(tableName).replace(/"/g, '""');
+    try {
+      return (this._sqlite.query(`PRAGMA table_info("${fts}")`).all() as any[]).map((c) => c.name);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Creates or repairs every searchable table's FTS index, inside the
+   * schema-sync transaction. A table whose FTS columns no longer match its
+   * searchable columns (a `.searchable()` added or removed) is rebuilt; a
+   * matching index is reconciled — orphan entries dropped, missing rows
+   * inserted — so rows written while the index was absent come back.
+   * Changed text on an existing row is NOT repaired here; only a full
+   * rebuild sees it. See rebuildSearchIndex().
+   */
+  private syncFtsTables(): void {
+    for (const tableName of Object.keys(this.schema)) {
+      const cols = this.searchableColumns(tableName);
+      if (cols.length === 0) continue;
+      if (!this.baseTableExists(tableName)) continue;
+      // A keyless table cannot be searched (no key to map hits back to
+      // rows), so sync skips it instead of crashing schema setup. Search
+      // and rebuild refuse it plainly when actually attempted.
+      if (this.pkColumnName(tableName) === null) continue;
+      const existing = this.ftsColumnNames(tableName);
+      const expected = [...cols, "__yatta_pk"];
+      const matches = existing.length === expected.length && expected.every((c) => existing.includes(c));
+      if (!matches) {
+        this.dropFtsTable(tableName);
+        this.createFtsTable(tableName, cols);
+        this.populateFtsTable(tableName, cols);
+        this.ftsReady.add(tableName);
+        continue;
+      }
+      const fts = this.ftsTableName(tableName).replace(/"/g, '""');
+      const base = tableName.replace(/"/g, '""');
+      const pkCol = this.tablePkColumn(tableName).replace(/"/g, '""');
+      const colSql = cols.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
+      const selectCols = cols.map((c) => `COALESCE("${c.replace(/"/g, '""')}", '')`).join(", ");
+      this._sqlite.run(
+        `DELETE FROM "${fts}" WHERE "__yatta_pk" NOT IN (SELECT CAST("${pkCol}" AS TEXT) FROM "${base}");`,
+      );
+      this._sqlite.run(
+        `INSERT INTO "${fts}" (${colSql}, "__yatta_pk") ` +
+          `SELECT ${selectCols}, CAST(b."${pkCol}" AS TEXT) FROM "${base}" AS b ` +
+          `WHERE NOT EXISTS (SELECT 1 FROM "${fts}" WHERE "__yatta_pk" = CAST(b."${pkCol}" AS TEXT));`,
+      );
+      this.ftsReady.add(tableName);
+    }
+  }
+
+  /**
+   * Makes sure one table's FTS index exists and matches its searchable
+   * columns, rebuilding when it does not. Called by `search()` so a first
+   * search never fails on a missing index. Also rebuilds when the row counts
+   * disagree — the cheap signal that rows were added or removed outside the
+   * Table write paths.
+   */
+  ensureSearchIndex(tableName: string): void {
+    const cols = this.searchableColumns(tableName);
+    if (cols.length === 0) return;
+    if (!this.baseTableExists(tableName)) {
+      throw new YattaError(
+        `Table "${tableName}" does not exist in this database, so it cannot be searched. ` +
+          `Create it first (a schema with autoMigrate creates tables on open).`,
+      );
+    }
+    if (this.pkColumnName(tableName) === null) {
+      throw new YattaError(
+        `Table "${tableName}" has no primary key column, so search cannot map index entries back to rows. ` +
+          `Add col.id() or col.uuid() to search it.`,
+      );
+    }
+    const existing = this.ftsColumnNames(tableName);
+    const expected = [...cols, "__yatta_pk"];
+    const matches = existing.length === expected.length && expected.every((c) => existing.includes(c));
+    if (!matches) {
+      this.rebuildSearchIndex(tableName);
+      return;
+    }
+    this.ftsReady.add(tableName);
+    try {
+      const fts = this.ftsTableName(tableName).replace(/"/g, '""');
+      const base = tableName.replace(/"/g, '""');
+      const ftsCount = (this._sqlite.query(`SELECT COUNT(*) AS c FROM "${fts}"`).get() as { c: number }).c;
+      const baseCount = (this._sqlite.query(`SELECT COUNT(*) AS c FROM "${base}"`).get() as { c: number }).c;
+      if (ftsCount !== baseCount) this.rebuildSearchIndex(tableName);
+    } catch {
+      // Counting is a repair heuristic, not the search itself. A failure
+      // here must not mask the search that follows.
+    }
+  }
+
+  /**
+   * Rebuilds the full-text index from current rows — the escape hatch for
+   * rows changed outside the Table write paths. With no argument, rebuilds
+   * every searchable table. A table with no searchable columns is refused:
+   * there is nothing to rebuild.
+   */
+  rebuildSearchIndex(tableName?: string): void {
+    const targets = tableName ? [tableName] : Object.keys(this.schema);
+    for (const target of targets) {
+      const cols = this.searchableColumns(target);
+      if (cols.length === 0) {
+        throw new YattaError(
+          `Table "${target}" has no searchable columns, so there is no search index to rebuild. ` +
+            `Mark a text column with .searchable() first.`,
+        );
+      }
+      if (!this.baseTableExists(target)) {
+        throw new YattaError(`Table "${target}" does not exist in this database, so its search index cannot be rebuilt.`);
+      }
+      if (this.pkColumnName(target) === null) {
+        throw new YattaError(
+          `Table "${target}" has no primary key column, so its search index cannot be rebuilt. ` +
+            `Add col.id() or col.uuid() to search it.`,
+        );
+      }
+      this.dropFtsTable(target);
+      this.createFtsTable(target, cols);
+      this.populateFtsTable(target, cols);
+      this.ftsReady.add(target);
+    }
+    this.clearStatementCache();
+  }
+
+  /**
+   * The indexed vocabulary for a table: every distinct term the FTS index
+   * holds, used for typo correction. Read from the fts5vocab table when it
+   * exists; otherwise scanned from the base table's searchable values.
+   * The scan fallback is slower on large tables, but it is only the
+   * correction dictionary — ranking still comes from FTS5 itself.
+   */
+  ftsVocabulary(tableName: string): Set<string> {
+    const vocab = this.ftsVocabTableName(tableName);
+    const vocabExists = this.run(
+      `SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1;`,
+      [vocab],
+      "get",
+    ) as { ok: number } | null;
+    if (vocabExists) {
+      try {
+        const qvocab = `"${vocab.replace(/"/g, '""')}"`;
+        const rows = this.run(`SELECT DISTINCT term FROM ${qvocab};`, [], "all") as { term: string }[];
+        return new Set(rows.map((r) => r.term));
+      } catch {
+        // Fall through to the scan below.
+      }
+    }
+    const cols = this.searchableColumns(tableName);
+    const terms = new Set<string>();
+    if (cols.length === 0) return terms;
+    const base = tableName.replace(/"/g, '""');
+    const colSql = cols.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
+    const rows = this.run(`SELECT ${colSql} FROM "${base}";`, [], "all") as Record<string, unknown>[];
+    for (const row of rows) {
+      for (const c of cols) {
+        const value = row[c];
+        if (typeof value === "string") {
+          for (const token of tokenizeText(value)) terms.add(token);
+        }
+      }
+    }
+    return terms;
+  }
+
+  /**
+   * Replaces one row's FTS entry with its current searchable text. Silent
+   * when the index does not exist yet: the next search rebuilds it from the
+   * base rows, so a skipped write here loses nothing.
+   */
+  ftsUpsert(tableName: string, pk: string | number, row: Record<string, any>): void {
+    const cols = this.searchableColumns(tableName);
+    if (cols.length === 0) return;
+    if (!this.ftsReady.has(tableName)) {
+      if (!this.ftsTableExists(tableName)) return;
+      this.ftsReady.add(tableName);
+    }
+    const fts = this.ftsTableName(tableName).replace(/"/g, '""');
+    const pkText = String(pk);
+    try {
+      this.run(`DELETE FROM "${fts}" WHERE "__yatta_pk" = ?;`, [pkText], "run");
+      const colSql = cols.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
+      const placeholders = cols.map(() => "?").join(", ");
+      const values = cols.map((c) => {
+        const v = row[c];
+        return v === null || v === undefined ? "" : String(v);
+      });
+      this.run(
+        `INSERT INTO "${fts}" (${colSql}, "__yatta_pk") VALUES (${placeholders}, ?);`,
+        [...values, pkText],
+        "run",
+      );
+    } catch (err: any) {
+      // The cache can go stale when the index is dropped outside this
+      // instance's knowledge (restore of an older backup, a manual DROP).
+      // A missing index is a repair-on-search situation, never a reason for
+      // an insert to fail: drop the stale cache entry and let the next
+      // search rebuild. Any other error still propagates.
+      if (String(err?.message ?? err).includes("no such table")) {
+        this.ftsReady.delete(tableName);
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /** Removes one row's FTS entry. Silent when the index does not exist yet. */
+  ftsDelete(tableName: string, pk: string | number): void {
+    const cols = this.searchableColumns(tableName);
+    if (cols.length === 0) return;
+    if (!this.ftsReady.has(tableName)) {
+      if (!this.ftsTableExists(tableName)) return;
+      this.ftsReady.add(tableName);
+    }
+    const fts = this.ftsTableName(tableName).replace(/"/g, '""');
+    try {
+      this.run(`DELETE FROM "${fts}" WHERE "__yatta_pk" = ?;`, [String(pk)], "run");
+    } catch (err: any) {
+      // Same stale-cache reasoning as ftsUpsert: a missing index must not
+      // break a delete. Any other error still propagates.
+      if (String(err?.message ?? err).includes("no such table")) {
+        this.ftsReady.delete(tableName);
+        return;
+      }
+      throw err;
+    }
+  }
+
   // ── Atomic Backup & Validated Restore ─────────────────────────────────────
 
   /**
@@ -2990,6 +3761,12 @@ export class YattaDB {
     } finally {
       this._sqlite = new Database(this.path, { create: true });
       this.applyPragmas();
+      // The restored file may predate the search index (or carry a
+      // different one). Cached "index exists" knowledge from the old file
+      // must not survive: the next write re-checks, and the next search
+      // rebuilds if needed, instead of writing into a table that is gone.
+      this.ftsReady.clear();
+      this.clearStatementCache();
     }
 
     return { success: true };
