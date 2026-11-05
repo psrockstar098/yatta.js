@@ -30,6 +30,10 @@
  *    - `.count({ where })`, `.paginate({ page, pageSize })`: Aggregates & pagination.
  *  - `db.transaction(fn)`: Immediate or deferred transaction with nested savepoints.
  *  - `db.backup(destPath)` & `db.restore(sourcePath)`: Online safe backup & restore.
+ *  - `db.vectors`: Vector search (see `src/types/vectors.ts`): store embeddings
+ *    and search by cosine similarity, backed by sqlite-vec when a `vec0`
+ *    binary is loadable, plain SQLite otherwise. Text embeddings are
+ *    optional and lazy (see `src/types/vectors_embed.ts`).
  *
  *  MODULE AUGMENTATION:
  *  ```ts
@@ -76,6 +80,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import type { OutboxEntry, RecordOutboxInput } from "./outbox";
+import type { VectorStore } from "./vectors";
 
 // ──────────────────────────────────────────────────────────────────────────
 // 0. Global Schema Registry & Utility Types
@@ -2642,6 +2647,8 @@ export class YattaDB {
   private dbSearchSynonyms: Map<string, string[][]>;
   /** Searchable tables whose FTS table is known to exist, so writes skip a lookup. */
   private ftsReady = new Set<string>();
+  /** Lazily created vector store (see `vectors`). Null until first access. */
+  private vectorStore: VectorStore | null = null;
   private static readonly MAX_STMT_CACHE = 500;
 
   /**
@@ -2867,6 +2874,27 @@ export class YattaDB {
     const { ensureOutboxTable, recordOutbox: recordOutboxRow } = require("./outbox");
     ensureOutboxTable(this);
     return recordOutboxRow(this, input);
+  }
+
+  /**
+   * Vector search over this database file: `db.vectors.search(...)`.
+   *
+   * Lazy like the outbox: the vectors module is loaded only on first
+   * access, and no extension is loaded and no table created until the
+   * first vector call. A database that never touches vectors pays
+   * nothing for them. Note this reserves the table name "vectors", the
+   * same way other YattaDB methods reserve theirs.
+   *
+   * The store tracks the connection it resolved its backend for, so a
+   * `restore()` that swaps the connection re-resolves (and re-loads
+   * vec0, when applicable) on next use instead of trusting the old one.
+   */
+  get vectors(): VectorStore {
+    if (this.vectorStore === null) {
+      const { VectorStore: VectorStoreClass } = require("./vectors");
+      this.vectorStore = new VectorStoreClass(this);
+    }
+    return this.vectorStore!;
   }
 
   // ── Raw SQL Suite ────────────────────────────────────────────────────────

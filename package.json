@@ -42,6 +42,8 @@
     },
     "./api": "./src/types/index.ts",
     "./db": "./src/types/db.ts",
+    "./vectors": "./src/types/vectors.ts",
+    "./vectors/embed": "./src/types/vectors_embed.ts",
     "./auth": "./src/types/auth.ts",
     "./jobs": "./src/types/job.ts",
     "./cache": "./src/types/cache_queue.ts",
