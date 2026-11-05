@@ -254,6 +254,173 @@ describe("API & HTTP Layer", () => {
       expect(await textRes.text()).toBe("Plain text content");
     });
 
+    // Perf round 3, batch 1: API.json / API.text fast path (plain-object
+    // headers, no `new Headers()` on the common call). These pin the exact
+    // observable behavior the fast path must preserve.
+    it("should keep the exact charset-suffixed Content-Type on every init shape", async () => {
+      const jsonInits: ResponseInit[] = [
+        {},
+        { status: 201 },
+        { status: 404, statusText: "Custom Not Found" },
+        { headers: { "X-Custom": "abc" } },
+        { headers: new Headers({ "X-Custom": "abc" }) },
+        { headers: [["X-Custom", "abc"]] },
+      ];
+      for (const init of jsonInits) {
+        const res = API.json({ ok: true }, init);
+        expect(res.headers.get("Content-Type")).toBe(
+          "application/json; charset=utf-8",
+        );
+        expect(await res.json()).toEqual({ ok: true });
+      }
+      const textInits: ResponseInit[] = [
+        {},
+        { status: 201 },
+        { headers: { "X-Custom": "abc" } },
+        { headers: new Headers({ "X-Custom": "abc" }) },
+        { headers: [["X-Custom", "abc"]] },
+      ];
+      for (const init of textInits) {
+        const res = API.text("hello", init);
+        expect(res.headers.get("Content-Type")).toBe(
+          "text/plain; charset=utf-8",
+        );
+        expect(await res.text()).toBe("hello");
+      }
+    });
+
+    it("should never overwrite a caller-provided Content-Type", () => {
+      const cases: [ResponseInit, string][] = [
+        [{ headers: { "Content-Type": "text/html" } }, "text/html"],
+        [{ headers: { "content-type": "application/vnd.api+json" } }, "application/vnd.api+json"],
+        [{ headers: { "CONTENT-TYPE": "text/csv" } }, "text/csv"],
+        [
+          { headers: new Headers({ "Content-Type": "text/html" }) },
+          "text/html",
+        ],
+        [
+          { headers: [["Content-Type", "text/xml"]] },
+          "text/xml",
+        ],
+      ];
+      for (const [init, want] of cases) {
+        expect(API.json({ ok: true }, init).headers.get("Content-Type")).toBe(
+          want,
+        );
+        expect(API.text("hi", init).headers.get("Content-Type")).toBe(want);
+      }
+      // No default leak: a caller Content-Type on one call must not affect
+      // the next default call.
+      expect(API.json({ ok: true }).headers.get("Content-Type")).toBe(
+        "application/json; charset=utf-8",
+      );
+    });
+
+    it("should preserve status, statusText and custom headers byte-identically", async () => {
+      const res = API.json(
+        { created: true },
+        {
+          status: 201,
+          statusText: "Created Thing",
+          headers: {
+            "X-Request-Id": "abc-123",
+            "Cache-Control": "no-store",
+          },
+        },
+      );
+      expect(res.status).toBe(201);
+      expect(res.statusText).toBe("Created Thing");
+      expect(res.headers.get("X-Request-Id")).toBe("abc-123");
+      expect(res.headers.get("Cache-Control")).toBe("no-store");
+      expect(await res.json()).toEqual({ created: true });
+
+      const dup = API.json(
+        { ok: true },
+        {
+          headers: [
+            ["Set-Cookie", "a=1"],
+            ["Set-Cookie", "b=2"],
+          ],
+        },
+      );
+      expect(dup.headers.getSetCookie()).toEqual(["a=1", "b=2"]);
+
+      const textRes = API.text("not found", {
+        status: 404,
+        statusText: "Nothing Here",
+        headers: { "X-Trace": "t-1" },
+      });
+      expect(textRes.status).toBe(404);
+      expect(textRes.statusText).toBe("Nothing Here");
+      expect(textRes.headers.get("X-Trace")).toBe("t-1");
+      expect(await textRes.text()).toBe("not found");
+    });
+
+    it("should round-trip unicode bodies in json and text", async () => {
+      const data = { msg: "héllo wörld — ünïcode ✓ 𝄞", emoji: "🎉" };
+      const jsonRes = API.json(data);
+      expect(await jsonRes.json()).toEqual(data);
+      expect(jsonRes.headers.get("Content-Type")).toBe(
+        "application/json; charset=utf-8",
+      );
+      const textRes = API.text("héllo wörld — ünïcode ✓ 𝄞 🎉");
+      expect(await textRes.text()).toBe("héllo wörld — ünïcode ✓ 𝄞 🎉");
+    });
+
+    it("should serialise non-object JSON values", async () => {
+      expect(await API.json(null).json()).toBeNull();
+      expect(await API.json("just a string").json()).toBe("just a string");
+      expect(await API.json(42).json()).toBe(42);
+      expect(await API.json(true).json()).toBe(true);
+      expect(await API.json([1, "two", null]).json()).toEqual([
+        1,
+        "two",
+        null,
+      ]);
+      // JSON.stringify(undefined) is undefined: empty 200 body, no throw.
+      const undef = API.json(undefined);
+      expect(undef.status).toBe(200);
+      expect(await undef.text()).toBe("");
+    });
+
+    it("should reject header injection exactly as before and never mutate caller headers", () => {
+      // CRLF in a header value or name must still throw (the Response
+      // constructor enforces this; the fast path must not swallow it).
+      expect(() =>
+        API.json({ ok: true }, { headers: { "X-Evil": "a\r\nInjected: 1" } }),
+      ).toThrow(TypeError);
+      expect(() =>
+        API.text("hi", { headers: { "X-Evil": "a\r\nInjected: 1" } }),
+      ).toThrow(TypeError);
+      expect(() =>
+        API.json({ ok: true }, { headers: { "X-Evil\r\nInjected": "1" } }),
+      ).toThrow(TypeError);
+      // `new Headers(null)` throws in Bun; the fast path must not turn a
+      // null headers value into a silent default.
+      expect(() =>
+        API.json(
+          { ok: true },
+          { headers: null as unknown as HeadersInit },
+        ),
+      ).toThrow(TypeError);
+
+      // Caller headers are never mutated by the call ...
+      const obj = { "X-M": "1" };
+      API.json({ ok: true }, { headers: obj });
+      expect(obj).toEqual({ "X-M": "1" });
+      const pairs: [string, string][] = [["X-M", "1"]];
+      API.json({ ok: true }, { headers: pairs });
+      expect(pairs).toEqual([["X-M", "1"]]);
+      // ... and mutating the caller's Headers afterwards must not change
+      // the response that was already built.
+      const h = new Headers({ "X-M": "1" });
+      const res = API.json({ ok: true }, { headers: h });
+      h.set("X-M", "MUTATED");
+      h.set("X-New", "yes");
+      expect(res.headers.get("X-M")).toBe("1");
+      expect(res.headers.get("X-New")).toBeNull();
+    });
+
     it("should parse query parameters accurately", () => {
       const req = new Request(
         "http://localhost/search?q=bun&page=2&filter=active",
