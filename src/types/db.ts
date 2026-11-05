@@ -1613,7 +1613,8 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * - The query is tokenized before it reaches FTS5, so FTS5 operators,
    *   wildcards, and column prefixes typed into the query are treated as
    *   words or dropped — never as syntax. Search input cannot inject SQL
-   *   or FTS5 query syntax.
+   *   or FTS5 query syntax. Operator words (`and`/`or`/`not`) are dropped
+   *   and every remaining term is ANDed, so there is no OR search in v1.
    * - `rank` on each hit is the raw `bm25()` value: negative, smaller is
    *   more relevant, meaningful only for ordering within this query.
    *
@@ -1657,7 +1658,12 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     const limit = options.limit !== undefined ? this.rowCount(options.limit, "limit", true) : undefined;
     const offset = options.offset !== undefined ? this.rowCount(options.offset, "offset", false) : 0;
 
-    const tokens = tokenizeText(query);
+    // FTS5 operator words carry no meaning here — the query is rebuilt from
+    // tokens, and every remaining token is ANDed. Dropping them (instead of
+    // letting "or" become an unmatchable search term) means "laptop or mouse"
+    // searches for rows matching both words, and a payload like
+    // `" OR 1=1 --` cannot smuggle operators into the MATCH expression.
+    const tokens = tokenizeText(query).filter((t) => t !== "and" && t !== "or" && t !== "not");
     if (tokens.length === 0) return [];
 
     // Creates (or repairs) the index on first use, so a table opened with
@@ -1685,7 +1691,9 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
 
     const fts = this.db.ftsTableName(this.name);
     const qfts = `"${fts.replace(/"/g, '""')}"`;
-    const limitSql = limit !== undefined ? `LIMIT ${limit}` : "";
+    // SQLite rejects a bare OFFSET with no LIMIT, so an offset-only page
+    // gets LIMIT -1 (SQLite's "no upper bound"), the same idiom findMany uses.
+    const limitSql = limit !== undefined ? `LIMIT ${limit}` : options.offset !== undefined ? "LIMIT -1" : "";
     const offsetSql = options.offset !== undefined ? `OFFSET ${offset}` : "";
     const sql = [
       `SELECT "__yatta_pk" AS pk, bm25(${qfts}) AS rank FROM ${qfts}`,
@@ -3300,7 +3308,21 @@ export class YattaDB {
   private createFtsTable(tableName: string, cols: string[]): void {
     const fts = this.ftsTableName(tableName).replace(/"/g, '""');
     const colSql = cols.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
-    this._sqlite.run(`CREATE VIRTUAL TABLE "${fts}" USING fts5(${colSql}, "__yatta_pk" UNINDEXED, tokenize='unicode61');`);
+    try {
+      this._sqlite.run(`CREATE VIRTUAL TABLE "${fts}" USING fts5(${colSql}, "__yatta_pk" UNINDEXED, tokenize='unicode61');`);
+    } catch (err: any) {
+      // Bun's docs do not promise FTS5: on Linux/Windows Bun links its own
+      // SQLite build, but on macOS it uses Apple's build, whose compile
+      // options Bun does not control. A build without FTS5 must fail with
+      // this explanation, not SQLite's bare "no such module: fts5".
+      if (String(err?.message ?? err).includes("no such module")) {
+        throw new YattaError(
+          `Full-text search needs SQLite's FTS5 module, which this Bun/SQLite build does not include. ` +
+            `Search cannot be used with this build; every other Yatta feature works without it.`,
+        );
+      }
+      throw err;
+    }
     // Vocabulary table for typo correction: distinct indexed terms, read at
     // query time. Best effort — if it cannot be created, search falls back
     // to scanning the base table's searchable values for terms.
@@ -3331,13 +3353,22 @@ export class YattaDB {
   }
 
   private tablePkColumn(tableName: string): string {
+    return this.pkColumnName(tableName) ?? "id";
+  }
+
+  /**
+   * A searchable table's primary key column, or null when the table has
+   * none. Search maps index entries back to rows through the key, so a
+   * keyless table cannot be searched — and must not crash schema sync
+   * trying. Sync skips such tables; search and rebuild refuse them plainly.
+   */
+  private pkColumnName(tableName: string): string | null {
     const tableDef = this.schema[tableName];
-    if (tableDef) {
-      for (const [colName, builder] of Object.entries(tableDef)) {
-        if (builder.def.primaryKey) return colName;
-      }
+    if (!tableDef) return null;
+    for (const [colName, builder] of Object.entries(tableDef)) {
+      if (builder.def.primaryKey) return colName;
     }
-    return "id";
+    return "id" in tableDef ? "id" : null;
   }
 
   private ftsColumnNames(tableName: string): string[] {
@@ -3363,6 +3394,10 @@ export class YattaDB {
       const cols = this.searchableColumns(tableName);
       if (cols.length === 0) continue;
       if (!this.baseTableExists(tableName)) continue;
+      // A keyless table cannot be searched (no key to map hits back to
+      // rows), so sync skips it instead of crashing schema setup. Search
+      // and rebuild refuse it plainly when actually attempted.
+      if (this.pkColumnName(tableName) === null) continue;
       const existing = this.ftsColumnNames(tableName);
       const expected = [...cols, "__yatta_pk"];
       const matches = existing.length === expected.length && expected.every((c) => existing.includes(c));
@@ -3406,6 +3441,12 @@ export class YattaDB {
           `Create it first (a schema with autoMigrate creates tables on open).`,
       );
     }
+    if (this.pkColumnName(tableName) === null) {
+      throw new YattaError(
+        `Table "${tableName}" has no primary key column, so search cannot map index entries back to rows. ` +
+          `Add col.id() or col.uuid() to search it.`,
+      );
+    }
     const existing = this.ftsColumnNames(tableName);
     const expected = [...cols, "__yatta_pk"];
     const matches = existing.length === expected.length && expected.every((c) => existing.includes(c));
@@ -3444,6 +3485,12 @@ export class YattaDB {
       }
       if (!this.baseTableExists(target)) {
         throw new YattaError(`Table "${target}" does not exist in this database, so its search index cannot be rebuilt.`);
+      }
+      if (this.pkColumnName(target) === null) {
+        throw new YattaError(
+          `Table "${target}" has no primary key column, so its search index cannot be rebuilt. ` +
+            `Add col.id() or col.uuid() to search it.`,
+        );
       }
       this.dropFtsTable(target);
       this.createFtsTable(target, cols);
@@ -3507,18 +3554,31 @@ export class YattaDB {
     }
     const fts = this.ftsTableName(tableName).replace(/"/g, '""');
     const pkText = String(pk);
-    this.run(`DELETE FROM "${fts}" WHERE "__yatta_pk" = ?;`, [pkText], "run");
-    const colSql = cols.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
-    const placeholders = cols.map(() => "?").join(", ");
-    const values = cols.map((c) => {
-      const v = row[c];
-      return v === null || v === undefined ? "" : String(v);
-    });
-    this.run(
-      `INSERT INTO "${fts}" (${colSql}, "__yatta_pk") VALUES (${placeholders}, ?);`,
-      [...values, pkText],
-      "run",
-    );
+    try {
+      this.run(`DELETE FROM "${fts}" WHERE "__yatta_pk" = ?;`, [pkText], "run");
+      const colSql = cols.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
+      const placeholders = cols.map(() => "?").join(", ");
+      const values = cols.map((c) => {
+        const v = row[c];
+        return v === null || v === undefined ? "" : String(v);
+      });
+      this.run(
+        `INSERT INTO "${fts}" (${colSql}, "__yatta_pk") VALUES (${placeholders}, ?);`,
+        [...values, pkText],
+        "run",
+      );
+    } catch (err: any) {
+      // The cache can go stale when the index is dropped outside this
+      // instance's knowledge (restore of an older backup, a manual DROP).
+      // A missing index is a repair-on-search situation, never a reason for
+      // an insert to fail: drop the stale cache entry and let the next
+      // search rebuild. Any other error still propagates.
+      if (String(err?.message ?? err).includes("no such table")) {
+        this.ftsReady.delete(tableName);
+        return;
+      }
+      throw err;
+    }
   }
 
   /** Removes one row's FTS entry. Silent when the index does not exist yet. */
@@ -3530,7 +3590,17 @@ export class YattaDB {
       this.ftsReady.add(tableName);
     }
     const fts = this.ftsTableName(tableName).replace(/"/g, '""');
-    this.run(`DELETE FROM "${fts}" WHERE "__yatta_pk" = ?;`, [String(pk)], "run");
+    try {
+      this.run(`DELETE FROM "${fts}" WHERE "__yatta_pk" = ?;`, [String(pk)], "run");
+    } catch (err: any) {
+      // Same stale-cache reasoning as ftsUpsert: a missing index must not
+      // break a delete. Any other error still propagates.
+      if (String(err?.message ?? err).includes("no such table")) {
+        this.ftsReady.delete(tableName);
+        return;
+      }
+      throw err;
+    }
   }
 
   // ── Atomic Backup & Validated Restore ─────────────────────────────────────
@@ -3654,6 +3724,12 @@ export class YattaDB {
     } finally {
       this._sqlite = new Database(this.path, { create: true });
       this.applyPragmas();
+      // The restored file may predate the search index (or carry a
+      // different one). Cached "index exists" knowledge from the old file
+      // must not survive: the next write re-checks, and the next search
+      // rebuilds if needed, instead of writing into a table that is gone.
+      this.ftsReady.clear();
+      this.clearStatementCache();
     }
 
     return { success: true };
