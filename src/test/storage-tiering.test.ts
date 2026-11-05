@@ -19,6 +19,8 @@ import {
   createTieredStorage,
   createTieredStorageFromManager,
   createTieringJobHandler,
+  loadTieringConfig,
+  parseTieringConfig,
   scheduleTiering,
   type TieredStorage,
 } from "../types/storage_tiering";
@@ -562,6 +564,50 @@ describe("storage tiering", () => {
     expect(await tiered.file("signed.txt").sign()).toContain("fake-hot.local/signed.txt");
     await tiered.runOnce(10_000);
     expect(await tiered.file("signed.txt").sign()).toContain("fake-cold.local/signed.txt");
+  });
+
+  it("hand-edited tiering config parses as JSON5 and as plain JSON", async () => {
+    const parsed = parseTieringConfig(`
+      // Hand-edited: stale after a month, promote back when hot again.
+      {
+        staleAfter: '30d',
+        promoteBack: true,
+        promoteAfterReads: 3,
+        promoteWindowMs: 86400000,
+      }
+    `);
+    expect(parsed).toEqual({
+      staleAfter: "30d",
+      promoteBack: true,
+      promoteAfterReads: 3,
+      promoteWindowMs: 86400000,
+    });
+    expect(parseTieringConfig('{"staleAfterMs": 5000}')).toEqual({
+      staleAfterMs: 5000,
+    });
+    // A parsed config drives the real constructor.
+    const { hot, cold } = makeTiered();
+    const tiered = createTieredStorage(hot, cold, parsed);
+    expect(tiered.promoteBack).toBe(true);
+    expect(tiered.staleAfterMs).toBe(30 * 24 * 60 * 60 * 1000);
+  });
+
+  it("tiering config rejects unknown fields, wrong types, and bad ranges", () => {
+    expect(() => parseTieringConfig('{ verify: "custom" }')).toThrow(/Unknown tiering config field "verify"/);
+    expect(() => parseTieringConfig('{ promoteBack: "yes" }')).toThrow(/promoteBack.*boolean/);
+    expect(() => parseTieringConfig("{ staleAfterMs: -1 }")).toThrow(/staleAfterMs/);
+    expect(() => parseTieringConfig("{ promoteAfterReads: 0 }")).toThrow(/promoteAfterReads/);
+    expect(() => parseTieringConfig('{ staleAfter: "soon" }')).toThrow();
+    expect(() => parseTieringConfig("[1, 2]")).toThrow(/must be a JSON object/);
+    expect(() => parseTieringConfig("not json at all")).toThrow();
+  });
+
+  it("tiering config loads from a JSON5 file", async () => {
+    const dir = tempDir("config");
+    const file = path.join(dir, "tiering.json5");
+    fs.writeFileSync(file, "{ staleAfterMs: 2500, // 2.5 seconds\n }");
+    const loaded = await loadTieringConfig(file);
+    expect(loaded).toEqual({ staleAfterMs: 2500 });
   });
 
   it("plain manager save keeps working, and no tiering logging happens on a normal run", async () => {

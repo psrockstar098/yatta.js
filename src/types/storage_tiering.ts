@@ -24,6 +24,12 @@
  * - S3 credentials come from the disk configuration (which the app fills
  *   from the environment before Bun starts). Tiering never reads, logs,
  *   or prints a credential.
+ * - Hand-edited tiering config files are read with `parseTieringConfig`
+ *   / `loadTieringConfig`, which accept JSON5 (comments, trailing
+ *   commas, unquoted keys) as well as plain JSON. Tiering generates no
+ *   code from strings anywhere, so it runs unchanged under Bun's
+ *   `--disallow-code-generation-from-strings=strict` flag, and it uses
+ *   no `bun:ffi`, so it runs unchanged under `--no-ffi-cc`.
  *
  * Two Bun S3 facts shape this code, both from bun.sh/docs/runtime/s3:
  * - `S3Client.file()` is a lazy reference that makes no network request
@@ -766,6 +772,123 @@ export function createTieredStorageFromManager(
   // bridges the static narrowing.
   const diskByName = (name: string) => manager.disk(name as never);
   return new TieredStorage(diskByName(hotName), diskByName(coldName), config);
+}
+
+/**
+ * Fields a hand-edited tiering config file may set. Only the
+ * serializable fields are allowed: functions (a custom `verify`, a
+ * clock, callbacks, a tracker) cannot come from a file, so they are
+ * rejected as unknown fields rather than silently ignored.
+ */
+const TIERING_CONFIG_FILE_KEYS = new Set([
+  "staleAfter",
+  "staleAfterMs",
+  "promoteBack",
+  "promoteAfterReads",
+  "promoteWindowMs",
+  "hotDisk",
+  "coldDisk",
+]);
+
+function parseJson5(text: string): unknown {
+  // Bun.JSON5 is feature-detected, not assumed: the cast keeps this
+  // compiling against older @types/bun that predates it, and plain JSON
+  // configs still parse anywhere through the JSON fallback. JSON5 is a
+  // superset of JSON, so when Bun.JSON5 exists it handles both.
+  const json5 = (
+    Bun as unknown as {
+      JSON5?: { parse: (text: string) => unknown };
+    }
+  ).JSON5;
+  if (json5) return json5.parse(text);
+  return JSON.parse(text);
+}
+
+/**
+ * Parse tiering config from hand-edited text, accepting JSON5: comments,
+ * trailing commas, unquoted keys, and single-quoted strings, as well as
+ * plain JSON. A leading byte-order mark is stripped, since editors add
+ * one to hand-edited files. Unknown fields and wrong-typed values throw
+ * a StorageError naming the field, so a typo fails loudly instead of
+ * being ignored. The result feeds `createTieredStorageFromManager`
+ * directly; function-valued options still come from code, not files.
+ */
+export function parseTieringConfig(text: string): TieredFromManagerConfig {
+  const cleaned = text.replace(/^\uFEFF/, "");
+  const raw: unknown = parseJson5(cleaned);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new StorageError("Tiering config must be a JSON object");
+  }
+  const record = raw as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!TIERING_CONFIG_FILE_KEYS.has(key)) {
+      throw new StorageError(
+        `Unknown tiering config field "${key}". Allowed fields: ${[...TIERING_CONFIG_FILE_KEYS].join(", ")}`,
+      );
+    }
+  }
+  const asNumber = (key: string, value: unknown, min: number): number => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < min) {
+      throw new StorageError(
+        `Tiering config field "${key}" must be a finite number >= ${min}`,
+      );
+    }
+    return value;
+  };
+  if (record.staleAfter !== undefined) {
+    const value = record.staleAfter;
+    if (typeof value === "number") {
+      asNumber("staleAfter", value, 0);
+    } else if (typeof value === "string") {
+      // Throws a StorageError on a malformed duration string.
+      parseDuration(value as HumanTime);
+    } else {
+      throw new StorageError(
+        'Tiering config field "staleAfter" must be a duration string like "30d" or a number of seconds',
+      );
+    }
+  }
+  if (record.staleAfterMs !== undefined) {
+    asNumber("staleAfterMs", record.staleAfterMs, 0);
+  }
+  if (record.promoteBack !== undefined && typeof record.promoteBack !== "boolean") {
+    throw new StorageError('Tiering config field "promoteBack" must be a boolean');
+  }
+  if (record.promoteAfterReads !== undefined) {
+    const value = asNumber("promoteAfterReads", record.promoteAfterReads, 1);
+    if (!Number.isInteger(value)) {
+      throw new StorageError(
+        'Tiering config field "promoteAfterReads" must be a whole number',
+      );
+    }
+  }
+  if (record.promoteWindowMs !== undefined) {
+    asNumber("promoteWindowMs", record.promoteWindowMs, 0);
+  }
+  for (const key of ["hotDisk", "coldDisk"] as const) {
+    if (
+      record[key] !== undefined &&
+      (typeof record[key] !== "string" || (record[key] as string).length === 0)
+    ) {
+      throw new StorageError(
+        `Tiering config field "${key}" must be a non-empty disk name`,
+      );
+    }
+  }
+  return record as TieredFromManagerConfig;
+}
+
+/**
+ * Load tiering config from a file, accepting JSON5 as above. The path is
+ * resolved the way `Bun.file` resolves it (relative to the process
+ * working directory). An app that imports its config as a module instead
+ * (`import config from "./tiering.json5"`) needs no helper: Bun parses
+ * JSON5 modules at runtime and inlines them at bundle time.
+ */
+export async function loadTieringConfig(
+  path: string,
+): Promise<TieredFromManagerConfig> {
+  return parseTieringConfig(await Bun.file(path).text());
 }
 
 /**

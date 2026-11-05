@@ -142,6 +142,99 @@ is already local when that read returns. Keep the threshold above 1:
 promoting on a single read would bounce a file back and forth on
 every mover run.
 
+## Hand-edited config files (JSON5)
+
+Tiering config can live in a file instead of code. It accepts JSON5 —
+comments, trailing commas, unquoted keys, single-quoted strings — as
+well as plain JSON, so a hand-edited file stays friendly.
+
+```ts
+import { loadTieringConfig, createTieredStorageFromManager } from "yatta.js/storage-tiering";
+
+const tiered = createTieredStorageFromManager(storage, await loadTieringConfig("./tiering.json5"));
+```
+
+```json5
+// tiering.json5 — stale after a month, promote back when hot again.
+{
+  staleAfter: '30d',
+  promoteBack: true,
+  promoteAfterReads: 3,
+}
+```
+
+Only serializable fields are allowed (`staleAfter`, `staleAfterMs`,
+`promoteBack`, `promoteAfterReads`, `promoteWindowMs`, `hotDisk`,
+`coldDisk`). Unknown fields, wrong types, and out-of-range values
+throw naming the field, so a typo fails loudly instead of being
+ignored. Function-valued options (a custom `verify`, a clock,
+callbacks, a tracker) still come from code, never from a file. An app
+that imports its config as a module instead (`import config from
+"./tiering.json5"`) needs no helper: Bun parses JSON5 modules at
+runtime and inlines them at bundle time.
+
+## Bun runtime notes
+
+Seven Bun behaviours shape how tiering is built and run. All seven
+were checked against the docs and, where the local Bun differs,
+against the local Bun (1.4.4) as well.
+
+- **AOT compilation (`bun compile`).** Typed code compiles to faster
+  machine code; untyped code can run slower than under the JIT, and
+  `bun compile --explain` lists slow paths worst-first with a fix
+  each. The mover and tracking hot paths (`runOnce`,
+  `copyVerifyDelete`, the hash verification, the access tracker) are
+  fully typed with no `any` in them, so they are AOT-friendly. One
+  honest limit: the local Bun (1.4.4) has no `bun compile` command
+  and no `--explain` flag — those are newer than this runtime — so
+  no `--explain` report could be produced here. The guidance above
+  is what to run once the team is on a Bun that has it; nothing in
+  tiering needs restructuring for it.
+- **`--smol` and friends.** `--smol` trades speed for memory (more
+  frequent garbage collection) and is an explicit operator knob only
+  — tiering never sets it, and the mover is not run under it by
+  default. `--expose-gc` is not needed (tiering never forces a
+  collection). Tiering uses no FFI or addons, so it runs unchanged
+  under `--no-ffi-cc` and `--no-addons` (proven by test run, below).
+- **Bundler (`Bun.build()`).** The `files` map bundles from memory or
+  overrides files on disk, which is the sanctioned route for codegen
+  paths that need no temp files. Tiering has no codegen path, so it
+  uses no `files` map — inventing one would be decoration, not an
+  application. What was verified instead: the tiering module bundles
+  cleanly with `target: "bun"` (which adds the `// @bun` pragma, so
+  the runtime skips re-transpiling it).
+- **Code generation from strings — a correction.** That page is not
+  a code generator; it is the `--disallow-code-generation-from-strings`
+  security flag (`eval`/`Function` blocked, `=strict` blocking every
+  string-to-code path). Tiering generates no code from strings
+  anywhere — no `eval`, `Function`, `vm`, or `ShadowRealm` in the
+  tiering, storage, or router files — and JSON5 config parsing is
+  data parsing, not code generation, so it is unaffected. Proven:
+  the full tiering suite passes under
+  `--disallow-code-generation-from-strings=strict`.
+- **Type checking (`bun check` vs `tsc`).** Both were run. `bun run
+  typecheck` (tsc) is still the coordinator's push gate and passes.
+  `bun check` (TypeScript 7 semantics, multi-core) also passes: no
+  type errors in 140 files, and no errors in the 5 feature files
+  alone. Config friction: none found. The TS 7 defaults the docs
+  warn about — `strict` on, an explicit `types` list — are already
+  how this repo is configured (`strict: true`, `types: ["bun"]`),
+  and no removed compiler option is set. Configs were not swapped
+  on the strength of this: tsc stays the gate, `bun check` is the
+  second opinion.
+- **C compiler (`bun:ffi` `cc()` via TinyCC).** Sanctioned only where
+  a profiler proves a hot path needs it, and TinyCC is fast to
+  compile but not an optimizing compiler. Tiering does not use it:
+  the only compute-heavy step is SHA-256 verification, which already
+  runs natively through `node:crypto`, so a TinyCC hash would not
+  beat it and would add a native dependency for nothing. No profiler
+  evidence exists for any tiering hot path, so no FFI was added.
+  Proven: the tiering suite passes under `--no-ffi-cc`.
+- **JSON5.** See "Hand-edited config files" above. `Bun.JSON5` is
+  feature-detected with a plain-JSON fallback, so configs parse on
+  older Bun versions too (JSON5 features need a Bun with `Bun.JSON5`,
+  which the local 1.4.4 already has).
+
 ## Both disks, or nothing
 
 Tiering activates only when a local disk and an S3 disk are both
