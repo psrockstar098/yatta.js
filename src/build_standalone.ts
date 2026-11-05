@@ -55,16 +55,40 @@
 // - `bun check --aot` does not exist on 1.4.4 ("Unknown flag"), so
 //   the type gate falls back to plain `bun check` there, and says so
 //   in the output. The `--aot` gate needs a newer Bun to verify.
+//
+// Two standalone requirements, measured on Bun 1.4.4 (perf round 2):
+// - The entrypoint must live inside the project directory. `bun build`
+//   resolves bare imports from the entry's location, so an entry
+//   outside the package bundles almost nothing (1 module in the
+//   minimal repro) and the binary fails at runtime with "Cannot find
+//   package 'otplib'", then "'@simplewebauthn/server'". The build
+//   refuses such an entry instead of shipping that binary.
+// - The binary needs `import "reflect-metadata"` FIRST. Without it the
+//   binary crashes at startup: "tsyringe requires a reflect polyfill"
+//   (thrown from tsyringe's lazy init, reached through
+//   @simplewebauthn/server, which the framework's auth imports).
+//   The polyfill's code is in the bundle either way — it rides in
+//   via @simplewebauthn/server's certificate helpers — but with
+//   dynamic `await import(...)` (as in the framework's own main.ts)
+//   Bun evaluates the framework modules first and tsyringe's init
+//   runs before the polyfill code, so it is in the bundle but too
+//   late. The build therefore compiles a generated shim entry inside
+//   the project that imports reflect-metadata first, then the real
+//   entrypoint, and deletes the shim after the build.
 
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
   readFileSync,
   readdirSync,
+  realpathSync,
+  rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 
 export interface BuildOutcome {
   code: number;
@@ -458,6 +482,9 @@ function usageLines(): string[] {
     "at runtime.",
     "",
     "  --entry    Entrypoint; default: yatta/main.ts, then src/main.ts.",
+    "             Must live inside the project directory: bun build",
+    "             resolves bare imports from the entry's location, so an",
+    "             entry outside the package bundles almost nothing.",
     "  --out      Output binary; default: dist/app.",
     "  --target   Cross-compile target, e.g. bun-linux-x64, bun-darwin-arm64.",
     "  --asset    Directory to embed, repeatable. ./public is embedded",
@@ -501,6 +528,122 @@ function resolveEntry(cwd: string, explicit: string | null): string | null {
     if (existsSync(join(cwd, candidate))) return candidate;
   }
   return null;
+}
+
+/**
+ * Whether a file lives inside a directory, after resolving symlinks
+ * on both sides: a symlinked /tmp or a symlinked entry must not
+ * defeat the check, and a path that only looks inside (`..` that
+ * stays put) must pass.
+ */
+function isInsideDir(dir: string, file: string): boolean {
+  let root: string;
+  try {
+    root = realpathSync(dir);
+  } catch {
+    root = resolve(dir);
+  }
+  let abs: string;
+  try {
+    abs = realpathSync(file);
+  } catch {
+    abs = resolve(file);
+  }
+  return abs === root || abs.startsWith(root + sep);
+}
+
+/** Generated entrypoint filename prefix. Random suffix, deleted after the build. */
+const SHIM_PREFIX = ".yatta-standalone-entry-";
+
+/**
+ * Where `reflect-metadata` resolves from, for the generated entry.
+ * Returns the import specifier for the shim — the bare name when the
+ * package resolves from inside the project, the absolute file
+ * otherwise — or null when it resolves nowhere at all.
+ */
+function resolveReflectMetadata(cwd: string): string | null {
+  // The bare name is only safe when the resolved file actually lives
+  // inside the project: `Bun.resolveSync` also consults Bun's global
+  // install cache, and `bun build` does NOT resolve a bare specifier
+  // from there — a fixture with no node_modules proved it, failing
+  // the build with "Could not resolve: 'reflect-metadata'". So the
+  // resolution is checked against the project directory, and anything
+  // outside it is imported by absolute file path, which the bundler
+  // always accepts.
+  //
+  // Precedence: the project's own install first (the app's copy wins,
+  // matching `bun run`); the framework's install second (it always
+  // carries the package, transitive via @simplewebauthn/server, so a
+  // project that imports the framework can be shimmed even when its
+  // own node_modules does not hoist it); the global-cache copy last.
+  let fromProject: string | null = null;
+  try {
+    fromProject = Bun.resolveSync("reflect-metadata", cwd);
+  } catch {
+    fromProject = null;
+  }
+  if (fromProject !== null && isInsideDir(cwd, fromProject)) {
+    return "reflect-metadata";
+  }
+  try {
+    const fromFramework = Bun.resolveSync("reflect-metadata", join(import.meta.dir, ".."));
+    return fromFramework.split(sep).join("/");
+  } catch {
+    // Not in the framework's install either; fall through.
+  }
+  if (fromProject !== null) {
+    return fromProject.split(sep).join("/");
+  }
+  return null;
+}
+
+/**
+ * Whether the entry source imports the framework (or its passkey
+ * stack) — the only callers that need the polyfill. A heuristic,
+ * used only when reflect-metadata resolves nowhere: it decides
+ * between refusing the build and building without the shim, and a
+ * false positive there fails closed with a clear message.
+ */
+function entryNeedsPolyfill(source: string): boolean {
+  const re = /(?:from\s+|import\s+|import\(\s*)["']([^"']+)["']/g;
+  for (const match of source.matchAll(re)) {
+    const spec = match[1]!;
+    if (
+      spec === "yatta.js" ||
+      spec.startsWith("yatta.js/") ||
+      spec === "@simplewebauthn/server" ||
+      spec.startsWith("@simplewebauthn/server/") ||
+      spec === "tsyringe" ||
+      spec.startsWith("tsyringe/") ||
+      spec.includes("simplewebauthn") ||
+      spec.includes("types/auth") ||
+      spec.includes("func/auth")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The generated entrypoint: the polyfill first, then the real entry.
+ * The import is first on purpose — decorators run at import time, so
+ * a later import would be too late — and the entry is imported, not
+ * copied, so its `import.meta.dir` is unchanged.
+ */
+function shimSource(polyfillSpecifier: string, entrySpecifier: string): string {
+  return [
+    "// Generated by `yatta build --standalone`. Deleted after the build.",
+    "//",
+    "// The reflect-metadata polyfill must load before anything that uses",
+    "// tsyringe (reached through @simplewebauthn/server, which the",
+    "// framework's auth imports). Under `bun run` the runtime resolves",
+    "// it; a compiled binary without this import crashes at startup",
+    "// with \"tsyringe requires a reflect polyfill\".",
+    `import ${JSON.stringify(polyfillSpecifier)};`,
+    `import ${JSON.stringify(entrySpecifier)};`,
+    "",
+  ].join("\n");
 }
 
 /**
@@ -738,6 +881,26 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
     return { code: 1, lines: ["", `yatta build: refusing entrypoint "${entry}": ${entryReason}.`] };
   }
 
+  // The entrypoint must live inside the project: `bun build` resolves
+  // bare imports from the entry's location, so an entry outside the
+  // package bundles almost nothing and the binary fails at runtime
+  // ("Cannot find package 'otplib'", then "'@simplewebauthn/server'").
+  // Refuse it here, with the reason, rather than ship that binary.
+  const entryAbs = resolve(cwd, entry);
+  if (!isInsideDir(cwd, entryAbs)) {
+    return {
+      code: 1,
+      lines: [
+        "",
+        `yatta build: entrypoint "${entry}" is outside the project directory ${cwd}.`,
+        "  bun build resolves bare imports from the entry's location, so an entry",
+        "  outside the package bundles almost nothing and the binary fails at",
+        "  runtime (\"Cannot find package 'otplib'\", then",
+        "  \"@simplewebauthn/server\"). Move the entry inside the project.",
+      ],
+    };
+  }
+
   const resolvedAssets = resolveAssets(cwd, opts.assets);
   if ("error" in resolvedAssets) {
     return { code: 1, lines: ["", `yatta build: ${resolvedAssets.error}`] };
@@ -814,8 +977,70 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
     gateNote = gate.note;
   }
 
+  // The standalone entry is a generated shim inside the project that
+  // imports reflect-metadata first, then the real entrypoint (see the
+  // header comment for why the order matters). The shim lives in the
+  // project root so its bare imports resolve like the app's own, and
+  // it is deleted after the build whether the build succeeds or not.
+  // When reflect-metadata resolves nowhere: a plain app does not need
+  // it and builds as before, but an app that imports the framework
+  // would crash at startup without it, so that build is refused
+  // instead of shipping a binary that cannot boot.
+  let buildEntry = entry;
+  let shimPath: string | null = null;
+  const polyfill = resolveReflectMetadata(cwd);
+  if (polyfill !== null) {
+    let name = "";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      name = `${SHIM_PREFIX}${randomUUID().slice(0, 8)}.ts`;
+      if (!existsSync(join(cwd, name))) break;
+      name = "";
+    }
+    if (!name) {
+      return {
+        code: 1,
+        lines: ["", "yatta build: could not pick a fresh name for the generated entry."],
+      };
+    }
+    const rel = relative(cwd, entryAbs).split(sep).join("/");
+    const entrySpecifier = rel.startsWith(".") ? rel : `./${rel}`;
+    shimPath = join(cwd, name);
+    try {
+      writeFileSync(shimPath, shimSource(polyfill, entrySpecifier));
+    } catch (err) {
+      return {
+        code: 1,
+        lines: [
+          "",
+          `yatta build: could not write the generated entry "${name}": ${err instanceof Error ? err.message : String(err)}`,
+        ],
+      };
+    }
+    buildEntry = name;
+  } else {
+    let source = "";
+    try {
+      source = readFileSync(entryAbs, "utf8");
+    } catch {
+      source = "";
+    }
+    if (entryNeedsPolyfill(source)) {
+      return {
+        code: 1,
+        lines: [
+          "",
+          "yatta build: this app imports the framework, which needs the reflect-metadata",
+          "  polyfill at startup, but reflect-metadata does not resolve from the project",
+          "  or from the framework's install. Reinstall dependencies and rebuild;",
+          "  without the polyfill the binary crashes with",
+          "  \"tsyringe requires a reflect polyfill\".",
+        ],
+      };
+    }
+  }
+
   const outAbs = resolve(cwd, opts.out);
-  const bunArgs = ["build", "--compile", entry, "--outfile", outAbs];
+  const bunArgs = ["build", "--compile", buildEntry, "--outfile", outAbs];
   for (const asset of resolvedAssets.assets) bunArgs.push("--asset", asset);
   if (opts.target) bunArgs.push("--target", opts.target);
   if (opts.minify) bunArgs.push("--minify");
@@ -844,47 +1069,61 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
   // No --sourcemap: an embedded sourcemap carries the build machine's
   // paths into the binary. No --bytecode either: it is a startup
   // optimisation, not a correctness need, and it stays opt-in by hand.
-  const res = spawnSync("bun", bunArgs, { cwd, encoding: "utf8" });
-  if (res.error) {
-    return { code: 1, lines: ["", `yatta build: could not run \`bun\`: ${res.error.message}`] };
-  }
-  if (res.status !== 0) {
-    const detail = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
-    return {
-      code: res.status ?? 1,
-      lines: ["", "yatta build: `bun build --compile` failed.", ...(detail ? [detail] : [])],
-    };
-  }
-  if (!existsSync(outAbs)) {
-    return {
-      code: 1,
-      lines: ["", `yatta build: bun reported success but ${outAbs} is missing.`],
-    };
-  }
-
-  // Bun sets the executable bit on its own; make it explicit so a
-  // build on a filesystem that drops it still ships runnable.
   try {
-    chmodSync(outAbs, 0o755);
-  } catch {
-    // A filesystem that drops the bit fails here but the binary itself
-    // is still usable; the size line below says what was produced.
-  }
+    const res = spawnSync("bun", bunArgs, { cwd, encoding: "utf8" });
+    if (res.error) {
+      return { code: 1, lines: ["", `yatta build: could not run \`bun\`: ${res.error.message}`] };
+    }
+    if (res.status !== 0) {
+      const detail = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
+      return {
+        code: res.status ?? 1,
+        lines: ["", "yatta build: `bun build --compile` failed.", ...(detail ? [detail] : [])],
+      };
+    }
+    if (!existsSync(outAbs)) {
+      return {
+        code: 1,
+        lines: ["", `yatta build: bun reported success but ${outAbs} is missing.`],
+      };
+    }
 
-  const size = statSync(outAbs).size;
-  const lines = [
-    "",
-    `✓ Built ${outAbs} (${size} bytes) from ${entry}.`,
-    `  mode: ${opts.aot ? "AOT (machine code)" : "JIT bundle"}.`,
-    ...(gateNote ? [`  note: ${gateNote}`] : []),
-    ...(resolvedAssets.assets.length > 0
-      ? [`  assets embedded: ${resolvedAssets.assets.join(", ")}`]
-      : ["  no asset directory embedded (no ./public, no --asset)"]),
-    ...(execArgv.length > 0 ? [`  baked runtime flags: ${execArgv.join(" ")}`] : []),
-    "  Data and secrets are NOT in this binary: keep your database and",
-    "  uploads beside it, and set config (including .env) where it runs.",
-  ];
-  return { code: 0, lines, outPath: outAbs };
+    // Bun sets the executable bit on its own; make it explicit so a
+    // build on a filesystem that drops it still ships runnable.
+    try {
+      chmodSync(outAbs, 0o755);
+    } catch {
+      // A filesystem that drops the bit fails here but the binary itself
+      // is still usable; the size line below says what was produced.
+    }
+
+    const size = statSync(outAbs).size;
+    const lines = [
+      "",
+      `✓ Built ${outAbs} (${size} bytes) from ${entry}.`,
+      `  mode: ${opts.aot ? "AOT (machine code)" : "JIT bundle"}.`,
+      ...(shimPath
+        ? ["  reflect-metadata polyfill imported first (standalone binaries crash without it)."]
+        : []),
+      ...(gateNote ? [`  note: ${gateNote}`] : []),
+      ...(resolvedAssets.assets.length > 0
+        ? [`  assets embedded: ${resolvedAssets.assets.join(", ")}`]
+        : ["  no asset directory embedded (no ./public, no --asset)"]),
+      ...(execArgv.length > 0 ? [`  baked runtime flags: ${execArgv.join(" ")}`] : []),
+      "  Data and secrets are NOT in this binary: keep your database and",
+      "  uploads beside it, and set config (including .env) where it runs.",
+    ];
+    return { code: 0, lines, outPath: outAbs };
+  } finally {
+    if (shimPath) {
+      try {
+        rmSync(shimPath, { force: true });
+      } catch {
+        // A leftover shim is inert (nothing imports it), but its name
+        // is distinctive so it is easy to spot and delete by hand.
+      }
+    }
+  }
 }
 
 /** CLI entry: prints the outcome lines, returns the exit code. */

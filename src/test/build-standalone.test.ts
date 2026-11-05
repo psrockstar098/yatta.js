@@ -1,12 +1,15 @@
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -82,9 +85,10 @@ async function startBinary(
 ): Promise<{ port: number; child: ChildProcess }> {
   const child = spawn(binary, [], { cwd, stdio: ["ignore", "pipe", "pipe"] });
   let out = "";
+  let errOut = "";
   const port = await new Promise<number>((resolvePromise, reject) => {
     const timer = setTimeout(
-      () => reject(new Error(`binary did not print READY; got: ${out}`)),
+      () => reject(new Error(`binary did not print READY; got: ${out} ${errOut}`)),
       60_000,
     );
     child.stdout!.on("data", (chunk: Buffer) => {
@@ -94,6 +98,15 @@ async function startBinary(
         clearTimeout(timer);
         resolvePromise(Number(match[1]));
       }
+    });
+    child.stderr!.on("data", (chunk: Buffer) => {
+      errOut += chunk.toString();
+    });
+    // A binary that crashes at startup never prints READY: fail fast
+    // with its stderr instead of waiting out the whole timeout.
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`binary exited with code ${code} before READY; stdout: ${out} stderr: ${errOut}`));
     });
     child.on("error", (err) => {
       clearTimeout(timer);
@@ -617,5 +630,210 @@ describe("build machinery is CLI-only", () => {
   it("is not imported by the server entrypoint", () => {
     const mainSource = readFileSync(new URL("../main.ts", import.meta.url), "utf8");
     expect(mainSource).not.toContain("build_standalone");
+  });
+});
+
+const ROOT = join(import.meta.dir, "..", "..");
+
+// A minimal app that imports the framework's api, db, and auth the
+// way the perf round-2 app does (which pulls @simplewebauthn/server,
+// which pulls tsyringe, which needs the reflect-metadata polyfill at
+// import time because its decorators run then). The entry deliberately
+// never imports reflect-metadata itself: the build has to supply it,
+// first.
+//
+// The imports MUST be dynamic `await import(...)`, as in the round-2
+// app and in the framework's own main.ts: with static imports the
+// binary boots even without the polyfill, because Bun then evaluates
+// the polyfill's side-effect import (which rides in via
+// @simplewebauthn/server's certificate helpers) before tsyringe's
+// lazy init. With dynamic imports Bun evaluates the framework modules
+// first and tsyringe's init runs before the polyfill code — the
+// polyfill is in the bundle but too late — and the binary crashes at
+// startup with "tsyringe requires a reflect polyfill". An auth-only
+// entry does not reproduce it either: the trigger needs the full
+// api+db+auth shape with dynamic imports. So the fixture mirrors
+// the round-2 app's top-level calls, cut down to one route each.
+const FRAMEWORK_ENTRY = `const { createAPI, API } = await import("yatta.js/api");
+const { createDatabase, col } = await import("yatta.js/db");
+const { createAuth, MemoryAuthStore, MemoryChallengeStore, MemoryRateLimitStore } = await import("yatta.js/auth");
+
+const TOKEN = "perf-test-bearer-token";
+const schema = {
+  users: { id: col.text(), name: col.text(), email: col.text() },
+  visits: { id: col.id(), userId: col.text(), path: col.text() },
+};
+const db = createDatabase({ path: ":memory:", schema, forceNew: true });
+db.users.insert({ id: "u1", name: "Perf User", email: "perf@example.com" });
+
+const store = new MemoryAuthStore();
+const auth = createAuth({
+  secret: "standalone-shim-test-secret-0123456789abcdef",
+  store,
+  challengeStore: new MemoryChallengeStore(),
+  rateLimitStore: new MemoryRateLimitStore(),
+  security: { allowUnverifiedSession: true },
+});
+await store.createUser({
+  id: "u1",
+  email: "perf@example.com",
+  roles: ["viewer"],
+  emailVerified: true,
+  twoFactorEnabled: false,
+  credentialVersion: 1,
+});
+const now = new Date();
+const later = new Date(Date.now() + 3600_000);
+await store.createSession({
+  id: "s1",
+  userId: "u1",
+  sessionTokenHash: auth.crypto.hash(TOKEN),
+  expiresAt: later,
+  lastSeenAt: now,
+  lastAuthenticatedAt: now,
+  createdAt: now,
+  refreshVersion: 1,
+});
+
+const apiJson = createAPI();
+apiJson.get("/json", () => API.json({ hello: "world", n: 42, ok: true }));
+
+const api = createAPI();
+api.use(async (ctx: any, next: any) => {
+  const session = await auth.getSession(ctx.req, { autoRefresh: false });
+  if (!session) return API.json({ error: "Unauthorized" }, { status: 401 });
+  ctx.state.user = session.user;
+  return next();
+});
+api.get("/profile", (ctx: any) => {
+  const user = db.users.where({ id: "u1" }).first();
+  if (!user) return API.json({ error: "Not Found" }, { status: 404 });
+  const visit = db.visits.insert({ userId: "u1", path: "/profile" });
+  return API.json({ hello: "world", user: user.name, visit: visit.id });
+});
+
+const port = Number(process.env.PORT) || 0;
+const server = Bun.serve({
+  port,
+  fetch: (req) => {
+    const path = new URL(req.url).pathname;
+    return path === "/profile" ? api.handle(req, {}) : apiJson.handle(req, {});
+  },
+});
+console.log(\`READY \${server.port}\`);
+`;
+
+/**
+ * A project that imports the framework the way a real user project
+ * does: node_modules/yatta.js points at this checkout, and
+ * reflect-metadata sits hoisted next to it as a real directory (a
+ * copy, not a symlink: the shim uses the bare specifier only when
+ * the package resolves from inside the project, and a symlink would
+ * resolve to the checkout instead). The plain fixtures elsewhere in
+ * this file have no node_modules at all, so they cover the
+ * framework-fallback branch.
+ */
+function frameworkFixture(): string {
+  const fixture = mkdtempSync(join(tmpdir(), "yatta-build-shim-"));
+  mkdirSync(join(fixture, "node_modules"));
+  symlinkSync(ROOT, join(fixture, "node_modules", "yatta.js"), "dir");
+  cpSync(join(ROOT, "node_modules", "reflect-metadata"), join(fixture, "node_modules", "reflect-metadata"), {
+    recursive: true,
+  });
+  writeFileSync(join(fixture, "server.ts"), FRAMEWORK_ENTRY);
+  return fixture;
+}
+
+describe("standalone reflect-metadata shim and entry-inside-package", () => {
+  let fixture = "";
+  let binary = "";
+
+  beforeAll(() => {
+    fixture = frameworkFixture();
+    const outcome = runBuild(fixture, ["--standalone", "--entry", "server.ts"]);
+    expect(outcome.code).toBe(0);
+    binary = outcome.outPath!;
+  }, 180_000);
+
+  afterAll(() => {
+    if (fixture) rmSync(fixture, { recursive: true, force: true });
+  });
+
+  it("boots a framework app whose entry never imports reflect-metadata", async () => {
+    // Without the shim the binary crashes at startup: "tsyringe
+    // requires a reflect polyfill". The entry has no such import, so
+    // the build itself must supply it, first.
+    const { port, child } = await startBinary(binary, fixture);
+    try {
+      expect(await (await fetch(`http://localhost:${port}/json`)).json()).toEqual({
+        hello: "world",
+        n: 42,
+        ok: true,
+      });
+      // The authenticated route proves the auth stack (and the
+      // session seeded at startup) works in the binary, not just
+      // that the process stayed up.
+      const profile = await fetch(`http://localhost:${port}/profile`, {
+        headers: { Authorization: "Bearer perf-test-bearer-token" },
+      });
+      expect(profile.status).toBe(200);
+      const body = await profile.json();
+      expect(body.user).toBe("Perf User");
+    } finally {
+      await stop(child);
+    }
+  }, 120_000);
+
+  it("bundles the polyfill and leaves no generated entry behind", () => {
+    const bytes = readFileSync(binary);
+    expect(bytes.includes(Buffer.from("Reflect.metadata"))).toBe(true);
+    const leftovers = readdirSync(fixture).filter((f) =>
+      f.startsWith(".yatta-standalone-entry"),
+    );
+    expect(leftovers).toEqual([]);
+  });
+
+  it("still builds and boots when the entry already imports reflect-metadata", async () => {
+    writeFileSync(
+      join(fixture, "server-with-polyfill.ts"),
+      `import "reflect-metadata";\n${FRAMEWORK_ENTRY}`,
+    );
+    const outcome = runBuild(fixture, [
+      "--standalone",
+      "--entry",
+      "server-with-polyfill.ts",
+      "--out",
+      "dist/app-polyfill",
+    ]);
+    expect(outcome.code).toBe(0);
+    const { port, child } = await startBinary(outcome.outPath!, fixture);
+    try {
+      expect(await (await fetch(`http://localhost:${port}/json`)).json()).toEqual({
+        hello: "world",
+        n: 42,
+        ok: true,
+      });
+    } finally {
+      await stop(child);
+    }
+  }, 180_000);
+
+  it("refuses an entrypoint outside the project directory", () => {
+    const outside = mkdtempSync(join(tmpdir(), "yatta-build-outside-"));
+    try {
+      writeFileSync(join(outside, "server.ts"), ENTRY);
+      const outcome = runBuild(fixture, [
+        "--standalone",
+        "--entry",
+        join(outside, "server.ts"),
+        "--out",
+        "dist/app-outside",
+      ]);
+      expect(outcome.code).toBe(1);
+      expect(outcome.lines.join("\n")).toMatch(/outside the project/);
+      expect(existsSync(join(fixture, "dist", "app-outside"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

@@ -261,6 +261,26 @@ otherwise innocent asset directory.
   `--explain` is the exception: its whole value is the report, so
   on a Bun that produces none it fails with an upgrade pointer
   rather than pretending a report was made.
+- The entrypoint must live inside the project directory. `bun
+  build` resolves bare imports from the entry's location, so an entry
+  outside the package bundles almost nothing (one module in the
+  minimal repro) and the binary fails at runtime with "Cannot find
+  package 'otplib'", then "'@simplewebauthn/server'". The build
+  refuses such an entry instead of shipping that binary — move the
+  entry inside the project and rebuild.
+- The build imports `reflect-metadata` first. A binary without it
+  crashes at startup with "tsyringe requires a reflect polyfill"
+  (thrown from tsyringe's lazy init, reached through
+  @simplewebauthn/server, which the framework's auth imports). The
+  polyfill's code is in the bundle either way — it rides in via
+  @simplewebauthn/server's certificate helpers — but with dynamic
+  `await import(...)` (as in the framework's own main.ts) Bun
+  evaluates the framework modules first and tsyringe's init runs
+  before the polyfill code, so it is in the bundle but too late.
+  The build compiles a generated entry inside the project that
+  imports `reflect-metadata` first, then the real entrypoint, and
+  deletes the generated file after the build. If your entry already
+  imports it, the duplicate is harmless.
 - Worker entrypoints are not auto-detected. Bun compiles the
   entrypoints it is given; a worker spawned from a URL string at
   runtime is not an import, so it is not bundled. A single-entrypoint
