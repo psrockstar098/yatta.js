@@ -159,7 +159,7 @@ describe("rollup policies", () => {
     seed(db);
     runRollupPolicy(db as any, policy, { now: BASE + 10 * DAY });
     const second = runRollupPolicy(db as any, policy, { now: BASE + 10 * DAY });
-    expect(second.tiers[0].windows).toBe(2);
+    expect(second.tiers[0]!.windows).toBe(2);
     const hourly = readRollup(db as any, policy, "hourly");
     expect(hourly).toHaveLength(3);
     const hour0North = hourly.find((r) => r.bucket_start === BASE && r.region === "north")!;
@@ -172,11 +172,11 @@ describe("rollup policies", () => {
     seed(db);
     // Cutoff 30 minutes into hour 1: hour 0 is complete, hour 1 is not.
     const now = BASE + HOUR + 30 * MIN + DAY;
-    const result = runRollupPolicy(db as any, { ...policy, tiers: [policy.tiers[0]] }, { now });
-    expect(result.tiers[0].windows).toBe(1);
+    const result = runRollupPolicy(db as any, { ...policy, tiers: [policy.tiers[0]!] }, { now });
+    expect(result.tiers[0]!.windows).toBe(1);
     const hourly = readRollup(db as any, policy, "hourly");
     expect(hourly).toHaveLength(1);
-    expect(hourly[0].bucket_start).toBe(BASE);
+    expect(hourly[0]!.bucket_start).toBe(BASE);
   });
 
   it("default policy deletes nothing", () => {
@@ -199,11 +199,11 @@ describe("rollup policies", () => {
       tiers: [{ name: "hourly", window: "hour", olderThan: "1d", deleteRaw: true }],
     };
     const result = runRollupPolicy(db as any, deleting, { now: BASE + 10 * DAY });
-    expect(result.tiers[0].rowsDeleted).toBe(5);
+    expect(result.tiers[0]!.rowsDeleted).toBe(5);
     const remaining = db.table("readings").findMany({});
     expect(remaining).toHaveLength(1);
-    expect(remaining[0].at).toBe(recent);
-    expect(remaining[0].value).toBe(99);
+    expect(remaining[0]!.at).toBe(recent);
+    expect(remaining[0]!.value).toBe(99);
     // Summaries for the deleted windows are still readable.
     expect(readRollup(db as any, deleting, "hourly")).toHaveLength(3);
   });
@@ -315,15 +315,15 @@ describe("rollup policy validation", () => {
     // anything it should not: values are bound, never spliced.
     const quoted = readRollup(db2 as any, p as any, "hourly", { where: { region: `nor"th` } });
     expect(quoted).toHaveLength(1);
-    expect(quoted[0].value_sum).toBe(8);
+    expect(quoted[0]!.value_sum).toBe(8);
   });
 
   it("defaults the time column to the marked column and the table name to source_tier", () => {
     const db = memDb();
     const normalized = normalizeRollupPolicy(db as any, policy);
     expect(normalized.timeColumn).toBe("at");
-    expect(normalized.tiers[0].rollupTable).toBe("readings_hourly");
-    expect(normalized.tiers[0].deleteRaw).toBe(false);
+    expect(normalized.tiers[0]!.rollupTable).toBe("readings_hourly");
+    expect(normalized.tiers[0]!.deleteRaw).toBe(false);
   });
 
   it("refuses a rollup table name already holding a different shape", () => {
@@ -350,7 +350,7 @@ describe("cron scheduling", () => {
     const normalized = normalizeRollupPolicy(db as any, policy);
     expect(() =>
       db.transaction(() => {
-        runRollupTier(db as any, normalized, normalized.tiers[0], { now: BASE + 10 * DAY });
+        runRollupTier(db as any, normalized, normalized.tiers[0]!, { now: BASE + 10 * DAY });
         throw new Error("caller aborts");
       }),
     ).toThrow("caller aborts");

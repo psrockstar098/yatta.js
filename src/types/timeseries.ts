@@ -193,7 +193,7 @@ export function parseRollupDuration(value: string | number): number {
       `Invalid rollup duration "${value}". Use milliseconds, or a number with a unit: ms, s, m, h, d, w (for example "30d").`,
     );
   }
-  const ms = Number(match[1]) * DURATION_UNITS[match[2]];
+  const ms = Number(match[1]) * DURATION_UNITS[match[2]!]!;
   if (ms <= 0) {
     throw new YattaError(`Invalid rollup duration "${value}". Durations must be positive.`);
   }
@@ -250,7 +250,7 @@ export function normalizeRollupPolicy(store: TimeSeriesStore, policy: RollupPoli
   // Rollup bucket math divides integer timestamps, so a text timestamp
   // (an ISO string from col.createdAt()) cannot be bucketed. The index
   // from .timeSeries() still helps its reads; only rollups need integers.
-  if (tableDef[timeColumn].def.type !== "INTEGER") {
+  if (tableDef[timeColumn]!.def.type !== "INTEGER") {
     throw new YattaError(
       `Rollup time column "${policy.source}.${timeColumn}" must hold integer milliseconds since epoch. ` +
         `Use col.integer().timeSeries() for the timestamp a policy rolls up.`,
@@ -266,7 +266,7 @@ export function normalizeRollupPolicy(store: TimeSeriesStore, policy: RollupPoli
     if (!columns.includes(measure)) {
       throw new YattaError(`Rollup measure "${measure}" is not a column of "${policy.source}".`);
     }
-    if (tableDef[measure].def.type !== "INTEGER" && tableDef[measure].def.type !== "REAL") {
+    if (tableDef[measure]!.def.type !== "INTEGER" && tableDef[measure]!.def.type !== "REAL") {
       throw new YattaError(
         `Rollup measure "${policy.source}.${measure}" must be a numeric column (integer or real). Aggregates over text or JSON have no meaning here.`,
       );
@@ -348,6 +348,11 @@ export function normalizeRollupPolicy(store: TimeSeriesStore, policy: RollupPoli
 /** Expected columns of a tier's summary table, in storage order. */
 function rollupColumns(store: TimeSeriesStore, policy: NormalizedRollupPolicy): { name: string; type: string; nullable: boolean }[] {
   const tableDef = store.schema[policy.source];
+  if (!tableDef) {
+    // Unreachable for a normalized policy, which was validated against
+    // this schema, but the lookup itself can still be undefined.
+    throw new YattaError(`Rollup source table "${policy.source}" is not in the schema.`);
+  }
   const cols: { name: string; type: string; nullable: boolean }[] = [
     { name: "bucket_start", type: "INTEGER", nullable: false },
     { name: "bucket_end", type: "INTEGER", nullable: false },
@@ -356,7 +361,7 @@ function rollupColumns(store: TimeSeriesStore, policy: NormalizedRollupPolicy): 
   // Group columns stay nullable: a NULL group still summarizes into one
   // row, and a NOT NULL summary column would reject it.
   for (const group of policy.groupBy) {
-    cols.push({ name: group, type: tableDef[group].def.type, nullable: true });
+    cols.push({ name: group, type: tableDef[group]!.def.type, nullable: true });
   }
   for (const measure of policy.measures) {
     cols.push({ name: `${measure}_sum`, type: "REAL", nullable: true });
