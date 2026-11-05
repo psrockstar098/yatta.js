@@ -684,6 +684,19 @@ export class TieredFileRef {
     return (await this.read()).serve(request, options);
   }
 
+  /**
+   * Signed URL from whichever disk holds the file, so a moved file's
+   * signed URL still points at a copy that exists.
+   */
+  async sign(
+    expiresIn: HumanTime = "1h",
+    method: "GET" | "PUT" = "GET",
+  ): Promise<string> {
+    const tier = await this.tiered.tierOf(this.key);
+    const disk = tier === "cold" ? this.tiered.cold : this.tiered.hot;
+    return disk.signedUrl(this.key, { expiresIn, method });
+  }
+
   async download(options?: { filename?: string }): Promise<Response> {
     const file = await this.read();
     const name = options?.filename ?? this.key.split("/").pop() ?? this.key;
@@ -770,9 +783,13 @@ export function scheduleTiering(
     try {
       await tiered.runOnce();
     } catch (err) {
-      // No credential or key material ever reaches this log line: the
-      // error is a move failure, and its message names only the key.
-      console.error("[tiering] mover run failed:", err);
+      // Message only, never the whole error object: an S3 error object
+      // can carry request metadata, and nothing from it belongs in a log.
+      // Move failures name only the key in their message.
+      console.error(
+        "[tiering] mover run failed:",
+        err instanceof Error ? err.message : "unknown error",
+      );
     }
   });
 }

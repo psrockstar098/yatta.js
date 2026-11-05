@@ -182,3 +182,12 @@ network request (Bun's S3 file references are lazy).
 - **Tiering is not a backup.** A moved file exists in exactly one
   place after the move completes. If the S3 copy must also survive a
   bucket loss, that is a replication concern, not tiering.
+- **Going around the tiered handle bypasses its guarantees.** A file
+  written or deleted through a raw disk handle is not access-tracked,
+  is not covered by the per-key move lock, and can race a move in
+  flight. App code should use the tiered handle (or `ctx.storage`)
+  for files tiering owns; the mtime fallback is what still ages
+  directly-written files out.
+- **Verification reads both copies in full.** That is the price of
+  the guarantee, and it is paid once per move, not per read. For very
+  large files, prefer a longer `staleAfter` so the cost is rare.

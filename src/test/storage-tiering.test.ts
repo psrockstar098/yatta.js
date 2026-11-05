@@ -31,7 +31,10 @@ import { createCron } from "../types/job";
  * test ever touches a real provider.
  */
 class FakeDisk implements IStorageDriver {
-  constructor(private nowMs: () => number = Date.now) {}
+  constructor(
+    private nowMs: () => number = Date.now,
+    private baseUrl = "https://fake-cold.local",
+  ) {}
   private files = new Map<
     string,
     {
@@ -183,7 +186,7 @@ class FakeDisk implements IStorageDriver {
   }
 
   publicUrl(key: string): string {
-    return `https://fake-cold.local/${sanitizeKey(key)}`;
+    return `${this.baseUrl}/${sanitizeKey(key)}`;
   }
 }
 
@@ -192,8 +195,8 @@ function makeTiered(config: Partial<Parameters<typeof createTieredStorage>[2]> =
   // "stale" is deterministic and tracker time and mtime agree.
   let now = 1000;
   const clock = () => now;
-  const hotDriver = new FakeDisk(clock);
-  const coldDriver = new FakeDisk(clock);
+  const hotDriver = new FakeDisk(clock, "https://fake-hot.local");
+  const coldDriver = new FakeDisk(clock, "https://fake-cold.local");
   const hot = new StorageDisk(hotDriver);
   const cold = new StorageDisk(coldDriver);
   const tiered = createTieredStorage(hot, cold, {
@@ -551,6 +554,14 @@ describe("storage tiering", () => {
     const result = await handler();
     expect(result.moved).toEqual(["job.txt"]);
     expect(await tiered2.file("job.txt").text()).toBe("jobbed");
+  });
+
+  it("a signed URL comes from whichever disk holds the file", async () => {
+    const { tiered } = makeTiered();
+    await tiered.save("signed.txt", "signed");
+    expect(await tiered.file("signed.txt").sign()).toContain("fake-hot.local/signed.txt");
+    await tiered.runOnce(10_000);
+    expect(await tiered.file("signed.txt").sign()).toContain("fake-cold.local/signed.txt");
   });
 
   it("plain manager save keeps working, and no tiering logging happens on a normal run", async () => {
