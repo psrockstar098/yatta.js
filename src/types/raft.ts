@@ -382,17 +382,26 @@ function safeEqualHex(a: string, b: string): boolean {
  * AppendEntries signature body. The "raft-append-entries:" domain
  * prefix is the point: a phase-1 batch signature covers a different
  * body, so neither signature verifies as the other, and a captured
- * batch can never be replayed as a Raft message.
+ * batch can never be replayed as a Raft message. Only the seven
+ * named fields are covered: extra wire fields are ignored by the
+ * handler, so they cannot affect verification either way.
  */
-export function appendEntriesSignBody(req: AppendEntriesRequest): string {
+export function appendEntriesSignBody(body: {
+  term: unknown;
+  leaderId: unknown;
+  prevLogSeq: unknown;
+  prevLogTerm: unknown;
+  entries: unknown;
+  leaderCommit: unknown;
+}): string {
   return canonicalJson({
     domain: "raft-append-entries",
-    term: req.term,
-    leaderId: req.leaderId,
-    prevLogSeq: req.prevLogSeq,
-    prevLogTerm: req.prevLogTerm,
-    entries: req.entries,
-    leaderCommit: req.leaderCommit,
+    term: body.term,
+    leaderId: body.leaderId,
+    prevLogSeq: body.prevLogSeq,
+    prevLogTerm: body.prevLogTerm,
+    entries: body.entries,
+    leaderCommit: body.leaderCommit,
   });
 }
 
@@ -406,6 +415,38 @@ export function verifyAppendEntriesSignature(secret: string, req: AppendEntriesR
   let expected: string;
   try {
     expected = signAppendEntries(secret, req);
+  } catch {
+    return false;
+  }
+  return safeEqualHex(signature, expected);
+}
+
+/**
+ * Verifies a signature over the RAW wire body (minus the signature
+ * field itself), which is what the HTTP handler must do: validation
+ * normalizes entries to a subset, and verifying over the normalized
+ * subset would reject every legitimately signed message whose wire
+ * entries carry the full change-log fields. The signer signs exactly
+ * what it sends, so raw-body verification is the consistent check.
+ */
+export function verifyAppendEntriesSignatureRaw(
+  secret: string,
+  rawBody: Record<string, unknown>,
+  signature: string,
+): boolean {
+  if (!secret || !/^[0-9a-f]{64}$/.test(signature)) return false;
+  const { signature: _ignored, ...body } = rawBody;
+  void _ignored;
+  let expected: string;
+  try {
+    expected = hmacHex(secret, appendEntriesSignBody({
+      term: body.term,
+      leaderId: body.leaderId,
+      prevLogSeq: body.prevLogSeq,
+      prevLogTerm: body.prevLogTerm,
+      entries: body.entries,
+      leaderCommit: body.leaderCommit,
+    }));
   } catch {
     return false;
   }
@@ -1351,7 +1392,11 @@ export function createRaftHttpHandler(
         } catch {
           return new Response("Bad request.", { status: 400 });
         }
-        if (!verifyAppendEntriesSignature(secret, appendReq, signature)) {
+        // Verify over the raw wire body, not the normalized subset:
+        // validation drops the full change-log fields the signer
+        // covered, and verifying over the subset would reject every
+        // legitimately signed message. See verifyAppendEntriesSignatureRaw.
+        if (!verifyAppendEntriesSignatureRaw(secret, reqBody, signature)) {
           return new Response("Unauthorized.", { status: 401 });
         }
         const res = node.handleAppendEntries(appendReq);
