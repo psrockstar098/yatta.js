@@ -45,6 +45,8 @@
     "./auth": "./src/types/auth.ts",
     "./jobs": "./src/types/job.ts",
     "./cache": "./src/types/cache_queue.ts",
+    "./cache-decorator": "./src/types/cache_decorator.ts",
+    "./cache-edge": "./src/types/cache_edge.ts",
     "./storage": "./src/types/storage.ts",
     "./mail": "./src/types/mail.ts",
     "./realtime": "./src/types/realtime.ts",
