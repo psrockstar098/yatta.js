@@ -74,6 +74,7 @@
     "src/cli_migrate.ts",
     "src/migrate_generate.ts",
     "src/cli_backup.ts",
+    "src/build_standalone.ts",
     "src/deploy",
     "src/func",
     "src/types",
