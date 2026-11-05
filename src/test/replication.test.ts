@@ -295,6 +295,43 @@ describe("replication — applier", () => {
     expect(applier.checkpoint("app", "app")).toBe(batch.entries[0]!.seq);
     expect(applier.replicatedEntries("app", "app").length).toBe(1);
   });
+
+  it("calls onEntry before the entry is stored, and redelivers after a throwing handler", async () => {
+    const primary = memDb();
+    const replica = memDb();
+    seed(primary, 2);
+    const pub = publisherFor(primary);
+    const batch = pub.pullFor(tokenFor(), "app", 0);
+    const observed: { eventId: string; alreadyStored: boolean; checkpointAtCall: number }[] = [];
+    const applier = new ReplicationApplier(replica as unknown as OutboxStore, {
+      secret: SECRET,
+      onEntry: (entry) => {
+        observed.push({
+          eventId: entry.eventId,
+          alreadyStored: applier
+            .replicatedEntries("app", "app")
+            .some((e) => e.eventId === entry.eventId),
+          checkpointAtCall: applier.checkpoint("app", "app"),
+        });
+        if (observed.length === 2) throw new Error("read model down");
+      },
+    });
+    await expect(applier.applyBatch(batch)).rejects.toThrow("read model down");
+    // Handler ran before the store for both entries: neither was stored
+    // at call time, and the checkpoint had not advanced to either.
+    expect(observed.map((o) => o.alreadyStored)).toEqual([false, false]);
+    expect(observed.map((o) => o.checkpointAtCall)).toEqual([0, batch.entries[0]!.seq]);
+    // First entry stored, checkpoint at it; the failed one is not stored.
+    expect(applier.checkpoint("app", "app")).toBe(batch.entries[0]!.seq);
+    expect(applier.replicatedEntries("app", "app").length).toBe(1);
+    // Redelivery with a plain applier applies the failed entry and skips the stored one.
+    const retry = new ReplicationApplier(replica as unknown as OutboxStore, { secret: SECRET });
+    const res = await retry.applyBatch(batch);
+    expect(res.applied).toBe(1);
+    expect(res.skipped).toBe(1);
+    expect(retry.checkpoint("app", "app")).toBe(batch.entries[1]!.seq);
+    expect(retry.replicatedEntries("app", "app").length).toBe(2);
+  });
 });
 
 describe("replication — runner over multiple files", () => {

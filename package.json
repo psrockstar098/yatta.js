@@ -72,7 +72,8 @@
     "./cloud-backups": "./src/types/cloud_backups.ts",
     "./replay": "./src/types/replay.ts",
     "./replication": "./src/types/replication.ts",
-    "./raft": "./src/types/raft.ts"
+    "./raft": "./src/types/raft.ts",
+    "./outbox": "./src/types/outbox.ts"
   },
   "bin": {
     "yatta": "bin/yatta.js"

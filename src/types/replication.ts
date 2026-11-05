@@ -395,7 +395,15 @@ export interface ReplicationApplierOptions {
   expectedNodeId?: string;
   /** Largest single entry payload, in JSON characters. */
   maxPayloadChars?: number;
-  /** Called for each newly applied entry, in seq order, after it is stored. */
+  /**
+   * Called for each entry, in seq order, BEFORE it is stored. A throwing
+   * handler leaves the entry unstored, so the next pull redelivers it and
+   * retries the handler. A crash after the handler but before the store
+   * redelivers too, so handlers must be idempotent. Once stored, the
+   * checkpoint advances per entry, and redelivery of a stored entry is
+   * skipped. A handler that needs the entry in the replica log should
+   * read it after applyBatch returns, not inside this callback.
+   */
   onEntry?: (entry: OutboxEntry, file: string) => void | Promise<void>;
 }
 
