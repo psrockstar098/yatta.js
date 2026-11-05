@@ -36,14 +36,25 @@
 //   directory, not to the binary. So `DATABASE_URL=./data/app.db`
 //   means "next to where you run it", which is where data belongs.
 //
-// Version honesty: Bun's `bun build` silently ignores flags it does
-// not know (proven on Bun 1.4.4: `--bogusflag` and `--minif` both
-// produced binaries). So a flag this command cannot verify is honored
-// fails loudly instead of shipping a binary that pretends: `--aot`,
-// `--trim` and `--explain` are accepted only when `bun build --help`
-// lists them, and otherwise the build stops with the Bun version and
-// an upgrade pointer. A silent JIT substitute for a requested AOT
-// build would be worse than no build at all.
+// Version honesty, measured on Bun 1.4.4 (this VM):
+// - There is no standalone `bun compile` command ("Script not
+//   found"), so only the `bun build --compile` form is ever used.
+// - `bun build --compile --aot` is accepted (exit 0), but whether it
+//   changes codegen on 1.4.4 is unverified: `bun build` silently
+//   ignores flags it does not know (proven: `--bogusflag` and
+//   `--minif` both produced binaries, byte-identical in size to the
+//   plain build), and no `--explain` output exists here to confirm
+//   anything. So `--aot` and `--trim` pass through as requested, the
+//   binary is verified to build and run, and the output says plainly
+//   that AOT speed/memory wins are unverified on this Bun — never
+//   claimed, never silently substituted.
+// - `--explain` is different: its whole value is the report, and on
+//   1.4.4 it just bundles normally with no report. So `--explain` is
+//   accepted only when `bun build --help` lists it, and otherwise the
+//   build stops with the Bun version and an upgrade pointer.
+// - `bun check --aot` does not exist on 1.4.4 ("Unknown flag"), so
+//   the type gate falls back to plain `bun check` there, and says so
+//   in the output. The `--aot` gate needs a newer Bun to verify.
 
 import {
   chmodSync,
@@ -607,16 +618,19 @@ function findCodeGeneration(source: string): string | null {
 
 // ── Type gate ─────────────────────────────────────────────────────────
 // AOT relies on types to generate machine code, so `bun check --aot`
-// reports exactly what the build would fail on, and builds nothing.
-// For JIT builds the same gate is opt-in via --check, because a JIT
-// build never typechecked before and must not start failing projects
-// that never asked for it.
+// is the exact gate on a Bun that has it: it reports what the build
+// would fail on, and builds nothing. On Bun 1.4.4 that flag does not
+// exist, so an AOT-aspiring build falls back to plain `bun check`
+// plus a successful `bun build --compile` — and the fallback is
+// reported in the output, not hidden. For JIT builds the same gate
+// is opt-in via --check, because a JIT build never typechecked
+// before and must not start failing projects that never asked for it.
 
-function runTypeGate(
+function runCheck(
   cwd: string,
   entry: string,
   aot: boolean,
-): { ok: true } | { error: string } {
+): { status: number; output: string; error?: string } {
   // --no-script is not optional: a project with a `check` script in
   // package.json (the scaffolded template has one) would otherwise run
   // that script instead of the typechecker. The docs say it plainly:
@@ -626,23 +640,45 @@ function runTypeGate(
   args.push(entry);
   const res = spawnSync("bun", args, { cwd, encoding: "utf8" });
   if (res.error) {
-    return { error: `could not run \`bun check\`: ${res.error.message}` };
+    return { status: 1, output: "", error: `could not run \`bun check\`: ${res.error.message}` };
   }
-  const output = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
-  if (output.includes('Unknown flag "--aot"')) {
+  return {
+    status: res.status ?? 1,
+    output: [res.stdout, res.stderr].filter(Boolean).join("\n").trim(),
+  };
+}
+
+function runTypeGate(
+  cwd: string,
+  entry: string,
+  aot: boolean,
+): { ok: true; note?: string } | { error: string } {
+  const first = runCheck(cwd, entry, aot);
+  if (first.error) return { error: first.error };
+  if (first.status === 0) return { ok: true };
+  // The --aot gate needs a newer Bun. Fall back to plain `bun check`
+  // rather than refusing the build outright: the fallback still stops
+  // type errors, and the build step itself is verified separately.
+  if (aot && first.output.includes('Unknown flag "--aot"')) {
+    const fallback = runCheck(cwd, entry, false);
+    if (fallback.error) return { error: fallback.error };
+    if (fallback.status !== 0) {
+      return {
+        error:
+          `Type gate failed — the entrypoint does not type-check:\n${fallback.output}`,
+      };
+    }
     return {
-      error:
-        `This Bun (${bunVersion()}) does not support \`bun check --aot\`. ` +
-        `Upgrade Bun to build with --aot.`,
+      ok: true,
+      note:
+        `type gate: plain bun check (bun check --aot needs a newer Bun; ` +
+        `this Bun is ${bunVersion()}). AOT codegen benefit is unverified here.`,
     };
   }
-  if (res.status !== 0) {
-    return {
-      error:
-        `Type gate failed — the entrypoint does not type-check:\n${output}`,
-    };
-  }
-  return { ok: true };
+  return {
+    error:
+      `Type gate failed — the entrypoint does not type-check:\n${first.output}`,
+  };
 }
 
 export function runBuild(cwd: string, args: string[]): BuildOutcome {
@@ -724,20 +760,22 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
     }
   }
 
-  // Flags Bun silently ignores must not be passed blindly (see the
-  // header comment). Each one is accepted only if this Bun lists it.
-  const unsupported: string[] = [];
-  if (opts.aot && !bunSupportsBuildFlag("--aot")) unsupported.push("--aot");
-  if (opts.trim && !bunSupportsBuildFlag("--trim")) unsupported.push("--trim");
-  if (opts.explain !== null && !bunSupportsBuildFlag("--explain")) unsupported.push("--explain");
-  if (unsupported.length > 0) {
+  // --explain is the one flag whose whole value is output Bun may
+  // not produce: on 1.4.4 it just bundles normally with no report.
+  // So it is accepted only when this Bun lists it, and otherwise the
+  // build stops with the Bun version and an upgrade pointer, rather
+  // than pretending a report was produced. --aot and --trim pass
+  // through (see the header comment): they are accepted by this Bun,
+  // their effect is verified only as far as build-and-run, and the
+  // output says so where it matters.
+  if (opts.explain !== null && !bunSupportsBuildFlag("--explain")) {
     return {
       code: 1,
       lines: [
         "",
-        `yatta build: this Bun (${bunVersion()}) does not support ${unsupported.join(", ")}.`,
-        "  Upgrade Bun to use these flags; refusing to build rather than",
-        "  silently ignoring them and shipping a different binary.",
+        `yatta build: this Bun (${bunVersion()}) does not produce --explain reports.`,
+        "  Upgrade Bun to use --explain; refusing to build rather than",
+        "  silently shipping a binary with no report.",
       ],
     };
   }
@@ -767,11 +805,13 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
   }
 
   // Type gate: always for AOT, opt-in for JIT.
+  let gateNote: string | undefined;
   if (opts.aot || opts.check) {
     const gate = runTypeGate(cwd, entry, opts.aot);
     if ("error" in gate) {
       return { code: 1, lines: ["", `yatta build: ${gate.error}`] };
     }
+    gateNote = gate.note;
   }
 
   const outAbs = resolve(cwd, opts.out);
@@ -836,6 +876,7 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
     "",
     `✓ Built ${outAbs} (${size} bytes) from ${entry}.`,
     `  mode: ${opts.aot ? "AOT (machine code)" : "JIT bundle"}.`,
+    ...(gateNote ? [`  note: ${gateNote}`] : []),
     ...(resolvedAssets.assets.length > 0
       ? [`  assets embedded: ${resolvedAssets.assets.join(", ")}`]
       : ["  no asset directory embedded (no ./public, no --asset)"]),

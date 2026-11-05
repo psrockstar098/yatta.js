@@ -284,25 +284,86 @@ describe("isDataOrSecretPath", () => {
 });
 
 describe("JIT and AOT modes", () => {
-  it("refuses --aot on a Bun that does not advertise it, instead of silently building JIT", () => {
-    // This Bun (1.4.4) lists neither --aot nor --trim in `bun build --help`,
-    // and silently ignores unknown build flags — so a requested AOT or
-    // trimmed build must fail here with an upgrade pointer, never ship
-    // a JIT binary wearing the AOT label.
-    const aot = runBuild(dir, ["--standalone", "--entry", "server.ts", "--aot"]);
-    expect(aot.code).toBe(1);
-    expect(aot.lines.join("\n")).toMatch(/does not support --aot/);
-    expect(aot.lines.join("\n")).toMatch(/Upgrade Bun/);
+  // Bun 1.4.4 (this VM) has no standalone `bun compile` command and no
+  // `bun check --aot`, and its `bun build` silently ignores flags it
+  // does not know — so whether --aot changes codegen here is
+  // unverified. What is verified: the --aot build builds, runs, and
+  // serves, and the fallback type gate still stops type errors. The
+  // speed/memory wins are not claimed on this Bun.
+  function aotFixture(entrySource: string): string {
+    const fixture = mkdtempSync(join(tmpdir(), "yatta-build-aot-"));
+    writeFileSync(join(fixture, "server.ts"), entrySource);
+    writeFileSync(
+      join(fixture, "globals.d.ts"),
+      "declare const Bun: any;\ndeclare const console: any;\ndeclare const process: any;\n",
+    );
+    writeFileSync(
+      join(fixture, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: { strict: true, types: [] },
+        include: ["server.ts", "globals.d.ts"],
+      }),
+    );
+    return fixture;
+  }
 
-    const trim = runBuild(dir, ["--standalone", "--entry", "server.ts", "--trim"]);
-    expect(trim.code).toBe(1);
-    expect(trim.lines.join("\n")).toMatch(/does not support --trim/);
+  const servingEntry = `const port = Number(process.env.PORT) || 0;\nconst server = Bun.serve({ port, fetch: () => Response.json({ ok: true }) });\nconsole.log(\`READY \${server.port}\`);\n`;
+
+  it("--aot passes through, builds, runs, and says the gate fell back", async () => {
+    const fixture = aotFixture(servingEntry);
+    try {
+      const outcome = runBuild(fixture, ["--standalone", "--entry", "server.ts", "--aot"]);
+      expect(outcome.code).toBe(0);
+      expect(outcome.lines.join("\n")).toMatch(/mode: AOT/);
+      // The fallback is reported, not hidden.
+      expect(outcome.lines.join("\n")).toMatch(/plain bun check/);
+      expect(outcome.lines.join("\n")).toMatch(/unverified here/);
+      const { port, child } = await startBinary(outcome.outPath!, fixture);
+      try {
+        expect(await (await fetch(`http://localhost:${port}/`)).json()).toEqual({ ok: true });
+      } finally {
+        await stop(child);
+      }
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
   });
 
-  it("refuses --explain without --aot, and --aot with a foreign target", () => {
+  it("--aot with a type error is stopped by the fallback plain gate", () => {
+    const fixture = aotFixture(`const n: number = "not-a-number";\nconsole.log(n);\n`);
+    try {
+      const outcome = runBuild(fixture, ["--standalone", "--entry", "server.ts", "--aot"]);
+      expect(outcome.code).toBe(1);
+      expect(outcome.lines.join("\n")).toMatch(/Type gate failed/);
+      expect(outcome.lines.join("\n")).toMatch(/TS2322/);
+      expect(existsSync(join(fixture, "dist", "app"))).toBe(false);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("--trim passes through on this Bun", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "yatta-build-trim-"));
+    try {
+      writeFileSync(join(fixture, "server.ts"), servingEntry);
+      const outcome = runBuild(fixture, ["--standalone", "--entry", "server.ts", "--trim"]);
+      expect(outcome.code).toBe(0);
+      expect(existsSync(join(fixture, "dist", "app"))).toBe(true);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses --explain without --aot, with --aot on a Bun that produces no reports, and --aot with a foreign target", () => {
     const explain = runBuild(dir, ["--standalone", "--entry", "server.ts", "--explain"]);
     expect(explain.code).toBe(1);
     expect(explain.lines.join("\n")).toMatch(/--explain needs --aot/);
+
+    // On this Bun --explain just bundles normally with no report, so
+    // asking for it must fail rather than pretend a report was made.
+    const explainAot = runBuild(dir, ["--standalone", "--entry", "server.ts", "--aot", "--explain"]);
+    expect(explainAot.code).toBe(1);
+    expect(explainAot.lines.join("\n")).toMatch(/does not produce --explain reports/);
 
     const foreign = runBuild(dir, [
       "--standalone",

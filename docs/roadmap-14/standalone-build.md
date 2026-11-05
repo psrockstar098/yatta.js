@@ -78,15 +78,28 @@ yatta build --standalone --no-aot
 yatta build --standalone --aot
 ```
 
-What changes: faster startup, less memory (no bytecode, no JIT, no
-profiling data), and typed code runs faster because a property
-access becomes a load from a fixed offset. What it costs: the build
-takes longer, it builds only for the machine it runs on (build in
-CI or a container per platform — a foreign `--target` with `--aot`
-is refused), built-in objects become read-only, code from a string
-runs interpreted, and untyped hot code can run slower than under
-the JIT, because the JIT learns from real traffic and the compiler
-has to prove everything up front.
+What changes on a Bun that fully supports it: faster startup, less
+memory (no bytecode, no JIT, no profiling data), and typed code
+runs faster because a property access becomes a load from a fixed
+offset. What it costs: the build takes longer, it builds only for
+the machine it runs on (build in CI or a container per platform —
+a foreign `--target` with `--aot` is refused), built-in objects
+become read-only, code from a string runs interpreted, and untyped
+hot code can run slower than under the JIT, because the JIT learns
+from real traffic and the compiler has to prove everything up
+front.
+
+Version note, measured on Bun 1.4.4: there is no standalone
+`bun compile` command — only the `bun build --compile` form, which
+is what this command uses. `bun build --compile --aot` is accepted
+there, and the resulting binary builds, runs, and serves — but
+whether it changes codegen on 1.4.4 is unverified, because that
+Bun's `bun build` silently ignores flags it does not know and no
+`--explain` output exists to confirm anything. So on 1.4.4 the
+AOT speed and memory wins are not claimed: the mode is offered,
+the binary is verified end to end, and the benefit needs a newer
+Bun to measure. The same holds for `--trim`: it passes through,
+and its size effect is unverified on 1.4.4.
 
 So do not pick on principle. Build the same entrypoint both ways
 and measure under load that does what production does. Run the
@@ -97,7 +110,9 @@ memory matter most, AOT usually wins.
 
 `--explain` (with `--aot`) lists the code that compiled to a slow
 path, worst first, with a fix for each — the tool for keeping hot
-paths well-typed:
+paths well-typed. It is not available on Bun 1.4.4, where it just
+bundles normally with no report, so asking for it there fails
+rather than pretending a report was made:
 
 ```sh
 yatta build --standalone --aot --explain
@@ -108,10 +123,13 @@ smaller binary. It is experimental, and it does not turn on the
 string-to-code ban by itself (see below).
 
 AOT and the type gate: AOT relies on types, so it type-checks the
-whole program first. `yatta build --standalone --aot` runs
-`bun check --aot` on the entrypoint before compiling, and a type
-error stops the build with no binary written. For JIT builds the
-same gate is opt-in:
+whole program first. On a Bun that has it, `yatta build
+--standalone --aot` runs `bun check --aot` on the entrypoint
+before compiling. On Bun 1.4.4 that flag does not exist, so the
+gate falls back to plain `bun check` plus a successful
+`bun build --compile` — and the fallback is printed in the build
+output, not hidden. Either way, a type error stops the build with
+no binary written. For JIT builds the same gate is opt-in:
 
 ```sh
 yatta build --standalone --check
@@ -237,10 +255,12 @@ otherwise innocent asset directory.
   flag. If you need stack traces to map back, keep the build
   machine's source tree, not a sourcemap in the artifact.
 - Old Bun, new flags: Bun's `bun build` silently ignores flags it
-  does not know. A Bun that does not list `--aot`, `--trim`, or
-  `--explain` in `bun build --help` gets a refusal with its version
-  and an upgrade pointer — never a JIT binary silently standing in
-  for a requested AOT build.
+  does not know. `--aot` and `--trim` pass through anyway (they are
+  accepted on 1.4.4, and the binary is verified to build and run),
+  with the honest caveat that their effect is unverified there.
+  `--explain` is the exception: its whole value is the report, so
+  on a Bun that produces none it fails with an upgrade pointer
+  rather than pretending a report was made.
 - Worker entrypoints are not auto-detected. Bun compiles the
   entrypoints it is given; a worker spawned from a URL string at
   runtime is not an import, so it is not bundled. A single-entrypoint
@@ -273,6 +293,8 @@ otherwise innocent asset directory.
   shells out to `bun build` — so the map has nothing to do here.
   If a codegen step is ever added, it should use the map rather
   than temp files.
-- `bun run --aot` and `bun test --aot` (check like `bun compile`,
+- `bun run --aot` and `bun test --aot` (check like an AOT build,
   then run from source) are the development counterparts of the
   AOT build: use them to catch AOT problems without building.
+  `bun test --aot` is verified working on Bun 1.4.4 even though
+  `bun check --aot` is not.
