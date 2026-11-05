@@ -45,6 +45,7 @@
     "./vectors": "./src/types/vectors.ts",
     "./vectors/embed": "./src/types/vectors_embed.ts",
     "./auth": "./src/types/auth.ts",
+    "./jwt": "./src/types/jwt.ts",
     "./jobs": "./src/types/job.ts",
     "./bus-cluster": "./src/types/bus_cluster.ts",
     "./cache": "./src/types/cache_queue.ts",
