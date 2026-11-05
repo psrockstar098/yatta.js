@@ -864,11 +864,19 @@
 //    * ```
 //    */
 //   static json<T>(data: T, init: ResponseInit = {}): Response {
-//     const headers = new Headers(init.headers);
-//     if (!headers.has("Content-Type")) {
-//       headers.set("Content-Type", "application/json; charset=utf-8");
+//     if (
+//       init.headers === undefined &&
+//       init.status === undefined &&
+//       init.statusText === undefined
+//     ) {
+//       return new Response(JSON.stringify(data), {
+//         headers: { "content-type": "application/json; charset=utf-8" },
+//       });
 //     }
-//     return new Response(JSON.stringify(data), { ...init, headers });
+//     return new Response(
+//       JSON.stringify(data),
+//       this.withDefaultContentType(init, "application/json; charset=utf-8"),
+//     );
 //   }
 
 //   /**
@@ -884,11 +892,19 @@
 //    * ```
 //    */
 //   static text(data: string, init: ResponseInit = {}): Response {
-//     const headers = new Headers(init.headers);
-//     if (!headers.has("Content-Type")) {
-//       headers.set("Content-Type", "text/plain; charset=utf-8");
+//     if (
+//       init.headers === undefined &&
+//       init.status === undefined &&
+//       init.statusText === undefined
+//     ) {
+//       return new Response(data, {
+//         headers: { "content-type": "text/plain; charset=utf-8" },
+//       });
 //     }
-//     return new Response(data, { ...init, headers });
+//     return new Response(
+//       data,
+//       this.withDefaultContentType(init, "text/plain; charset=utf-8"),
+//     );
 //   }
 
 //   /**
@@ -2312,20 +2328,89 @@ export class API<TParams extends RouteParams = RouteParams> {
     return this;
   }
 
-  static json<T>(data: T, init: ResponseInit = {}): Response {
-    const headers = new Headers(init.headers);
-    if (!headers.has("Content-Type")) {
-      headers.set("Content-Type", "application/json; charset=utf-8");
+  /**
+   * Returns `init` with a default Content-Type added when the caller did
+   * not set one (matched case-insensitively, any header shape). Plain
+   * record / array headers are passed through untouched — the `Response`
+   * constructor parses them itself, so no `Headers` object is built. A
+   * caller Content-Type always wins. `null` or non-object headers are
+   * left to the `Headers` constructor, which rejects them exactly as the
+   * old `new Headers(init.headers)` path did (`new Headers(null)` throws
+   * TypeError in Bun — it is not treated as empty).
+   */
+  private static withDefaultContentType(
+    init: ResponseInit,
+    defaultType: string,
+  ): ResponseInit {
+    const headers = init.headers;
+    if (headers === undefined) {
+      return { ...init, headers: { "content-type": defaultType } };
     }
-    return new Response(JSON.stringify(data), { ...init, headers });
+    if (headers instanceof Headers) {
+      if (headers.has("content-type")) return init;
+      const copy = new Headers(headers);
+      copy.set("content-type", defaultType);
+      return { ...init, headers: copy };
+    }
+    if (Array.isArray(headers)) {
+      for (const [name] of headers) {
+        if (typeof name === "string" && name.toLowerCase() === "content-type")
+          return init;
+      }
+      return {
+        ...init,
+        headers: [...headers, ["content-type", defaultType] as [string, string]],
+      };
+    }
+    if (typeof headers === "object" && headers !== null) {
+      const record = headers as Record<string, string>;
+      for (const name of Object.keys(record)) {
+        if (name.toLowerCase() === "content-type") return init;
+      }
+      return { ...init, headers: { ...record, "content-type": defaultType } };
+    }
+    // null / number / string / ... : reject exactly as before.
+    const copy = new Headers(headers as HeadersInit);
+    if (!copy.has("content-type")) copy.set("content-type", defaultType);
+    return { ...init, headers: copy };
+  }
+
+  static json<T>(data: T, init: ResponseInit = {}): Response {
+    // Fast path (the common call: no caller headers, no status override):
+    // a plain-object headers literal — no `Headers` allocation, no spread.
+    // `Response.json()` is not usable here: it emits `application/json`
+    // without the `; charset=utf-8` suffix this method guarantees, it
+    // overwrites a caller Content-Type, and it throws on `undefined` data.
+    if (
+      init.headers === undefined &&
+      init.status === undefined &&
+      init.statusText === undefined
+    ) {
+      return new Response(JSON.stringify(data), {
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    }
+    return new Response(
+      JSON.stringify(data),
+      this.withDefaultContentType(init, "application/json; charset=utf-8"),
+    );
   }
 
   static text(data: string, init: ResponseInit = {}): Response {
-    const headers = new Headers(init.headers);
-    if (!headers.has("Content-Type")) {
-      headers.set("Content-Type", "text/plain; charset=utf-8");
+    // Same fast path as `json`: no `Headers` allocation on the common call.
+    if (
+      init.headers === undefined &&
+      init.status === undefined &&
+      init.statusText === undefined
+    ) {
+      return new Response(data, {
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
     }
-    return new Response(data, { ...init, headers });
+    return new Response(
+      data,
+      this.withDefaultContentType(init, "text/plain; charset=utf-8"),
+    );
   }
 
   static stream(body: ReadableStream, init: ResponseInit = {}): Response {
