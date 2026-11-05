@@ -15,7 +15,7 @@ import {
 import { basename, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { cmdDoctor } from "./cli_doctor";
-import { cmdMigrate, cmdMigrateMake, cmdMigrateStatus } from "./cli_migrate";
+import { cmdMigrate, cmdMigrateGenerate, cmdMigrateMake, cmdMigrateStatus, parseMigrateGenerateArgs } from "./cli_migrate";
 import { cmdDbBackup, cmdDbRestore } from "./cli_backup";
 import { cmdDeploy } from "./deploy/cli";
 
@@ -2271,6 +2271,7 @@ function cmdUsage(): number {
   log(`  ${c.cyan}yatta migrate${c.reset}      Run pending migrations`);
   log(`  ${c.cyan}yatta migrate:make <name>${c.reset}  Create a new migration file`);
   log(`  ${c.cyan}yatta migrate:status${c.reset}  Show migration status`);
+  log(`  ${c.cyan}yatta migrate:generate${c.reset}  Generate a migration from model changes`);
   log(`  ${c.cyan}yatta db:backup${c.reset}    Backup the SQLite database`);
   log(`  ${c.cyan}yatta db:restore <file>${c.reset}  Restore from backup`);
   log("");
@@ -2402,6 +2403,14 @@ export async function main(argv: string[]): Promise<number> {
       return cmdMigrateMake(rest[0] ?? "");
     case "migrate:status":
       return await cmdMigrateStatus();
+    case "migrate:generate": {
+      const parsed = parseMigrateGenerateArgs(rest);
+      if (parsed.error) {
+        fail(`migrate:generate: ${parsed.error}`);
+        return 1;
+      }
+      return await cmdMigrateGenerate(parsed.opts);
+    }
     case "db:backup":
       return cmdDbBackup();
     case "db:restore":
