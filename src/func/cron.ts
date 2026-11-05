@@ -12,6 +12,7 @@
 
 import { createCron } from "../types/job";
 import { jobs } from "./jobs";
+import { maybeScheduleCloudBackups } from "./cloud_backups";
 
 export const cron = createCron();
 
@@ -79,4 +80,14 @@ if (isScheduleLeader) {
       console.error("[cron] 10-minute health check failed:", err);
     }
   });
+}
+
+/*
+ * Cloud backups, leader-only like everything else in this file, and only
+ * when configured. Unconfigured — the default — this arms nothing, builds
+ * no S3 client, and starts no timer, so backup work costs exactly zero at
+ * startup. See src/func/cloud_backups.ts for the environment variables.
+ */
+if (isScheduleLeader) {
+  maybeScheduleCloudBackups(cron);
 }
