@@ -72,7 +72,7 @@ describe("bus cluster — unconfigured buses stay local", () => {
     const a = createEvents();
     const b = createEvents();
     const seen: unknown[] = [];
-    b.on("user.registered", (data) => seen.push(data));
+    b.on("user.registered", (data) => { seen.push(data); });
     await a.emit("user.registered", { userId: "u1" });
     expect(seen).toEqual([]);
   });
@@ -88,8 +88,8 @@ describe("bus cluster — in-process transport", () => {
     closers.push(() => ha.close(), () => hb.close());
     const aSeen: unknown[] = [];
     const bSeen: unknown[] = [];
-    a.on("user.registered", (data) => aSeen.push(data));
-    b.on("user.registered", (data) => bSeen.push(data));
+    a.on("user.registered", (data) => { aSeen.push(data); });
+    b.on("user.registered", (data) => { bSeen.push(data); });
     await ha.publish("user.registered", { userId: "u1" });
     await sleep(20);
     expect(aSeen).toEqual([{ userId: "u1" }]);
@@ -104,7 +104,7 @@ describe("bus cluster — in-process transport", () => {
     const hb = attachClusterTransport(b, hub.createTransport());
     closers.push(() => ha.close(), () => hb.close());
     const seen: string[] = [];
-    b.on("order.*", (_data, name) => seen.push(name));
+    b.on("order.*", (_data, name) => { seen.push(name); });
     await ha.publish("order.paid", { orderId: "o1" });
     await sleep(20);
     expect(seen).toEqual(["order.paid"]);
@@ -118,7 +118,7 @@ describe("bus cluster — in-process transport", () => {
     const hb = attachClusterTransport(b, hub.createTransport());
     closers.push(() => ha.close(), () => hb.close());
     const seen: unknown[] = [];
-    b.on("user.registered", (data) => seen.push(data));
+    b.on("user.registered", (data) => { seen.push(data); });
     // Reach into the transport: send the same envelope twice by hand.
     const transport = hub.createTransport();
     const hc = attachClusterTransport(createEvents(), transport);
@@ -147,15 +147,15 @@ describe("bus cluster — in-process transport", () => {
     const a = createEvents();
     const b = createEvents();
     const c = createEvents();
-    const ha = attachClusterTransport(a, hub.createTransport((e) => errors.push(e)));
-    const hb = attachClusterTransport(b, hub.createTransport((e) => errors.push(e)));
-    const hc = attachClusterTransport(c, hub.createTransport((e) => errors.push(e)));
+    const ha = attachClusterTransport(a, hub.createTransport((e) => { errors.push(e); }));
+    const hb = attachClusterTransport(b, hub.createTransport((e) => { errors.push(e); }));
+    const hc = attachClusterTransport(c, hub.createTransport((e) => { errors.push(e); }));
     closers.push(() => ha.close(), () => hb.close(), () => hc.close());
     b.on("ping", () => {
       throw new Error("boom");
     });
     const cSeen: unknown[] = [];
-    c.on("ping", (data) => cSeen.push(data));
+    c.on("ping", (data) => { cSeen.push(data); });
     await ha.publish("ping", { n: 1 });
     await sleep(30);
     expect(cSeen).toEqual([{ n: 1 }]);
@@ -164,7 +164,7 @@ describe("bus cluster — in-process transport", () => {
   it("invalid envelopes are dropped, never delivered", () => {
     const received: unknown[] = [];
     const bus = createEvents();
-    bus.on("user.registered", (data) => received.push(data));
+    bus.on("user.registered", (data) => { received.push(data); });
     const hub = createInProcessClusterHub();
     const handle = attachClusterTransport(bus, hub.createTransport());
     closers.push(() => handle.close());
@@ -261,8 +261,8 @@ describe("bus cluster — WebSocket hub", () => {
     closers.push(() => ha.close(), () => hb.close(), () => hc.close());
     const bSeen: unknown[] = [];
     const cSeen: unknown[] = [];
-    b.on("order.paid", (data) => bSeen.push(data));
-    c.on("order.paid", (data) => cSeen.push(data));
+    b.on("order.paid", (data) => { bSeen.push(data); });
+    c.on("order.paid", (data) => { cSeen.push(data); });
     await ha.publish("order.paid", { orderId: "o7" });
     await sleep(100);
     expect(bSeen).toEqual([{ orderId: "o7" }]);
@@ -285,7 +285,7 @@ describe("bus cluster — WebSocket hub", () => {
     const hg = attachClusterTransport(good, tg);
     closers.push(() => hg.close());
     const seen: unknown[] = [];
-    good.on("evil.event", (data) => seen.push(data));
+    good.on("evil.event", (data) => { seen.push(data); });
     // Raw socket, no token anywhere: header or first frame.
     const rogue = new WebSocket(hub.url);
     await new Promise<void>((resolve) => {
@@ -319,7 +319,7 @@ describe("bus cluster — WebSocket hub", () => {
     const hb = attachClusterTransport(bad, tb);
     closers.push(() => hb.close());
     const badSeen: unknown[] = [];
-    bad.on("order.paid", (data) => badSeen.push(data));
+    bad.on("order.paid", (data) => { badSeen.push(data); });
     await hg.publish("order.paid", { orderId: "o1" });
     await sleep(150);
     expect(badSeen).toEqual([]);
@@ -334,7 +334,7 @@ describe("bus cluster — WebSocket hub", () => {
     const hg = attachClusterTransport(good, tg);
     closers.push(() => hg.close());
     const seen: unknown[] = [];
-    good.on("evil.event", (data) => seen.push(data));
+    good.on("evil.event", (data) => { seen.push(data); });
     const raw = new WebSocket(hub.url, {
       headers: { authorization: "Bearer test-token-feat12" },
     } as never);
@@ -371,19 +371,19 @@ describe("bus durable — shared change log, no second log", () => {
     const db = memDb();
     const bus = createEvents();
     const got: Array<{ type: string; payload: unknown }> = [];
-    bus.on("user.registered", (data: any) => got.push({ type: "user.registered", payload: data.payload }));
-    bus.on("order.paid", (data: any) => got.push({ type: "order.paid", payload: data.payload }));
+    bus.on("user.registered", (data: any) => { got.push({ type: "user.registered", payload: data.payload }); });
+    bus.on("order.paid", (data: any) => { got.push({ type: "order.paid", payload: data.payload }); });
     db.transaction((tx) => {
       tx.users.insert({ email: "ada@example.com", name: "Ada" });
-      publishDurable(tx as never, "user.registered", { userId: "u1" });
-      publishDurable(tx as never, "order.paid", { orderId: "o1" });
+      publishDurable(tx, "user.registered", { userId: "u1" });
+      publishDurable(tx, "order.paid", { orderId: "o1" });
     });
-    const consumer = createDurableConsumer(bus, db as never);
+    const consumer = createDurableConsumer(bus, db);
     closers.push(() => consumer.stop());
     const result = await consumer.runOnce();
     expect(result).toEqual({ delivered: 2, skipped: 0, failed: 0 });
     expect(got.map((g) => g.type)).toEqual(["user.registered", "order.paid"]);
-    expect(got[0].payload).toEqual({ userId: "u1" });
+    expect(got[0]?.payload).toEqual({ userId: "u1" });
     expect(consumer.lastSeq).toBe(2);
     // Second pass delivers nothing: the checkpoint already covers it.
     expect(await consumer.runOnce()).toEqual({ delivered: 0, skipped: 0, failed: 0 });
@@ -395,18 +395,18 @@ describe("bus durable — shared change log, no second log", () => {
     const checkpoint = createFileCheckpoint(path.join(dir, "checkpoint.txt"));
     const busA = createEvents();
     const seenA: unknown[] = [];
-    busA.on("user.registered", (data: any) => seenA.push(data.payload));
-    publishDurable(db as never, "user.registered", { n: 1 });
-    publishDurable(db as never, "user.registered", { n: 2 });
-    const consumerA = createDurableConsumer(busA, db as never, { checkpoint });
+    busA.on("user.registered", (data: any) => { seenA.push(data.payload); });
+    publishDurable(db, "user.registered", { n: 1 });
+    publishDurable(db, "user.registered", { n: 2 });
+    const consumerA = createDurableConsumer(busA, db, { checkpoint });
     await consumerA.runOnce();
     expect(seenA).toEqual([{ n: 1 }, { n: 2 }]);
     // New consumer, same checkpoint file: only rows after it deliver.
-    publishDurable(db as never, "user.registered", { n: 3 });
+    publishDurable(db, "user.registered", { n: 3 });
     const busB = createEvents();
     const seenB: unknown[] = [];
-    busB.on("user.registered", (data: any) => seenB.push(data.payload));
-    const consumerB = createDurableConsumer(busB, db as never, { checkpoint });
+    busB.on("user.registered", (data: any) => { seenB.push(data.payload); });
+    const consumerB = createDurableConsumer(busB, db, { checkpoint });
     await consumerB.loadCheckpoint();
     await consumerB.runOnce();
     expect(seenB).toEqual([{ n: 3 }]);
@@ -415,8 +415,8 @@ describe("bus durable — shared change log, no second log", () => {
   it("a listener failure stops the pass at that row and retries in order", async () => {
     const db = memDb();
     const bus = createEvents();
-    publishDurable(db as never, "user.registered", { n: 1 });
-    publishDurable(db as never, "user.registered", { n: 2 });
+    publishDurable(db, "user.registered", { n: 1 });
+    publishDurable(db, "user.registered", { n: 2 });
     let failFirst = true;
     const got: unknown[] = [];
     bus.on("user.registered", (data: any) => {
@@ -424,8 +424,8 @@ describe("bus durable — shared change log, no second log", () => {
       got.push(data.payload);
     });
     const errors: Error[] = [];
-    const consumer = createDurableConsumer(bus, db as never, {
-      onError: (err) => errors.push(err),
+    const consumer = createDurableConsumer(bus, db, {
+      onError: (err) => { errors.push(err); },
     });
     const first = await consumer.runOnce();
     expect(first.failed).toBe(1);
@@ -442,7 +442,7 @@ describe("bus durable — shared change log, no second log", () => {
   it("handlers dedupe a replay by outboxEventId (at-least-once, honestly)", async () => {
     const db = memDb();
     const bus = createEvents();
-    publishDurable(db as never, "user.registered", { n: 1 });
+    publishDurable(db, "user.registered", { n: 1 });
     // A fresh consumer from the start replays the row: a crash between
     // emit and checkpoint save does exactly this in production.
     const applied = new Set<string>();
@@ -452,23 +452,23 @@ describe("bus durable — shared change log, no second log", () => {
       applied.add(data.outboxEventId);
       appliedPayloads.push(data.payload);
     });
-    const first = createDurableConsumer(bus, db as never);
+    const first = createDurableConsumer(bus, db);
     await first.runOnce();
-    const replay = createDurableConsumer(bus, db as never);
+    const replay = createDurableConsumer(bus, db);
     await replay.runOnce();
     expect(appliedPayloads).toEqual([{ n: 1 }]);
   });
 
   it("a duplicate eventId is rejected at record time, not delivered twice", async () => {
     const db = memDb();
-    publishDurable(db as never, "user.registered", { n: 1 }, { eventId: "dup-1" });
+    publishDurable(db, "user.registered", { n: 1 }, { eventId: "dup-1" });
     expect(() =>
-      publishDurable(db as never, "user.registered", { n: 1 }, { eventId: "dup-1" }),
+      publishDurable(db, "user.registered", { n: 1 }, { eventId: "dup-1" }),
     ).toThrow();
     const bus = createEvents();
     const got: unknown[] = [];
-    bus.on("user.registered", (data: any) => got.push(data.payload));
-    const consumer = createDurableConsumer(bus, db as never);
+    bus.on("user.registered", (data: any) => { got.push(data.payload); });
+    const consumer = createDurableConsumer(bus, db);
     await consumer.runOnce();
     expect(got).toEqual([{ n: 1 }]);
   });
@@ -476,7 +476,7 @@ describe("bus durable — shared change log, no second log", () => {
   it("the durable relay marks rows published only after the bus emit resolves", async () => {
     const db = memDb();
     const bus = createEvents();
-    const entry = recordOutbox(db as never, {
+    const entry = recordOutbox(db, {
       eventType: "user.registered",
       payload: { n: 1 },
     });
@@ -484,34 +484,34 @@ describe("bus durable — shared change log, no second log", () => {
     bus.on("user.registered", () => {
       if (fail) throw new Error("listener down");
     });
-    const relay = createDurableRelay(db as never, bus, {
+    const relay = createDurableRelay(db, bus, {
       pollIntervalMs: 60_000,
       retryBaseMs: 1,
       retryMaxMs: 1,
     });
     const first = await relay.runOnce();
     expect(first.failed).toBe(1);
-    expect(getOutboxByEventId(db as never, entry.eventId)?.status).toBe("pending");
+    expect(getOutboxByEventId(db, entry.eventId)?.status).toBe("pending");
     fail = false;
     await sleep(10);
     const second = await relay.runOnce();
     expect(second.published).toBe(1);
-    expect(getOutboxByEventId(db as never, entry.eventId)?.status).toBe("published");
+    expect(getOutboxByEventId(db, entry.eventId)?.status).toBe("published");
   });
 
   it("relay and consumer sharing a seen window do not double-deliver", async () => {
     const db = memDb();
     const bus = createEvents();
-    publishDurable(db as never, "user.registered", { n: 1 });
+    publishDurable(db, "user.registered", { n: 1 });
     const seen = new SeenEventIds();
     const got: unknown[] = [];
-    bus.on("user.registered", (data: any) => got.push(data.payload));
-    const relay = createDurableRelay(db as never, bus, {
+    bus.on("user.registered", (data: any) => { got.push(data.payload); });
+    const relay = createDurableRelay(db, bus, {
       pollIntervalMs: 60_000,
       seen,
     });
     await relay.runOnce();
-    const consumer = createDurableConsumer(bus, db as never, { seen });
+    const consumer = createDurableConsumer(bus, db, { seen });
     const result = await consumer.runOnce();
     expect(result.skipped).toBe(1);
     expect(got).toEqual([{ n: 1 }]);
@@ -519,7 +519,7 @@ describe("bus durable — shared change log, no second log", () => {
 
   it("rejects invalid durable event names", async () => {
     const db = memDb();
-    expect(() => publishDurable(db as never, "*", {})).toThrow();
-    expect(() => publishDurable(db as never, "a..b", {})).toThrow();
+    expect(() => publishDurable(db, "*", {})).toThrow();
+    expect(() => publishDurable(db, "a..b", {})).toThrow();
   });
 });

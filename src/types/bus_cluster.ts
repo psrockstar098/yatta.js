@@ -515,6 +515,9 @@ export function createClusterHub(options: ClusterHubOptions = {}): ClusterHubHan
       return new Response("Upgrade failed.", { status: 400 });
     },
     websocket: {
+      // Type placeholder, per Bun's docs: this types ws.data and
+      // the `data` option of server.upgrade below.
+      data: {} as { authed: boolean },
       maxPayloadLength: maxPayloadBytes,
       idleTimeout: options.idleTimeoutSec ?? 120,
       open(ws) {
@@ -525,6 +528,7 @@ export function createClusterHub(options: ClusterHubOptions = {}): ClusterHubHan
           // First-frame auth grace: a peer that cannot set headers
           // gets a few seconds to send its token, then it is cut off.
           const timer = setTimeout(() => {
+            graceTimers = graceTimers.filter((t) => t !== timer);
             if (!authed.has(socket)) {
               try {
                 socket.close(4401, "Unauthenticated.");
@@ -537,7 +541,12 @@ export function createClusterHub(options: ClusterHubOptions = {}): ClusterHubHan
       },
       message(ws, message) {
         const socket = ws as unknown as HubSocket;
-        const raw = typeof message === "string" ? message : Buffer.from(message as ArrayBuffer).toString("utf8");
+        const raw =
+          typeof message === "string"
+            ? message
+            : message instanceof ArrayBuffer
+              ? Buffer.from(message).toString("utf8")
+              : Buffer.from(message as Uint8Array).toString("utf8");
         if (!authed.has(socket)) {
           // First-frame auth: the only message an unauthenticated
           // socket may send. The token is checked, never logged.
@@ -584,10 +593,14 @@ export function createClusterHub(options: ClusterHubOptions = {}): ClusterHubHan
 
   return {
     get port() {
-      return server.port;
+      const bound = server.port;
+      if (bound === undefined) throw new Error("Cluster hub did not bind a port.");
+      return bound;
     },
     get url() {
-      return `ws://127.0.0.1:${server.port}/bus`;
+      const host = options.hostname;
+      const connectHost = host === undefined || host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
+      return `ws://${connectHost}:${server.port}/bus`;
     },
     get peerCount() {
       return authed.size;
@@ -621,6 +634,13 @@ export interface WebSocketClusterTransportOptions {
   reconnectBaseMs?: number;
   /** Reconnect delay cap in milliseconds. Defaults to 5000. */
   reconnectMaxMs?: number;
+  /**
+   * Maximum reconnect attempts after an unexpected close. Unset by
+   * default: retry forever with capped backoff. Set it when a peer
+   * with a wrong token should stop retrying and surface as
+   * disconnected instead of looping forever.
+   */
+  maxReconnectAttempts?: number;
   /** Called on connect, disconnect, and reconnect attempts. */
   onStatus?: (status: "connected" | "disconnected" | "reconnecting") => void;
 }
@@ -728,6 +748,11 @@ export class WebSocketClusterTransport implements ClusterTransport {
       }
       this.options.onStatus?.("reconnecting");
       if (this.options.reconnect === false) {
+        this.options.onStatus?.("disconnected");
+        return;
+      }
+      const maxAttempts = this.options.maxReconnectAttempts;
+      if (maxAttempts !== undefined && this.reconnectAttempts >= maxAttempts) {
         this.options.onStatus?.("disconnected");
         return;
       }
