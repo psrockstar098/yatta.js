@@ -170,6 +170,8 @@ export interface ColumnDefinition {
   references?: { table: string; column: string; onDelete?: string };
   /** Whether an index should be created on this column. */
   isIndex?: boolean;
+  /** Whether this column is the table's time-series timestamp (see `.timeSeries()`). */
+  isTimeSeries?: boolean;
   /** Whether the column is indexed for full-text search (see `.searchable()`). */
   isSearchable?: boolean;
   /** Whether column is treated as a boolean (mapped between boolean and 0/1 in SQLite). */
@@ -286,6 +288,43 @@ export class ColumnBuilder<V = unknown, Optional extends boolean = false, IsRef 
    */
   index(): ColumnBuilder<V, Optional, IsRef> {
     return this.clone<V, Optional, IsRef>({ isIndex: true });
+  }
+
+  /**
+   * Marks this column as the table's time-series timestamp.
+   *
+   * A time-series table holds append-mostly rows stamped with a time, and
+   * is read back in time order or by time range. Marking the timestamp
+   * column gives the table a dedicated index on that column at schema
+   * sync, so time-ordered reads and range scans use the index instead of
+   * sorting the whole table. A table with no marked column is untouched:
+   * the write path is exactly the existing one.
+   *
+   * Only integer (milliseconds since epoch) and text (ISO timestamp)
+   * columns can be marked: those are the two timestamp shapes the schema
+   * layer already uses. One marked column per table; rollups read the
+   * marked column when a policy does not name its time column.
+   *
+   * @example
+   * ```ts
+   * readings: {
+   *   id: col.id(),
+   *   at: col.integer().timeSeries(),
+   *   value: col.real(),
+   * },
+   * ```
+   */
+  timeSeries(): ColumnBuilder<V, Optional, IsRef> {
+    if (this.def.type !== "INTEGER" && this.def.type !== "TEXT") {
+      throw new YattaError(
+        "timeSeries() is only for integer or text timestamp columns. " +
+          "Store the timestamp as milliseconds since epoch (integer) or an ISO string (text).",
+      );
+    }
+    if (this.def.isJson || this.def.isUuid || this.def.isBoolean) {
+      throw new YattaError("timeSeries() cannot mark a JSON, UUID, or boolean column as a timestamp.");
+    }
+    return this.clone<V, Optional, IsRef>({ isTimeSeries: true });
   }
 
   /**
@@ -3008,6 +3047,7 @@ export class YattaDB {
           const columnSqls: string[] = [];
           const indexSqls: string[] = [];
           const indexedCols = new Set<string>();
+          const timeSeriesCols: string[] = [];
 
           for (const [colName, colBuilder] of Object.entries(tableDef)) {
             const def = colBuilder.def;
@@ -3024,6 +3064,31 @@ export class YattaDB {
                 `CREATE INDEX IF NOT EXISTS "${idxName}" ON "${tableName.replace(/"/g, '""')}" ("${colName.replace(/"/g, '""')}");`,
               );
             }
+
+            // A marked time-series column gets its own time-ordered index,
+            // unless .index() already put one on the same column: two
+            // identical indexes would double the write cost for no gain.
+            // The marker itself, not the index name, is what rollups read.
+            if (def.isTimeSeries) {
+              timeSeriesCols.push(colName);
+              if (!def.isIndex && !indexedCols.has(colName)) {
+                indexedCols.add(colName);
+                const tsIdxName = `idx_timeseries_${tableName}_${colName}`.replace(/"/g, '""');
+                indexSqls.push(
+                  `CREATE INDEX IF NOT EXISTS "${tsIdxName}" ON "${tableName.replace(/"/g, '""')}" ("${colName.replace(/"/g, '""')}");`,
+                );
+              }
+            }
+          }
+
+          // One timestamp orders a table's rows. Two marked columns would
+          // leave rollups guessing which one is the time axis, so the
+          // schema is rejected here instead of silently picking one.
+          if (timeSeriesCols.length > 1) {
+            throw new YattaError(
+              `Table "${tableName}" marks more than one time-series column (${timeSeriesCols.join(", ")}). ` +
+                `Mark exactly one timestamp column per table with .timeSeries().`,
+            );
           }
 
           this._sqlite.run(`CREATE TABLE IF NOT EXISTS "${tableName.replace(/"/g, '""')}" (${columnSqls.join(", ")});`);
@@ -3076,6 +3141,13 @@ export class YattaDB {
               const idxName = `idx_${tableName}_${colName}`.replace(/"/g, '""');
               indexSqls.push(
                 `CREATE INDEX IF NOT EXISTS "${idxName}" ON "${tableName.replace(/"/g, '""')}" ("${colName.replace(/"/g, '""')}");`,
+              );
+            }
+            if (def.isTimeSeries && !def.isIndex && !indexedCols.has(colName)) {
+              indexedCols.add(colName);
+              const tsIdxName = `idx_timeseries_${tableName}_${colName}`.replace(/"/g, '""');
+              indexSqls.push(
+                `CREATE INDEX IF NOT EXISTS "${tsIdxName}" ON "${tableName.replace(/"/g, '""')}" ("${colName.replace(/"/g, '""')}");`,
               );
             }
           }
