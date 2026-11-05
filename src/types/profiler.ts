@@ -75,8 +75,12 @@ interface InspectorSessionLike {
   disconnect(): void;
   post(
     method: string,
-    params?: Record<string, unknown>,
-    callback?: (err: Error | null, result?: any) => void,
+    callback: (err: Error | null, result?: any) => void,
+  ): void;
+  post(
+    method: string,
+    params: Record<string, unknown>,
+    callback: (err: Error | null, result?: any) => void,
   ): void;
 }
 
@@ -558,7 +562,7 @@ export class EventLoopLagMonitor {
   private timer?: ReturnType<typeof setInterval>;
   private samples: LagSample[] = [];
   private last: LagSample | null = null;
-  private allTimeMaxMs = 0;
+  private allTimeMaxValue = 0;
   private listeners = new Set<(sample: LagSample) => void>();
 
   constructor(options: EventLoopLagMonitorOptions = {}) {
@@ -621,7 +625,7 @@ export class EventLoopLagMonitor {
     try {
       this.histogram.reset();
     } catch {}
-    if (sample.maxMs > this.allTimeMaxMs) this.allTimeMaxMs = sample.maxMs;
+    if (sample.maxMs > this.allTimeMaxValue) this.allTimeMaxValue = sample.maxMs;
     this.last = sample;
     this.samples.push(sample);
     if (this.samples.length > this.maxSamples) this.samples.shift();
@@ -662,7 +666,7 @@ export class EventLoopLagMonitor {
   }
 
   get allTimeMaxMs(): number {
-    return this.allTimeMaxMs;
+    return this.allTimeMaxValue;
   }
 }
 
