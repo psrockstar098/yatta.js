@@ -156,6 +156,8 @@ describe("replication — applier", () => {
     const rows = applier.replicatedEntries("app", "app");
     expect(rows.length).toBe(2);
     expect(rows[0]!.eventType).toBe("user.registered");
+    // The original relay status survives the trip, for inspection only.
+    expect(rows[0]!.status).toBe("pending");
   });
 
   it("is idempotent: redelivery of the same batch applies nothing twice", async () => {

@@ -429,10 +429,18 @@ function ensureReplicationTables(store: OutboxStore): void {
       payload TEXT NOT NULL,
       occurred_at INTEGER NOT NULL,
       created_at INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
       PRIMARY KEY (source, file, seq),
       UNIQUE (source, file, event_id)
     );
   `);
+  // Tables created before the status column existed gain it here.
+  // The relay status of a replicated row is history, not a queue
+  // state: it is stored for inspection, never acted on by the replica.
+  const columns = store.rawAll<{ name: string }>(`PRAGMA table_info("${REPLICATION_LOG_TABLE}");`);
+  if (!columns.some((c) => c.name === "status")) {
+    store.rawRun(`ALTER TABLE "${REPLICATION_LOG_TABLE}" ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';`);
+  }
 }
 
 /**
@@ -446,9 +454,12 @@ function ensureReplicationTables(store: OutboxStore): void {
  *    contract says a gap means nothing was ever published there.
  * 4. Each entry is applied idempotently: seq at or below the checkpoint
  *    or an already-applied event_id is skipped, never re-applied.
- * 5. The checkpoint advances per entry, not per batch. A crash or a
- *    failing apply handler mid-batch resumes from the last good entry,
- *    and redelivery converges instead of corrupting.
+ * 5. The apply handler runs before the entry is stored, and the
+ *    checkpoint advances per entry, not per batch. A failing handler
+ *    leaves the entry unstored, so the next pull redelivers and
+ *    retries it; a crash after storing resumes after it. Redelivery
+ *    converges instead of corrupting, as long as handlers are
+ *    idempotent.
  */
 export class ReplicationApplier {
   private readonly secret: string;
@@ -493,7 +504,7 @@ export class ReplicationApplier {
     ensureReplicationTables(this.store);
     const rows = this.store.rawAll<any>(
       `SELECT seq, event_id, event_type, aggregate_type, aggregate_id, payload,
-              occurred_at, created_at
+              occurred_at, created_at, status
        FROM "${REPLICATION_LOG_TABLE}"
        WHERE source = ? AND file = ? AND seq > ?
        ORDER BY seq ASC LIMIT ?;`,
@@ -508,7 +519,7 @@ export class ReplicationApplier {
       payload: JSON.parse(row.payload),
       occurredAt: row.occurred_at,
       dedupeKey: null,
-      status: "published" as const,
+      status: (row.status ?? "pending") as OutboxEntry["status"],
       attempts: 0,
       nextAttemptAt: row.occurred_at,
       publishedAt: null,
@@ -562,8 +573,8 @@ export class ReplicationApplier {
       this.store.rawRun(
         `INSERT INTO "${REPLICATION_LOG_TABLE}"
            (source, file, seq, event_id, event_type, aggregate_type, aggregate_id,
-            payload, occurred_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+            payload, occurred_at, created_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
         [
           source,
           file,
@@ -575,6 +586,7 @@ export class ReplicationApplier {
           JSON.stringify(entry.payload),
           entry.occurredAt,
           entry.createdAt,
+          entry.status,
         ],
       );
       this.store.rawRun(
