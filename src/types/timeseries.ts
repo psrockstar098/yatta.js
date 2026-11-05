@@ -193,7 +193,11 @@ export function parseRollupDuration(value: string | number): number {
       `Invalid rollup duration "${value}". Use milliseconds, or a number with a unit: ms, s, m, h, d, w (for example "30d").`,
     );
   }
-  return Number(match[1]) * DURATION_UNITS[match[2]];
+  const ms = Number(match[1]) * DURATION_UNITS[match[2]];
+  if (ms <= 0) {
+    throw new YattaError(`Invalid rollup duration "${value}". Durations must be positive.`);
+  }
+  return ms;
 }
 
 /**
@@ -294,6 +298,7 @@ export function normalizeRollupPolicy(store: TimeSeriesStore, policy: RollupPoli
     throw new YattaError(`Rollup policy for "${policy.source}" needs at least one tier.`);
   }
   const seenTiers = new Set<string>();
+  const tiersSoFar = new Set<string>();
   const tiers: NormalizedRollupTier[] = policy.tiers.map((tier) => {
     if (!tier || typeof tier !== "object") {
       throw new YattaError(`Rollup tier for "${policy.source}" must be an object.`);
@@ -310,6 +315,15 @@ export function normalizeRollupPolicy(store: TimeSeriesStore, policy: RollupPoli
     }
     const rollupTable = tier.rollupTable ?? `${policy.source}_${tier.name}`;
     checkIdent("rollup table", rollupTable);
+    // Two tiers writing one summary table would delete each other's
+    // buckets: a tier run deletes by bucket_start before re-inserting,
+    // and bucket starts overlap across window sizes.
+    if (tiersSoFar.has(rollupTable)) {
+      throw new YattaError(
+        `Rollup tiers "${tier.name}" and another tier of "${policy.source}" both write to "${rollupTable}". Give each tier its own summary table.`,
+      );
+    }
+    tiersSoFar.add(rollupTable);
     if (rollupTable === policy.source) {
       throw new YattaError(`Rollup tier "${tier.name}" would write summaries into its own source table "${policy.source}".`);
     }
@@ -427,7 +441,7 @@ export function runRollupTier(
     const measureSelect = policy.measures
       .flatMap((m) => [`SUM(${q(m)})`, `AVG(${q(m)})`, `MIN(${q(m)})`, `MAX(${q(m)})`])
       .join(", ");
-    const targetCols = `"bucket_start", "bucket_end", "row_count"${groupList ? `, ${groupList}` : ""}${measureCols ? `, ${measureCols}` : ""}`;
+    const targetCols = `"bucket_start", "bucket_end", "row_count"${groupList}${measureCols ? `, ${measureCols}` : ""}`;
     for (const { b: bucketStart } of windows) {
       const bucketEnd = bucketStart + tier.windowMs;
       // Replace, never append: the same window re-run yields the same rows.

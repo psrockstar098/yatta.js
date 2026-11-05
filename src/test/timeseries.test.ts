@@ -265,6 +265,59 @@ describe("rollup policy validation", () => {
     expect(db.table("readings").findMany({})).toHaveLength(5);
   });
 
+  it("rejects two tiers sharing one summary table and a zero duration", () => {
+    const db = memDb();
+    expect(() =>
+      normalizeRollupPolicy(db as any, {
+        ...policy,
+        tiers: [
+          { name: "a", window: "hour", olderThan: "1d", rollupTable: "shared" },
+          { name: "b", window: "day", olderThan: "7d", rollupTable: "shared" },
+        ],
+      }),
+    ).toThrow(YattaError);
+    expect(() =>
+      normalizeRollupPolicy(db as any, {
+        ...policy,
+        tiers: [{ name: "hourly", window: "hour", olderThan: "0d" }],
+      }),
+    ).toThrow(YattaError);
+  });
+
+  it("summarizes NULL groups into one row and keeps group filters parameterized", () => {
+    const nullableSchema = {
+      events: {
+        id: col.id(),
+        at: col.integer().timeSeries(),
+        region: col.text().nullable(),
+        value: col.real(),
+      },
+    };
+    const db2 = createDatabase({ path: ":memory:", schema: nullableSchema, forceNew: true });
+    dbs.push(db2 as any);
+    db2.table("events").insert({ at: BASE + 5 * MIN, region: null, value: 4 });
+    db2.table("events").insert({ at: BASE + 6 * MIN, region: null, value: 6 });
+    db2.table("events").insert({ at: BASE + 7 * MIN, region: `nor"th`, value: 8 });
+    const p = {
+      source: "events",
+      measures: ["value"],
+      groupBy: ["region"],
+      tiers: [{ name: "hourly", window: "hour", olderThan: "1d" }],
+    } as const;
+    runRollupPolicy(db2 as any, p as any, { now: BASE + 10 * DAY });
+    runRollupPolicy(db2 as any, p as any, { now: BASE + 10 * DAY });
+    const rows = readRollup(db2 as any, p as any, "hourly");
+    expect(rows).toHaveLength(2);
+    const nullGroup = rows.find((r) => r.region === null)!;
+    expect(nullGroup.row_count).toBe(2);
+    expect(nullGroup.value_sum).toBe(10);
+    // A quote inside a filter value must not break the query or match
+    // anything it should not: values are bound, never spliced.
+    const quoted = readRollup(db2 as any, p as any, "hourly", { where: { region: `nor"th` } });
+    expect(quoted).toHaveLength(1);
+    expect(quoted[0].value_sum).toBe(8);
+  });
+
   it("defaults the time column to the marked column and the table name to source_tier", () => {
     const db = memDb();
     const normalized = normalizeRollupPolicy(db as any, policy);
