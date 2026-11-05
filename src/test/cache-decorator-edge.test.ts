@@ -334,10 +334,10 @@ describe("edge-aware engine wiring", () => {
     };
     const cache = new EdgeAwareCacheEngine({ maxItems: 100, edge: fake });
     await cache.set("k1", "v1", { tags: ["users"] });
-    expect(await cache.get("k1")).toBe("v1");
+    expect(await cache.get<string>("k1")).toBe("v1");
     const evicted = await cache.invalidateTags("users");
     expect(evicted).toBe(1);
-    expect(await cache.get("k1")).toBeNull();
+    expect(await cache.get<string>("k1")).toBeNull();
     expect(calls.length).toBe(1);
     expect(JSON.parse(calls[0]!.body)).toEqual({ tags: ["users"] });
   });
@@ -347,7 +347,7 @@ describe("edge-aware engine wiring", () => {
     expect(cache.edgeProvider).toBeNull();
     await cache.set("k1", "v1", { tags: ["users"] });
     expect(await cache.invalidateTags("users")).toBe(1);
-    expect(await cache.get("k1")).toBeNull();
+    expect(await cache.get<string>("k1")).toBeNull();
   });
 
   it("a provider failure does not break local invalidation", async () => {
@@ -364,7 +364,7 @@ describe("edge-aware engine wiring", () => {
       await cache.set("k1", "v1", { tags: ["users"] });
       const evicted = await cache.invalidateTags("users");
       expect(evicted).toBe(1);
-      expect(await cache.get("k1")).toBeNull();
+      expect(await cache.get<string>("k1")).toBeNull();
       expect(warn.seen.join(" ")).toContain("cloudflare");
       expect(warn.seen.join(" ")).not.toContain("tok-abc");
     } finally {
@@ -384,7 +384,7 @@ describe("edge-aware engine wiring", () => {
     const warn = captureWarn();
     try {
       expect(await invalidateTagsWithEdge(cache, "users", failing)).toBe(1);
-      expect(await cache.get("k1")).toBeNull();
+      expect(await cache.get<string>("k1")).toBeNull();
     } finally {
       warn.restore();
     }

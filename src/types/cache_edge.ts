@@ -103,6 +103,9 @@ async function postPurge(
         ? AbortSignal.timeout(PURGE_TIMEOUT_MS)
         : undefined,
   });
+  // fetch rejects on network failure, not on HTTP errors, so the
+  // status check here is what turns a 4xx/5xx purge into a failure
+  // (Bun docs, fetch page: fetch implements the WHATWG standard).
   if (!response.ok) {
     throw new Error(
       `Edge purge failed for provider "${providerName}": HTTP ${response.status}.`,
