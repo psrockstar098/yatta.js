@@ -372,6 +372,24 @@ describe("ThresholdCapture with a stub profiler", () => {
     await profiler.stop();
   });
 
+  it("stop() mid-capture ends the wait without storing a partial", async () => {
+    const profiler = stubProfiler();
+    const capture = new ThresholdCapture({
+      profiler,
+      thresholdMs: 50,
+      captureDurationMs: 60000,
+    });
+    capture.start();
+    capture.observe(100);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(capture.isCapturing).toBe(true);
+    capture.stop();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(capture.isCapturing).toBe(false);
+    expect(capture.captures()).toHaveLength(0);
+    expect(profiler.isRunning).toBe(false);
+  });
+
   it("rejects bad options", () => {
     const profiler = stubProfiler();
     expect(

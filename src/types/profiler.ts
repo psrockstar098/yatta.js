@@ -248,6 +248,11 @@ export class SamplingProfiler {
         );
       }
       return profile;
+    } catch (err) {
+      if (err instanceof ProfilerError) throw err;
+      throw new ProfilerError("SamplingProfiler: failed to stop", {
+        cause: err,
+      });
     } finally {
       try {
         session.disconnect();
@@ -314,7 +319,10 @@ export function collapsedStacks(profile: CpuProfile): FoldedStack[] {
     const frames: string[] = [];
     let current = byId.get(sampleId);
     while (current) {
-      const label = frameLabel(current.callFrame);
+      // A frame name is runtime data, not trusted syntax: a ";" or
+      // newline in it would split one frame into two in the folded
+      // format and corrupt the flamegraph built from it.
+      const label = frameLabel(current.callFrame).replace(/[;\n\r]/g, " ");
       if (current.callFrame.functionName !== "(root)") {
         frames.unshift(label);
       }
@@ -427,10 +435,20 @@ export function toFlamegraphSvg(
   profile: CpuProfile,
   options: FlamegraphOptions = {},
 ): string {
-  const width = options.width ?? 1200;
-  const rowHeight = options.rowHeight ?? 16;
-  const fontSize = options.fontSize ?? 12;
-  const title = options.title ?? "CPU profile flamegraph";
+  // Numbers are coerced, never interpolated raw: a caller-supplied value
+  // is the only thing that reaches the SVG template, and a string there
+  // could break out of an attribute.
+  const finiteOr = (value: number | undefined, fallback: number): number =>
+    typeof value === "number" && Number.isFinite(value) && value > 0
+      ? value
+      : fallback;
+  const width = finiteOr(options.width, 1200);
+  const rowHeight = finiteOr(options.rowHeight, 16);
+  const fontSize = finiteOr(options.fontSize, 12);
+  const title =
+    typeof options.title === "string"
+      ? options.title.slice(0, 200)
+      : "CPU profile flamegraph";
 
   const root: FlameNode = { label: "", samples: 0, children: new Map() };
   for (const { stack, samples } of collapsedStacks(profile)) {
@@ -730,6 +748,10 @@ export class ThresholdCapture {
   private cooldownUntil = 0;
   private stored: CapturedProfile[] = [];
   private timer?: ReturnType<typeof setTimeout>;
+  // Set when stop() interrupts a capture mid-window, so the wait ends
+  // instead of hanging forever with the profiler left running.
+  private waitResolve?: () => void;
+  private aborted = false;
 
   constructor(options: ThresholdCaptureOptions) {
     if (!options.profiler) {
@@ -787,6 +809,7 @@ export class ThresholdCapture {
   start(): boolean {
     if (this.enabled) return false;
     this.enabled = true;
+    this.aborted = false;
     return true;
   }
 
@@ -794,9 +817,17 @@ export class ThresholdCapture {
     if (!this.enabled) return false;
     this.enabled = false;
     this.streak = 0;
+    this.aborted = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = undefined;
+    }
+    // Wake a capture waiting out its window so it stops its profiler
+    // instead of hanging with capturing stuck on.
+    if (this.waitResolve) {
+      const resolve = this.waitResolve;
+      this.waitResolve = undefined;
+      resolve();
     }
     return true;
   }
@@ -840,10 +871,17 @@ export class ThresholdCapture {
       if (!started && !this.profiler.isRunning) return;
       ownsProfile = true;
       await new Promise<void>((resolve) => {
-        this.timer = setTimeout(resolve, this.captureDurationMs);
+        this.waitResolve = resolve;
+        this.timer = setTimeout(() => {
+          this.waitResolve = undefined;
+          resolve();
+        }, this.captureDurationMs);
       });
       this.timer = undefined;
       const profile = await this.profiler.stop();
+      // Stopped mid-window: the partial profile is discarded, not stored
+      // as if it were a full capture, and no cooldown is set.
+      if (this.aborted) return;
       if (!profile) return;
       const capture: CapturedProfile = {
         startedAt,
