@@ -69,7 +69,8 @@
     "./ds": "./src/types/ds.ts",
     "./timeseries": "./src/types/timeseries.ts",
     "./cloud-backups": "./src/types/cloud_backups.ts",
-    "./replay": "./src/types/replay.ts"
+    "./replay": "./src/types/replay.ts",
+    "./replication": "./src/types/replication.ts"
   },
   "bin": {
     "yatta": "bin/yatta.js"
