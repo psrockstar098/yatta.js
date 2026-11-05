@@ -20,10 +20,10 @@ import {
   verifyAppendEntriesSignature,
   createSignedHttpRaftTransport,
   createRaftHttpHandler,
-  createNodeToken,
   type RaftLogEntry,
   type RaftNodeOptions,
 } from "../types/raft";
+import { createNodeToken } from "../types/replication";
 
 const SECRET = "test-raft-secret-that-is-not-real";
 
