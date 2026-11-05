@@ -165,6 +165,7 @@ describe("general rate-limit middleware", () => {
       /windowSec/,
     );
     expect(() => createRateLimit({ maxKeys: NaN })).toThrow(/maxKeys/);
+    expect(() => createRateLimit({ dimensions: ["hostname" as never] })).toThrow(/dimension/);
   });
 });
 
@@ -307,6 +308,31 @@ describe("proxy-aware client IP", () => {
     });
     expect(resolveClientIp(req, { trustProxy: true })).toBe("203.0.113.5");
   });
+
+  it("folds an IPv4-mapped IPv6 address to its IPv4 form, so one client holds one bucket", async () => {
+    expect(
+      resolveClientIp(new Request("http://localhost/x"), {
+        getClientIp: () => "::ffff:203.0.113.7",
+      }),
+    ).toBe("203.0.113.7");
+    // A genuine IPv6 address is untouched.
+    expect(
+      resolveClientIp(new Request("http://localhost/x"), {
+        getClientIp: () => "2001:db8::1",
+      }),
+    ).toBe("2001:db8::1");
+    const api = limitedApi({
+      limit: 1,
+      windowSec: 60,
+      getClientIp: (req) => req.headers.get("x-test-ip") ?? undefined,
+    });
+    expect(
+      (await api.handle(get("http://localhost/x", { "x-test-ip": "::ffff:203.0.113.7" }), {})).status,
+    ).toBe(200);
+    expect(
+      (await api.handle(get("http://localhost/x", { "x-test-ip": "203.0.113.7" }), {})).status,
+    ).toBe(429);
+  });
 });
 
 describe("OAuth token endpoint wiring", () => {
@@ -322,6 +348,22 @@ describe("OAuth token endpoint wiring", () => {
     );
     // All six come from the same unidentified client, so they share
     // the "unknown" bucket — the point is the preset's limit, not the IP.
+    expect(results).toEqual([200, 200, 200, 200, 200, 429]);
+  });
+
+  it("still limits when the token router is mounted under a parent router", async () => {
+    // The limiter must live on the router that owns the route. A
+    // parent router's middleware does not run for mounted children,
+    // so the child router carries its own limiter here.
+    const child = createAPI();
+    child.use(oauthTokenRateLimit({ getClientIp: () => "1.1.1.1" }));
+    child.post("/token", () => new Response("ok"));
+    const parent = createAPI();
+    parent.mount("/oauth", child);
+    const results = await statuses(
+      parent,
+      Array.from({ length: 6 }, () => post("http://localhost/oauth/token")),
+    );
     expect(results).toEqual([200, 200, 200, 200, 200, 429]);
   });
 

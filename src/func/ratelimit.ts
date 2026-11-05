@@ -193,6 +193,17 @@ export function normalizeRoutePath(pathname: string): string {
   return path || "/";
 }
 
+// An IPv4 client seen over an IPv6 socket arrives as "::ffff:1.2.3.4"
+// (that is what `server.requestIP` returns for a loopback client, and
+// for any IPv4 peer on a dual-stack socket). Without normalising, the
+// same client holds two buckets — one per address spelling — and gets
+// twice the budget. Only the mapped form is folded; a genuine IPv6
+// address is left exactly as it arrived.
+function normalizeIp(ip: string): string {
+  const mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  return mapped ? mapped[1]! : ip;
+}
+
 // Resolve the client IP. Mirrors auth's resolution order: peer address
 // first, then — only when proxies are trusted — the forwarded headers,
 // counting back from the right past the trusted proxies. Returns
@@ -230,7 +241,7 @@ export function resolveClientIp(
     }
   }
 
-  return ip || "unknown";
+  return ip ? normalizeIp(ip) : "unknown";
 }
 
 function validateRule(rule: RateLimitRule, where: string): void {
@@ -315,6 +326,14 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
   }
   const store = options.store ?? new MemoryRateLimitStore();
   const dimensions = options.dimensions ?? ["ip"];
+  for (const dimension of dimensions) {
+    if (dimension !== "ip" && dimension !== "user") {
+      throw new TypeError(
+        `rateLimit: unknown dimension "${dimension}". Only "ip" and "user" exist; ` +
+          "an unknown dimension would silently limit nothing.",
+      );
+    }
+  }
   const violationsPerLevel = options.escalation?.violationsPerLevel ?? 3;
   const maxLevel = options.escalation?.maxLevel ?? 2;
   if (!Number.isFinite(violationsPerLevel) || violationsPerLevel < 1) {
@@ -358,9 +377,8 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
 
     type BucketState = {
       key: string;
-      record: RateLimitCounter | null;
+      record: RateLimitCounter;
       effective: { level: number; limit: number; windowSec: number };
-      fresh: boolean;
     };
     const states: BucketState[] = [];
     for (const bucket of buckets) {
@@ -375,7 +393,6 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
           record = await store.get(key);
         }
       }
-      let fresh = false;
       if (!record || now > record.resetAt) {
         // A window just ended. If it ended clean — no violation was
         // counted in it — one violation decays, so a key that behaved
@@ -391,11 +408,10 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
           resetAt: now + effective.windowSec * 1000,
           violations,
         };
-        fresh = true;
-        states.push({ key, record, effective, fresh });
+        states.push({ key, record, effective });
       } else {
         const effective = penaltyFor(record.violations, violationsPerLevel, maxLevel, rule);
-        states.push({ key, record, effective, fresh });
+        states.push({ key, record, effective });
       }
     }
 
