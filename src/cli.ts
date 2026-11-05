@@ -18,6 +18,7 @@ import { cmdDoctor } from "./cli_doctor";
 import { cmdMigrate, cmdMigrateGenerate, cmdMigrateMake, cmdMigrateStatus, parseMigrateGenerateArgs } from "./cli_migrate";
 import { cmdDbBackup, cmdDbRestore } from "./cli_backup";
 import { cmdDeploy } from "./deploy/cli";
+import { cmdBuild } from "./build_standalone";
 
 /**
  * The version `version` and `help` print.
@@ -2264,6 +2265,7 @@ function cmdUsage(): number {
   log(`  ${c.cyan}yatta info${c.reset}         Show paths and versions`);
   log(`  ${c.cyan}yatta doctor${c.reset}       Diagnose project health and configuration`);
   log(`  ${c.cyan}yatta deploy${c.reset}       Configure one-command deployment (docker today)`);
+  log(`  ${c.cyan}yatta build${c.reset}        Build a standalone binary (yatta build --standalone)`);
   log(`  ${c.cyan}yatta version${c.reset}      Print the version`);
   log(`  ${c.cyan}yatta help${c.reset}         Show this`);
   log("");
@@ -2350,8 +2352,10 @@ export async function main(argv: string[]): Promise<number> {
   }
   // Deploy is the one command that takes flags (--platform, --dry-run,
   // --yes, --registry), so it parses its own arguments instead of being
-  // refused here. Every other command still takes no flags, by design.
-  if (command !== "deploy" && firstArg !== undefined && firstArg.startsWith("-")) {
+  // refused here. Build is the same (--standalone, --entry, --out,
+  // --target, --asset, --minify). Every other command still takes no
+  // flags, by design.
+  if (command !== "deploy" && command !== "build" && firstArg !== undefined && firstArg.startsWith("-")) {
     fail(`Unknown option "${firstArg}".`);
     return cmdUsage();
   }
@@ -2397,6 +2401,8 @@ export async function main(argv: string[]): Promise<number> {
       return cmdDoctor();
     case "deploy":
       return cmdDeploy(rest);
+    case "build":
+      return cmdBuild(rest);
     case "migrate":
       return await cmdMigrate();
     case "migrate:make":
