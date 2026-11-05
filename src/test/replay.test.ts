@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "bun:test";
 import { createDatabase, col, type TypedDatabase } from "../types/db";
-import { recordOutbox } from "../types/outbox";
+import { recordOutbox, type OutboxEntry } from "../types/outbox";
 import {
   createReplayRunner,
   replayAggregate,
@@ -10,7 +10,6 @@ import {
   verifySnapshot,
   rewindTo,
   assertReplayAllowed,
-  type OutboxEntry,
   type ReplaySnapshot,
 } from "../types/replay";
 
@@ -60,7 +59,7 @@ function userReducer(state: UserState, entry: OutboxEntry): UserState {
   return { ...state, events: [...state.events, entry.eventType] };
 }
 
-function recordEvents(db: TestDb, userId: string) {
+function recordEvents(db: TestDb, userId: string): [number, number, number] {
   const seqs: number[] = [];
   db.transaction((tx) => {
     seqs.push(tx.recordOutbox({
@@ -82,7 +81,8 @@ function recordEvents(db: TestDb, userId: string) {
       payload: { name: "Ada King" },
     }).seq);
   });
-  return seqs;
+  if (seqs.length !== 3) throw new Error("expected 3 recorded events");
+  return [seqs[0]!, seqs[1]!, seqs[2]!];
 }
 
 describe("time-travel replay — dev gate", () => {

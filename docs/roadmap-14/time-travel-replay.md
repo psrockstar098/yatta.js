@@ -111,8 +111,10 @@ Entries `isApplied` already knows are skipped and counted in
 ## Laziness
 
 This module is not imported by the framework entry points, so loading
-the framework costs nothing here. No snapshot table is created and no
-log is read until a caller builds a runner with the dev flag set.
+the framework costs nothing here. It is reachable only through its
+own export path, `yatta.js/replay`, which a caller imports
+deliberately. No snapshot table is created and no log is read until
+a caller builds a runner with the dev flag set.
 
 ## Gotchas
 
