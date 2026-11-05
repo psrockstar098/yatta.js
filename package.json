@@ -61,7 +61,8 @@
     "./oidc": "./src/func/oidc.ts",
     "./mcp": "./src/func/mcp.ts",
     "./package.json": "./package.json",
-    "./ds": "./src/types/ds.ts"
+    "./ds": "./src/types/ds.ts",
+    "./timeseries": "./src/types/timeseries.ts"
   },
   "bin": {
     "yatta": "bin/yatta.js"
