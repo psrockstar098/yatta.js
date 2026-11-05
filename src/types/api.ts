@@ -2802,11 +2802,35 @@ export class API<TParams extends RouteParams = RouteParams> {
 
       let advanced = false;
       let downstream: Response | undefined;
+      let downstreamSettled = false;
 
-      const next = async (): Promise<Response> => {
+      /*
+       * Plain function, not an async one: the old `async () => { downstream =
+       * await dispatch(...) }` added a whole async frame per middleware level,
+       * and dispatch cost grows ~9us per level (measured). Returning the
+       * dispatch promise directly drops that frame; the `.then` records the
+       * result for the returned-nothing branch below. It is attached before
+       * the caller can await the promise, so by the time a middleware that
+       * awaited next() resumes, downstreamSettled is already true.
+       */
+      const next = (): Promise<Response> => {
         advanced = true;
-        downstream = await dispatch(position + 1);
-        return downstream;
+        const p = dispatch(position + 1);
+        /*
+         * The rejection handler matters: without it, a dispatch that throws
+         * (the multiple-next guard) leaves this forked promise rejected and
+         * unobserved, which Bun treats as fatal — the guard error would
+         * crash the process instead of reaching dispatchError as a 500.
+         * The caller still observes the same rejection through `p` itself.
+         */
+        void p.then(
+          (r) => {
+            downstream = r;
+            downstreamSettled = true;
+          },
+          () => {},
+        );
+        return p;
       };
 
       const returned = await middleware(ctx, next);
@@ -2832,8 +2856,12 @@ export class API<TParams extends RouteParams = RouteParams> {
         /*
          * Advanced but returned nothing: `await next()` without `return next()`. Hand
          * back what the rest of the chain produced, which is what the author meant.
+         * downstreamSettled (not just advanced) is the test: a middleware that
+         * called next() without awaiting it leaves the downstream promise still
+         * in flight, and the old code then fell through to the second dispatch
+         * below, which hits the multiple-next guard. That fall-through is kept.
          */
-        if (advanced && downstream) return downstream;
+        if (advanced && downstreamSettled) return downstream!;
 
         return dispatch(position + 1);
       }
