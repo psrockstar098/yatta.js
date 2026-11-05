@@ -194,10 +194,15 @@ export interface TierRunResult {
   failed: Array<{ key: string; error: unknown }>;
 }
 
-/** Smallest scheduler surface tiering needs (the cron scheduler has it). */
+/**
+ * Smallest scheduler surface tiering needs (the cron scheduler has it).
+ * The interval type is the scheduler's own ("1h" for the cron scheduler,
+ * a number for others) — `any` here is deliberate, so this interface
+ * accepts any scheduler without forcing its interval format on callers.
+ */
 export interface TieringScheduler {
   every(
-    interval: string,
+    interval: any,
     task: () => Promise<void> | void,
   ): unknown;
 }
@@ -742,7 +747,12 @@ export function createTieredStorageFromManager(
   if (!hotName || !coldName) return null;
   if (manager.driverKind(hotName) !== "local") return null;
   if (manager.driverKind(coldName) !== "s3") return null;
-  return new TieredStorage(manager.disk(hotName), manager.disk(coldName), config);
+  // The names are runtime strings, but `disk()` is generic over the
+  // app's registered disk names, which a global augmentation narrows.
+  // The driverKind checks above are the real validation; the cast only
+  // bridges the static narrowing.
+  const diskByName = (name: string) => manager.disk(name as never);
+  return new TieredStorage(diskByName(hotName), diskByName(coldName), config);
 }
 
 /**

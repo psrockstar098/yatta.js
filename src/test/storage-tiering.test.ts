@@ -23,6 +23,7 @@ import {
   type TieredStorage,
 } from "../types/storage_tiering";
 import { Context, createAPI, API } from "../types/api";
+import { createCron } from "../types/job";
 
 /**
  * In-memory driver shaped like an S3 disk: same driver interface, no
@@ -107,8 +108,8 @@ class FakeDisk implements IStorageDriver {
       bytes.length,
       entry.contentType,
       entry.lastModified,
-      () => new Response(bytes).body!,
-      (start, end) => new Response(bytes.subarray(start, end)).body!,
+      () => new Blob([new Uint8Array(bytes)]).stream(),
+      (start, end) => new Blob([new Uint8Array(bytes.subarray(start, end))]).stream(),
       `"${bytes.length}"`,
       entry.metadata,
     );
@@ -490,15 +491,18 @@ describe("storage tiering", () => {
   it("tiering moves real local-disk files end to end, verified by content hash", async () => {
     const hotDir = tempDir("real-hot");
     const coldDir = tempDir("real-cold");
+    // Disk names must be registered names (the app's augmentation narrows
+    // them to "local" | "s3"); both drivers here are local on purpose, so
+    // this exercises real local-disk copy-verify-delete end to end.
     const manager = createStorage({
-      default: "hot",
+      default: "local",
       publicReads: true,
       disks: {
-        hot: { driver: "local", baseDir: hotDir, publicUrl: "/storage/files" },
-        cold: { driver: "local", baseDir: coldDir, publicUrl: "/storage/files" },
+        local: { driver: "local", baseDir: hotDir, publicUrl: "/storage/files" },
+        s3: { driver: "local", baseDir: coldDir, publicUrl: "/storage/files" },
       },
     });
-    const tiered = createTieredStorage(manager.disk("hot"), manager.disk("cold"), {
+    const tiered = createTieredStorage(manager.disk("local"), manager.disk("s3"), {
       staleAfterMs: 0,
     });
     await tiered.save("real.txt", "real bytes on real disks");
@@ -524,6 +528,21 @@ describe("storage tiering", () => {
     advance(10_000);
     await captured!();
     expect(await tiered.tierOf("sched.txt")).toBe("cold");
+
+    // The real cron scheduler accepts the same helper (and its timers
+    // never keep the process alive on their own, but stop it anyway).
+    const { tiered: tieredReal, advance: advanceReal } = makeTiered();
+    await tieredReal.save("real-cron.txt", "real cron");
+    advanceReal(10_000);
+    const cron = createCron();
+    scheduleTiering(cron, tieredReal, "1h");
+    // A 1h interval does not fire here; stopping proves registration
+    // itself is compatible with the real scheduler, and a direct run
+    // proves the registered task would move the file.
+    cron.stop();
+    expect(await tieredReal.runOnce()).toEqual(
+      expect.objectContaining({ moved: ["real-cron.txt"] }),
+    );
 
     const { tiered: tiered2, advance: advance2 } = makeTiered();
     await tiered2.save("job.txt", "jobbed");
