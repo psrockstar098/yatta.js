@@ -350,6 +350,19 @@ describe("edge-aware engine wiring", () => {
     expect(await cache.get<string>("k1")).toBeNull();
   });
 
+  it("with no provider, the purge path is not even entered", async () => {
+    const cache = new EdgeAwareCacheEngine({ maxItems: 100, edge: null });
+    let purgeCalls = 0;
+    const original = cache.purgeEdge.bind(cache);
+    cache.purgeEdge = async (...args: Parameters<typeof original>) => {
+      purgeCalls++;
+      return original(...args);
+    };
+    await cache.set("k1", "v1", { tags: ["users"] });
+    await cache.invalidateTags("users");
+    expect(purgeCalls).toBe(0);
+  });
+
   it("a provider failure does not break local invalidation", async () => {
     const warn = captureWarn();
     try {

@@ -105,6 +105,23 @@ import { invalidateTagsWithEdge } from "yatta.js/cache-edge";
 await invalidateTagsWithEdge(cache, "users", provider);
 ```
 
+## Zero cost when not used
+
+This feature is opt-in and lazy, end to end:
+
+- The existing cache engine is untouched, so undecorated use runs
+  exactly the code it ran before — no wrapper, no extra check.
+- Importing the decorator or edge modules creates nothing: no engine,
+  no database, no network call. A function costs nothing until it is
+  actually wrapped, and only its calls go through the engine.
+- Edge modules are never imported by startup code. Nothing in the main
+  entrypoint or the cache subsystem imports them; an app loads them
+  only when it imports `yatta.js/cache-decorator` or
+  `yatta.js/cache-edge`.
+- With no provider configured, `invalidateTags` on an edge-aware engine
+  does not enter the purge path at all — not even a no-op network
+  attempt. The only cost is one null check.
+
 ## Gotchas
 
 - **Fail-open, by design.** If the edge provider fails or is slow

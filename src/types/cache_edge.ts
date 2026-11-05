@@ -302,7 +302,13 @@ export class EdgeAwareCacheEngine extends MemoryCacheEngine {
     tags: string | string[],
   ): Promise<number> {
     const evicted = await super.invalidateTags(tags);
-    await this.purgeEdge({ tags: Array.isArray(tags) ? tags : [tags] });
+    // Strictly opt-in: with no provider, no purge code path runs at
+    // all — not even a no-op attempt. The check is a single null test,
+    // so unconfigured invalidation costs nothing measurable over the
+    // plain engine (which this class otherwise is, unchanged).
+    if (this.edge) {
+      await this.purgeEdge({ tags: Array.isArray(tags) ? tags : [tags] });
+    }
     return evicted;
   }
 
