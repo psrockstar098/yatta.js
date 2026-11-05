@@ -283,6 +283,275 @@ describe("isDataOrSecretPath", () => {
   });
 });
 
+describe("JIT and AOT modes", () => {
+  it("refuses --aot on a Bun that does not advertise it, instead of silently building JIT", () => {
+    // This Bun (1.4.4) lists neither --aot nor --trim in `bun build --help`,
+    // and silently ignores unknown build flags — so a requested AOT or
+    // trimmed build must fail here with an upgrade pointer, never ship
+    // a JIT binary wearing the AOT label.
+    const aot = runBuild(dir, ["--standalone", "--entry", "server.ts", "--aot"]);
+    expect(aot.code).toBe(1);
+    expect(aot.lines.join("\n")).toMatch(/does not support --aot/);
+    expect(aot.lines.join("\n")).toMatch(/Upgrade Bun/);
+
+    const trim = runBuild(dir, ["--standalone", "--entry", "server.ts", "--trim"]);
+    expect(trim.code).toBe(1);
+    expect(trim.lines.join("\n")).toMatch(/does not support --trim/);
+  });
+
+  it("refuses --explain without --aot, and --aot with a foreign target", () => {
+    const explain = runBuild(dir, ["--standalone", "--entry", "server.ts", "--explain"]);
+    expect(explain.code).toBe(1);
+    expect(explain.lines.join("\n")).toMatch(/--explain needs --aot/);
+
+    const foreign = runBuild(dir, [
+      "--standalone",
+      "--entry",
+      "server.ts",
+      "--aot",
+      "--target",
+      "bun-darwin-arm64",
+    ]);
+    expect(foreign.code).toBe(1);
+    expect(foreign.lines.join("\n")).toMatch(/only for the machine it runs on/);
+  });
+
+  it("accepts --no-aot as the explicit JIT spelling", () => {
+    const elsewhere = mkdtempSync(join(tmpdir(), "yatta-build-noaot-"));
+    try {
+      writeFileSync(join(elsewhere, "server.ts"), ENTRY);
+      const outcome = runBuild(elsewhere, ["--standalone", "--no-aot", "--entry", "server.ts"]);
+      expect(outcome.code).toBe(0);
+      expect(outcome.lines.join("\n")).toMatch(/mode: JIT bundle/);
+      expect(existsSync(join(elsewhere, "dist", "app"))).toBe(true);
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+});
+
+const HARDENED_ENTRY = `import { makeFn } from "./helper";
+
+const port = Number(process.env.PORT) || 0;
+const server = Bun.serve({
+  port,
+  fetch(req) {
+    const url = new URL(req.url);
+    if (url.pathname === "/execargv") {
+      return Response.json({ execArgv: process.execArgv });
+    }
+    if (url.pathname === "/eval") {
+      try {
+        return Response.json({ value: makeFn()() });
+      } catch (err) {
+        return Response.json({ error: String(err) }, { status: 500 });
+      }
+    }
+    return Response.json({ ok: true });
+  },
+});
+console.log(\`READY \${server.port}\`);
+`;
+
+// The code generation lives in a dependency, not the entrypoint, so
+// the entrypoint scan passes and the binary itself must enforce it.
+const HELPER = `export function makeFn() {
+  return new Function("return 42");
+}
+`;
+
+function hardenedFixture(): string {
+  const fixture = mkdtempSync(join(tmpdir(), "yatta-build-hardened-"));
+  writeFileSync(join(fixture, "server.ts"), HARDENED_ENTRY);
+  writeFileSync(join(fixture, "helper.ts"), HELPER);
+  return fixture;
+}
+
+describe("baked runtime flags and the string-to-code ban", () => {
+  it("bakes --smol, --no-addons, and the ban into execArgv, and the ban throws at runtime", async () => {
+    const fixture = hardenedFixture();
+    try {
+      const outcome = runBuild(fixture, [
+        "--standalone",
+        "--no-aot",
+        "--entry",
+        "server.ts",
+        "--smol",
+        "--no-addons",
+        "--disallow-code-generation",
+      ]);
+      expect(outcome.code).toBe(0);
+      const binary = outcome.outPath!;
+      const { port, child } = await startBinary(binary, fixture);
+      try {
+        const argv = await (await fetch(`http://localhost:${port}/execargv`)).json();
+        expect(argv.execArgv).toContain("--smol");
+        expect(argv.execArgv).toContain("--no-addons");
+        expect(argv.execArgv).toContain("--disallow-code-generation-from-strings");
+        const evalRes = await fetch(`http://localhost:${port}/eval`);
+        expect(evalRes.status).toBe(500);
+        const body = await evalRes.json();
+        expect(body.error).toMatch(/EvalError/);
+      } finally {
+        await stop(child);
+      }
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("bakes the =strict level the same way", async () => {
+    const fixture = hardenedFixture();
+    try {
+      const outcome = runBuild(fixture, [
+        "--standalone",
+        "--entry",
+        "server.ts",
+        "--disallow-code-generation=strict",
+      ]);
+      expect(outcome.code).toBe(0);
+      const { port, child } = await startBinary(outcome.outPath!, fixture);
+      try {
+        const argv = await (await fetch(`http://localhost:${port}/execargv`)).json();
+        expect(argv.execArgv).toContain("--disallow-code-generation-from-strings=strict");
+        const evalRes = await fetch(`http://localhost:${port}/eval`);
+        expect(evalRes.status).toBe(500);
+      } finally {
+        await stop(child);
+      }
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses the ban when the entrypoint itself generates code", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "yatta-build-codegen-"));
+    try {
+      writeFileSync(
+        join(fixture, "server.ts"),
+        `const f = new Function("return 1");\nconsole.log(f());\n`,
+      );
+      const outcome = runBuild(fixture, [
+        "--standalone",
+        "--entry",
+        "server.ts",
+        "--disallow-code-generation",
+      ]);
+      expect(outcome.code).toBe(1);
+      expect(outcome.lines.join("\n")).toMatch(/refusing --disallow-code-generation/);
+      expect(outcome.lines.join("\n")).toMatch(/new Function\(/);
+      expect(existsSync(join(fixture, "dist", "app"))).toBe(false);
+      // Without the ban the same entry builds fine: the refusal is
+      // about the combination, not the code.
+      const plain = runBuild(fixture, ["--standalone", "--entry", "server.ts"]);
+      expect(plain.code).toBe(0);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("JSON5 build config", () => {
+  it("reads a config with comments and trailing commas, and CLI flags win over it", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "yatta-build-config-"));
+    try {
+      writeFileSync(
+        join(fixture, "server.ts"),
+        `const port = Number(process.env.PORT) || 0;\nconst server = Bun.serve({ port, fetch: () => Response.json({ ok: true }) });\nconsole.log(\`READY \${server.port}\`);\n`,
+      );
+      writeFileSync(
+        join(fixture, "yatta.build.json5"),
+        `{
+          // The entrypoint and output for this project.
+          entry: "server.ts",
+          out: "dist/from-config",
+        }\n`,
+      );
+      const fromConfig = runBuild(fixture, ["--standalone", "--no-aot", "--config", "yatta.build.json5"]);
+      expect(fromConfig.code).toBe(0);
+      expect(fromConfig.outPath).toBe(join(fixture, "dist", "from-config"));
+      const { port, child } = await startBinary(fromConfig.outPath!, fixture);
+      try {
+        expect(await (await fetch(`http://localhost:${port}/`)).json()).toEqual({ ok: true });
+      } finally {
+        await stop(child);
+      }
+
+      const overridden = runBuild(fixture, [
+        "--standalone",
+        "--config",
+        "yatta.build.json5",
+        "--out",
+        "dist/override",
+      ]);
+      expect(overridden.code).toBe(0);
+      expect(overridden.outPath).toBe(join(fixture, "dist", "override"));
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects unknown config keys instead of silently ignoring them", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "yatta-build-config-bad-"));
+    try {
+      writeFileSync(join(fixture, "server.ts"), "console.log(1);\n");
+      writeFileSync(join(fixture, "yatta.build.json5"), `{ entry: "server.ts", outp: "dist/x" }\n`);
+      const outcome = runBuild(fixture, ["--standalone", "--config", "yatta.build.json5"]);
+      expect(outcome.code).toBe(1);
+      expect(outcome.lines.join("\n")).toMatch(/unknown key "outp"/);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("bun check type gate", () => {
+  function gateFixture(entrySource: string): string {
+    const fixture = mkdtempSync(join(tmpdir(), "yatta-build-gate-"));
+    writeFileSync(join(fixture, "server.ts"), entrySource);
+    // Ambient declarations stand in for @types/bun: the gate fixture
+    // must not depend on an installed node_modules to be checkable.
+    writeFileSync(
+      join(fixture, "globals.d.ts"),
+      "declare const Bun: any;\ndeclare const console: any;\ndeclare const process: any;\n",
+    );
+    writeFileSync(
+      join(fixture, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: { strict: true, types: [] },
+        include: ["server.ts", "globals.d.ts"],
+      }),
+    );
+    return fixture;
+  }
+
+  const goodEntry = `const port = Number(process.env.PORT) || 0;\nconst server = Bun.serve({ port, fetch: () => Response.json({ ok: true }) });\nconsole.log(\`READY \${server.port}\`);\n`;
+
+  it("passes a clean entry and builds it", () => {
+    const fixture = gateFixture(goodEntry);
+    try {
+      const outcome = runBuild(fixture, ["--standalone", "--entry", "server.ts", "--check"]);
+      expect(outcome.code).toBe(0);
+      expect(existsSync(join(fixture, "dist", "app"))).toBe(true);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("stops the build on a type error, writing no binary", () => {
+    const fixture = gateFixture(`const n: number = "not-a-number";\nconsole.log(n);\n`);
+    try {
+      const outcome = runBuild(fixture, ["--standalone", "--entry", "server.ts", "--check"]);
+      expect(outcome.code).toBe(1);
+      expect(outcome.lines.join("\n")).toMatch(/Type gate failed/);
+      expect(outcome.lines.join("\n")).toMatch(/TS2322/);
+      expect(existsSync(join(fixture, "dist", "app"))).toBe(false);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("build machinery is CLI-only", () => {
   it("is not imported by the server entrypoint", () => {
     const mainSource = readFileSync(new URL("../main.ts", import.meta.url), "utf8");
