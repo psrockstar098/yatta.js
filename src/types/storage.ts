@@ -2487,6 +2487,19 @@ export class StorageDisk {
   }
 
   /**
+   * Plain upload under one name, for callers that do not need the fluent
+   * builder — including `ctx.storage.save(key, data)`. Same upload path
+   * as `file(key).put(data)`, no separate behaviour.
+   */
+  async save(
+    key: string,
+    data: UploadInput,
+    options?: UploadOptions,
+  ): Promise<FileMetadata> {
+    return this.upload(key, data, options);
+  }
+
+  /**
    * Returns a {@link SignBuilder} to generate a signed URL for a key.
    */
   sign(key: string): SignBuilder {
@@ -2962,6 +2975,39 @@ export class StorageManager {
    */
   async search(options: SearchOptions): Promise<FileMetadata[]> {
     return this.defaultDisk.search(options);
+  }
+
+  /**
+   * Plain upload on the default disk, for callers that do not need the
+   * fluent builder — including `ctx.storage.save(key, data)`.
+   */
+  async save(
+    key: string,
+    data: UploadInput,
+    options?: UploadOptions,
+  ): Promise<FileMetadata> {
+    return this.defaultDisk.save(key, data, options);
+  }
+
+  /**
+   * Names of the configured disks, in configuration order. Tiering uses
+   * this to find a local disk and an S3 disk without probing either.
+   */
+  diskNames(): string[] {
+    return [...this.disks.keys()];
+  }
+
+  /**
+   * Driver kind of a configured disk: "local", "s3", or "unknown" when
+   * the disk is not configured. Tiering activates only when one disk
+   * reports "local" and another reports "s3".
+   */
+  driverKind(name: string): "local" | "s3" | "unknown" {
+    const disk = this.disks.get(name);
+    if (!disk) return "unknown";
+    if (disk.driver instanceof LocalStorageDriver) return "local";
+    if (disk.driver instanceof S3StorageDriver) return "s3";
+    return "unknown";
   }
 
   /**

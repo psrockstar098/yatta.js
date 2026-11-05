@@ -48,6 +48,7 @@
     "./cache-decorator": "./src/types/cache_decorator.ts",
     "./cache-edge": "./src/types/cache_edge.ts",
     "./storage": "./src/types/storage.ts",
+    "./storage-tiering": "./src/types/storage_tiering.ts",
     "./mail": "./src/types/mail.ts",
     "./realtime": "./src/types/realtime.ts",
     "./observe": "./src/types/observe.ts",

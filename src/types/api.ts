@@ -1521,6 +1521,12 @@ export interface APIOptions {
    * sink, or at a capturing array in a test, without changing the response.
    */
   errorLog?: (error: unknown) => void;
+  /**
+   * Storage made available to every handler as `ctx.storage`. A plain
+   * storage manager and a tiered storage both satisfy the shape. When
+   * absent, `ctx.storage` is undefined and handlers must check for it.
+   */
+  storage?: ContextStorage;
 }
 
 export class HttpError extends Error {
@@ -1583,21 +1589,62 @@ function sanitizeHeaderValue(val: string): string {
 // Context
 // ──────────────────────────────────────────────────────────────────────────
 
+/**
+ * Smallest storage surface a request handler needs. It is structural on
+ * purpose: this router file imports nothing but `node:path`, so it cannot
+ * import the storage types, and both the plain storage manager and the
+ * tiered storage satisfy this shape (a manager gains `save` for it).
+ */
+export interface ContextStorageFileRef {
+  put(data: unknown, options?: unknown): Promise<unknown>;
+  write(data: unknown, options?: unknown): Promise<unknown>;
+  read(): Promise<unknown>;
+  text(): Promise<string>;
+  json<T = unknown>(): Promise<T>;
+  buffer(): Promise<Buffer>;
+  exists(): Promise<boolean>;
+  delete(): Promise<void>;
+  serve(request?: Request | null, options?: unknown): Promise<Response>;
+}
+
+/** Storage as a handler sees it: save, file handles, and named disks. */
+export interface ContextStorage {
+  save(key: string, data: unknown, options?: unknown): Promise<unknown>;
+  file(key: string): ContextStorageFileRef;
+  disk?(name?: string): unknown;
+}
+
+/** Optional values a Context is built with, beyond request and params. */
+export interface ContextInit {
+  /** Storage made available as `ctx.storage`, when the app configured one. */
+  storage?: ContextStorage;
+}
+
 export class Context<TParams extends RouteParams = RouteParams> {
   readonly req: Request;
   readonly params: TParams;
   readonly url: URL;
   readonly state: Record<string, unknown> = {};
 
+  /**
+   * Storage for this request, when the app configured one — either via
+   * `createAPI({ storage })`, `api.withStorage(storage)`, or the
+   * Context constructor itself. Absent when no storage is configured;
+   * handlers that need it should check, not assume. Middleware may also
+   * assign it, the same way it shares anything else on the request.
+   */
+  storage?: ContextStorage;
+
   private cachedCookies?: Record<string, string>;
   private rawBodyParsed = false;
   private rawBodyData: unknown;
   private rawFormData?: FormData;
 
-  constructor(req: Request, params: TParams) {
+  constructor(req: Request, params: TParams, init?: ContextInit) {
     this.req = req;
     this.params = params;
     this.url = new URL(req.url);
+    this.storage = init?.storage;
   }
 
   /**
@@ -1848,9 +1895,27 @@ export class API<TParams extends RouteParams = RouteParams> {
     Map<string, { handler: Handler<any>; params: Record<string, string>; routePath: string }>
   >();
 
+  /**
+   * Storage handed to every handler as `ctx.storage`, when configured.
+   * A mounted child router keeps its own value when it has one, and
+   * otherwise inherits its parent's at request time.
+   */
+  storage?: ContextStorage;
+
   constructor(path = "", options: APIOptions = {}) {
     this.declaredPath = path === "/" ? "" : path.replace(/\/$/, "");
     this.errorLog = options.errorLog;
+    this.storage = options.storage;
+  }
+
+  /**
+   * Attach storage to this router after construction, for apps that
+   * build storage after their routes. Same effect as the constructor
+   * option; later calls replace earlier ones.
+   */
+  withStorage(storage: ContextStorage): this {
+    this.storage = storage;
+    return this;
   }
 
   get(handler: Handler<TParams>): this;
@@ -2524,9 +2589,11 @@ export class API<TParams extends RouteParams = RouteParams> {
     req: Request,
     params: TParams = {} as TParams,
     basePath?: string,
-    options?: { isMounted?: boolean },
+    options?: { isMounted?: boolean; storage?: ContextStorage },
   ): Promise<Response> {
-    const ctx = new Context<TParams>(req, params);
+    const ctx = new Context<TParams>(req, params, {
+      storage: options?.storage ?? this.storage,
+    });
     const method = req.method.toUpperCase() as Method;
     // Reuse the URL the Context already parsed in its constructor instead of
     // parsing req.url a second time — one parse per request, not two.
@@ -2656,6 +2723,7 @@ export class API<TParams extends RouteParams = RouteParams> {
           try {
             return await mount.router.handle(req, c.params, nextBase, {
               isMounted: true,
+              storage: mount.router.storage ?? c.storage,
             });
           } catch (err) {
             return await this.dispatchError(err, c, options?.isMounted);
