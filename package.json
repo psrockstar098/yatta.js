@@ -62,7 +62,8 @@
     "./mcp": "./src/func/mcp.ts",
     "./package.json": "./package.json",
     "./ds": "./src/types/ds.ts",
-    "./timeseries": "./src/types/timeseries.ts"
+    "./timeseries": "./src/types/timeseries.ts",
+    "./cloud-backups": "./src/types/cloud_backups.ts"
   },
   "bin": {
     "yatta": "bin/yatta.js"
