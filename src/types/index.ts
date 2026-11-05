@@ -30,4 +30,7 @@ export {
   type APIOptions,
   type CookieOptions,
   type CorsOptions,
+  type ContextStorage,
+  type ContextStorageFileRef,
+  type ContextInit,
 } from "./api";
