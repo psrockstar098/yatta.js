@@ -56,8 +56,11 @@ export async function createLocalEmbedder(): Promise<VectorEmbedder> {
 
   // Fixed package name, loaded lazily. If the operator never installed
   // it, this is a plain explanation, not a crash at import time.
+  // The package is optional and not a Yatta dependency, so it has no
+  // resolvable types here; the suppression covers that, not a code error.
   let runtime: any;
   try {
+    // @ts-ignore - optional dependency, intentionally not installed
     runtime = await import("@xenova/transformers");
   } catch {
     throw new YattaError(

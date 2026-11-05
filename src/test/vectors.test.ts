@@ -131,9 +131,9 @@ describe("vectors: store and search ranking (plain-SQLite backend)", () => {
     expect(db.vectors.backend).toBe("sqlite");
     const hits = db.vectors.search("docs", [1, 0, 0]);
     expect(hits.map((h) => h.id)).toEqual(["a", "b", "c"]);
-    expect(hits[0].score).toBeCloseTo(1, 10);
-    expect(hits[1].score).toBeCloseTo(0.6, 10);
-    expect(hits[2].score).toBeCloseTo(0, 10);
+    expect(hits[0]!.score).toBeCloseTo(1, 10);
+    expect(hits[1]!.score).toBeCloseTo(0.6, 10);
+    expect(hits[2]!.score).toBeCloseTo(0, 10);
   });
 
   it("orders ties by id so ranking is deterministic", () => {
@@ -150,8 +150,8 @@ describe("vectors: store and search ranking (plain-SQLite backend)", () => {
     expect(db.vectors.search("docs", [1, 0, 0], { limit: 2 }).map((h) => h.id)).toEqual(["a", "b"]);
     expect(db.vectors.search("docs", [1, 0, 0], { threshold: 0.7 }).map((h) => h.id)).toEqual(["a"]);
     const withVec = db.vectors.search("docs", [1, 0, 0], { limit: 1, includeEmbedding: true });
-    expect(withVec[0].embedding).toEqual([1, 0, 0]);
-    expect(db.vectors.search("docs", [1, 0, 0])[0].embedding).toBeUndefined();
+    expect(withVec[0]!.embedding).toEqual([1, 0, 0]);
+    expect(db.vectors.search("docs", [1, 0, 0])[0]!.embedding).toBeUndefined();
   });
 
   it("upsert replaces the previous vector for the same id", () => {
@@ -159,7 +159,7 @@ describe("vectors: store and search ranking (plain-SQLite backend)", () => {
     seed(db);
     db.vectors.upsert("docs", { id: "c", embedding: [1, 0, 0], metadata: { title: "now cats" } });
     const hits = db.vectors.search("docs", [1, 0, 0]);
-    expect(hits[0].id).toBe("a"); // tie with c, id order
+    expect(hits[0]!.id).toBe("a"); // tie with c, id order
     expect(hits.map((h) => h.id)).toEqual(["a", "c", "b"]);
     expect(db.vectors.get("docs", "c")).toEqual({ id: "c", embedding: [1, 0, 0], metadata: { title: "now cats" } });
   });
@@ -277,12 +277,12 @@ describe("vectors: text embeddings", () => {
     const hits = await db.vectors.searchText("docs", "a cat", { embedder });
     // Cat doc scores 1; dog and bird docs score 0 and tie-break by id.
     expect(hits.map((h) => h.id)).toEqual(["cat-doc", "bird-doc", "dog-doc"]);
-    expect(hits[0].id).toBe("cat-doc");
-    expect(hits[0].score).toBeCloseTo(1, 10);
+    expect(hits[0]!.id).toBe("cat-doc");
+    expect(hits[0]!.score).toBeCloseTo(1, 10);
     // A store-level default embedder works without passing one per call.
     db.vectors.setEmbedder(embedder);
     const again = await db.vectors.searchText("docs", "the cat");
-    expect(again[0].id).toBe("cat-doc");
+    expect(again[0]!.id).toBe("cat-doc");
     db.vectors.setEmbedder(null);
   });
 

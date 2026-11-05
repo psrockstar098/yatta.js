@@ -2851,11 +2851,11 @@ export class YattaDB {
    * vec0, when applicable) on next use instead of trusting the old one.
    */
   get vectors(): VectorStore {
-    if (!this.vectorStore) {
+    if (this.vectorStore === null) {
       const { VectorStore: VectorStoreClass } = require("./vectors");
       this.vectorStore = new VectorStoreClass(this);
     }
-    return this.vectorStore;
+    return this.vectorStore!;
   }
 
   // ── Raw SQL Suite ────────────────────────────────────────────────────────

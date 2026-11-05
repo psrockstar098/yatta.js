@@ -77,9 +77,9 @@ testDescribe("vectors: sqlite-vec backend", () => {
     expect(db.vectors.backend).toBe("sqlite-vec");
     const hits = db.vectors.search("docs", [1, 0, 0]);
     expect(hits.map((h) => h.id)).toEqual(["a", "b", "c"]);
-    expect(hits[0].score).toBeCloseTo(1, 5);
-    expect(hits[1].score).toBeCloseTo(0.6, 5);
-    expect(hits[2].score).toBeCloseTo(0, 5);
+    expect(hits[0]!.score).toBeCloseTo(1, 5);
+    expect(hits[1]!.score).toBeCloseTo(0.6, 5);
+    expect(hits[2]!.score).toBeCloseTo(0, 5);
   });
 
   test("limit, threshold, and includeEmbedding match the SQL backend's contract", () => {
@@ -89,8 +89,8 @@ testDescribe("vectors: sqlite-vec backend", () => {
     // Threshold fetches past k = limit, so qualifying rows are not cut off.
     expect(db.vectors.search("docs", [1, 0, 0], { threshold: 0.7 }).map((h) => h.id)).toEqual(["a"]);
     const withVec = db.vectors.search("docs", [1, 0, 0], { limit: 1, includeEmbedding: true });
-    expect(withVec[0].embedding).toEqual([1, 0, 0]);
-    expect(db.vectors.search("docs", [1, 0, 0])[0].embedding).toBeUndefined();
+    expect(withVec[0]!.embedding).toEqual([1, 0, 0]);
+    expect(db.vectors.search("docs", [1, 0, 0])[0]!.embedding).toBeUndefined();
   });
 
   test("upsert replaces, remove deletes, get returns the stored (raw) vector", () => {

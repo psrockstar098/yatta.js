@@ -667,7 +667,14 @@ export class VectorStore {
       throw new YattaError("Text embedding needs a non-empty string.");
     }
     const vectors = await this.embedText([text], embedder);
-    return vectors[0];
+    const first = vectors[0];
+    if (first === undefined) {
+      // embedText guarantees one vector per text, so this is unreachable
+      // in practice — but a missing vector must fail here, not surface
+      // as undefined downstream.
+      throw new YattaError("Embedder returned no vector for the text.");
+    }
+    return first;
   }
 
   private async resolveEmbedder(embedder?: VectorEmbedder): Promise<VectorEmbedder> {
