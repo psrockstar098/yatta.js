@@ -131,6 +131,12 @@ This feature is opt-in and lazy, end to end:
   purge never makes local data look stale when it is not.
 - **No purge-everything.** An empty tag/URL list is a no-op, never a
   whole-cache purge. Purging everything stays a dashboard action.
+- **A tag purge only matches tagged responses.** Cloudflare purges by
+  tag only content whose responses carry a matching `Cache-Tag` header,
+  and Vercel likewise only content tagged with `Vercel-Cache-Tag`. If
+  the origin never emits those headers, the purge call succeeds and
+  removes nothing. Tagging the response is part of the setup, not an
+  afterthought.
 - **Credentials live in the environment only.** They are never in code,
   never in tests (tests use fake fetches), never in a URL, and never in
   a log line or error message. A provider name with missing credentials
