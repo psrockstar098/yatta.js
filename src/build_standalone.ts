@@ -79,8 +79,11 @@
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   rmSync,
@@ -158,20 +161,32 @@ const DATA_DIRS = new Set([
  * Checked on every path segment, not just the last one: an asset root
  * of `./storage` is refused even though the directory name alone is
  * not a file, and `data/app.db` is refused even though `data` is
- * innocent. A `.env` file is refused under any name that ends in
- * `.env`, and key files by their usual names and extensions.
+ * innocent. An env file is refused in any case (`.ENV` is `.env` on
+ * a case-insensitive filesystem), under any name that contains
+ * `.env.` (backups like `my.env.bak`), and as `.envrc` — and key
+ * files by their usual names and extensions.
  */
 export function isDataOrSecretPath(path: string): string | null {
   const parts = path.split(/[\\/]/).filter(Boolean);
   for (const part of parts) {
     if (DATA_DIRS.has(part)) return `directory "${part}" holds data, not static assets`;
-    if (part === ".env" || part.startsWith(".env.") || part.endsWith(".env")) {
+    // Env files, in any case and under any env-ish name: compare
+    // lowercased, and treat any `.env.` segment as an env file, not
+    // just a leading one — a backup holds the same secrets as the
+    // file itself, and `.envrc` is direnv's env file.
+    const lower = part.toLowerCase();
+    if (
+      lower === ".env" ||
+      lower === ".envrc" ||
+      lower.startsWith(".envrc.") ||
+      lower.endsWith(".env") ||
+      lower.includes(".env.")
+    ) {
       return `file "${part}" is environment config, not a static asset`;
     }
     if (part.startsWith("id_rsa") || part.startsWith("id_ed25519")) {
       return `file "${part}" looks like a private key`;
     }
-    const lower = part.toLowerCase();
     const dot = lower.lastIndexOf(".");
     const ext = dot >= 0 ? lower.slice(dot) : "";
     if (DATA_EXTENSIONS.has(ext)) return `file "${part}" is a database file, not a static asset`;
@@ -486,6 +501,8 @@ function usageLines(): string[] {
     "             resolves bare imports from the entry's location, so an",
     "             entry outside the package bundles almost nothing.",
     "  --out      Output binary; default: dist/app.",
+    "             Refuses to overwrite the entrypoint, or an existing",
+    "             file that is not a previous build output.",
     "  --target   Cross-compile target, e.g. bun-linux-x64, bun-darwin-arm64.",
     "  --asset    Directory to embed, repeatable. ./public is embedded",
     "             automatically when it exists. A path that looks like",
@@ -502,6 +519,9 @@ function usageLines(): string[] {
     "  --minify   Minify the bundled code before compiling.",
     "  --check    Type-check the entrypoint with `bun check` first.",
     "             Always on for --aot; opt-in for JIT builds.",
+    "             An entry that only uses top-level await must be a",
+    "             module: add `export {};` to it, or the gate fails",
+    "             with TS1375.",
     "  --smol     Bake --smol into the binary: less memory, more GC.",
     "             An explicit knob for small boxes, never a default.",
     "  --no-addons  Bake --no-addons: refuse dlopen and bun:ffi cc().",
@@ -550,6 +570,119 @@ function isInsideDir(dir: string, file: string): boolean {
     abs = resolve(file);
   }
   return abs === root || abs.startsWith(root + sep);
+}
+
+/**
+ * Whether a file looks like a compiled executable: the ELF, Mach-O,
+ * or PE signature at its start. `yatta build --standalone` writes
+ * one of these, so a file that has one is a previous build output
+ * and may be overwritten by a rebuild; anything else at the output
+ * path is the user's file, not the build's.
+ */
+function looksLikeCompiledBinary(path: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const header = Buffer.alloc(64);
+    const read = readSync(fd, header, 0, 64, 0);
+    if (read >= 4) {
+      const magic = header.subarray(0, 4);
+      // ELF.
+      if (magic[0] === 0x7f && magic[1] === 0x45 && magic[2] === 0x4c && magic[3] === 0x46) {
+        return true;
+      }
+      // Mach-O 64/32, both endiannesses, and the universal (fat) magic.
+      if (
+        (magic[0] === 0xcf && magic[1] === 0xfa && magic[2] === 0xed && magic[3] === 0xfe) ||
+        (magic[0] === 0xfe && magic[1] === 0xed && magic[2] === 0xfa && magic[3] === 0xcf) ||
+        (magic[0] === 0xce && magic[1] === 0xfa && magic[2] === 0xed && magic[3] === 0xfe) ||
+        (magic[0] === 0xfe && magic[1] === 0xed && magic[2] === 0xfa && magic[3] === 0xce) ||
+        (magic[0] === 0xca && magic[1] === 0xfe && magic[2] === 0xba && magic[3] === 0xbe)
+      ) {
+        return true;
+      }
+    }
+    // PE (Windows): an "MZ" header with a "PE\0\0" signature at the
+    // offset stored at 0x3c.
+    if (read >= 2 && header[0] === 0x4d && header[1] === 0x5a) {
+      const peOffset = header.readUInt32LE(0x3c);
+      const signature = Buffer.alloc(4);
+      const got = readSync(fd, signature, 0, 4, peOffset);
+      if (
+        got === 4 &&
+        signature[0] === 0x50 &&
+        signature[1] === 0x45 &&
+        signature[2] === 0x00 &&
+        signature[3] === 0x00
+      ) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // The read already answered; a close failure changes nothing.
+      }
+    }
+  }
+}
+
+/**
+ * The output destination must never destroy the entrypoint or the
+ * user's data: `bun build --compile --outfile` overwrites whatever
+ * it names, with no warning. So --out is refused when it is the
+ * entrypoint itself (compared after resolving symlinks, so
+ * `--out ./server.ts` and `--out sub/../server.ts` are both caught),
+ * and refused when it names an existing file that is not already a
+ * binary this command produced — a rebuild overwrites its own
+ * previous output, anything else must be moved or deleted by hand
+ * first. There is deliberately no --force: overwriting a file you
+ * did not mean to is a typo away, and deleting it first is the
+ * explicit act.
+ */
+function guardOutPath(
+  display: string,
+  outAbs: string,
+  entryAbs: string,
+): { ok: true } | { error: string } {
+  let isEntry = outAbs === entryAbs;
+  if (!isEntry && existsSync(outAbs)) {
+    try {
+      isEntry = realpathSync(outAbs) === realpathSync(entryAbs);
+    } catch {
+      // Unresolvable paths are not the entry; the checks below decide.
+    }
+  }
+  if (isEntry) {
+    return {
+      error:
+        `--out "${display}" is the entrypoint itself. ` +
+        `The build would replace your source with the binary; choose another --out.`,
+    };
+  }
+  let stat;
+  try {
+    stat = statSync(outAbs);
+  } catch {
+    return { ok: true };
+  }
+  if (stat.isDirectory()) {
+    return { error: `--out "${display}" is a directory; pass a file path for the binary.` };
+  }
+  if (!stat.isFile()) {
+    return { error: `--out "${display}" exists but is not a regular file; choose another --out.` };
+  }
+  if (looksLikeCompiledBinary(outAbs)) return { ok: true };
+  return {
+    error:
+      `--out "${display}" already exists and is not a previous build output. ` +
+      `Move or delete it first, or choose another --out.`,
+  };
 }
 
 /** Generated entrypoint filename prefix. Random suffix, deleted after the build. */
@@ -791,6 +924,29 @@ function runCheck(
   };
 }
 
+/**
+ * Whether a `bun check` failure is only TS1375: the entrypoint uses
+ * top-level await but is not a module. That is the framework's own
+ * entry shape (dynamic `await import(...)`, no static imports), and
+ * the fix is one line in the entry — so the gate says so instead of
+ * failing with the raw checker text alone.
+ */
+function isTs1375Only(output: string): boolean {
+  const codes = new Set([...output.matchAll(/TS(\d+)/g)].map((m) => m[1]));
+  return codes.size === 1 && codes.has("1375");
+}
+
+/** A type-gate failure, with the TS1375 pointer when it applies. */
+function typeGateError(output: string): string {
+  const base = `Type gate failed — the entrypoint does not type-check:\n${output}`;
+  if (!isTs1375Only(output)) return base;
+  return (
+    `${base}\n` +
+    `  The only error is TS1375: the entrypoint uses top-level await but is not a module.\n` +
+    `  Add \`export {};\` to the entrypoint to make it a module, then rebuild.`
+  );
+}
+
 function runTypeGate(
   cwd: string,
   entry: string,
@@ -806,10 +962,7 @@ function runTypeGate(
     const fallback = runCheck(cwd, entry, false);
     if (fallback.error) return { error: fallback.error };
     if (fallback.status !== 0) {
-      return {
-        error:
-          `Type gate failed — the entrypoint does not type-check:\n${fallback.output}`,
-      };
+      return { error: typeGateError(fallback.output) };
     }
     return {
       ok: true,
@@ -818,10 +971,7 @@ function runTypeGate(
         `this Bun is ${bunVersion()}). AOT codegen benefit is unverified here.`,
     };
   }
-  return {
-    error:
-      `Type gate failed — the entrypoint does not type-check:\n${first.output}`,
-  };
+  return { error: typeGateError(first.output) };
 }
 
 export function runBuild(cwd: string, args: string[]): BuildOutcome {
@@ -899,6 +1049,15 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
         "  \"@simplewebauthn/server\"). Move the entry inside the project.",
       ],
     };
+  }
+
+  // The output must never destroy the entrypoint or the user's data
+  // (see guardOutPath): check the destination before any work that
+  // could create artifacts, not at the end.
+  const outAbs = resolve(cwd, opts.out);
+  const outGuard = guardOutPath(opts.out, outAbs, entryAbs);
+  if ("error" in outGuard) {
+    return { code: 1, lines: ["", `yatta build: ${outGuard.error}`] };
   }
 
   const resolvedAssets = resolveAssets(cwd, opts.assets);
@@ -1039,7 +1198,6 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
     }
   }
 
-  const outAbs = resolve(cwd, opts.out);
   const bunArgs = ["build", "--compile", buildEntry, "--outfile", outAbs];
   for (const asset of resolvedAssets.assets) bunArgs.push("--asset", asset);
   if (opts.target) bunArgs.push("--target", opts.target);

@@ -233,6 +233,21 @@ describe("yatta build --standalone", () => {
     expect(outcomeEnv.lines.join("\n")).toMatch(/Refusing/);
   });
 
+  it("refuses a .ENV file as an asset, in any case", () => {
+    const mixed = mkdtempSync(join(tmpdir(), "yatta-build-upper-env-"));
+    try {
+      writeFileSync(join(mixed, "server.ts"), ENTRY);
+      mkdirSync(join(mixed, "public"));
+      writeFileSync(join(mixed, "public", ".ENV"), `AUTH_SECRET=${SENTINEL_ENV}\n`);
+      const outcome = runBuild(mixed, ["--standalone", "--entry", "server.ts", "--asset", "public"]);
+      expect(outcome.code).toBe(1);
+      expect(outcome.lines.join("\n")).toMatch(/Refusing/);
+      expect(existsSync(join(mixed, "dist", "app"))).toBe(false);
+    } finally {
+      rmSync(mixed, { recursive: true, force: true });
+    }
+  });
+
   it("fails cleanly with no entrypoint", () => {
     const empty = mkdtempSync(join(tmpdir(), "yatta-build-empty-"));
     try {
@@ -272,6 +287,68 @@ describe("yatta build --standalone", () => {
   });
 });
 
+describe("output destination guard", () => {
+  it("refuses --out equal to the entrypoint, leaving it intact", () => {
+    const proj = mkdtempSync(join(tmpdir(), "yatta-build-out-entry-"));
+    try {
+      writeFileSync(join(proj, "server.ts"), ENTRY);
+      const before = readFileSync(join(proj, "server.ts"), "utf8");
+      const outcome = runBuild(proj, ["--standalone", "--entry", "server.ts", "--out", "server.ts"]);
+      expect(outcome.code).toBe(1);
+      expect(outcome.lines.join("\n")).toMatch(/--out/);
+      expect(outcome.lines.join("\n")).toMatch(/entrypoint/);
+      expect(readFileSync(join(proj, "server.ts"), "utf8")).toBe(before);
+      expect(existsSync(join(proj, "dist", "app"))).toBe(false);
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses --out naming an existing data file, leaving it intact", () => {
+    const proj = mkdtempSync(join(tmpdir(), "yatta-build-out-data-"));
+    try {
+      writeFileSync(join(proj, "server.ts"), ENTRY);
+      writeFileSync(join(proj, "notes.txt"), "DO NOT DELETE — user data\n");
+      const outcome = runBuild(proj, ["--standalone", "--entry", "server.ts", "--out", "notes.txt"]);
+      expect(outcome.code).toBe(1);
+      expect(outcome.lines.join("\n")).toMatch(/already exists/);
+      expect(readFileSync(join(proj, "notes.txt"), "utf8")).toBe("DO NOT DELETE — user data\n");
+      expect(existsSync(join(proj, "dist", "app"))).toBe(false);
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses --out naming an existing directory", () => {
+    const proj = mkdtempSync(join(tmpdir(), "yatta-build-out-dir-"));
+    try {
+      writeFileSync(join(proj, "server.ts"), ENTRY);
+      mkdirSync(join(proj, "dist2"));
+      const outcome = runBuild(proj, ["--standalone", "--entry", "server.ts", "--out", "dist2"]);
+      expect(outcome.code).toBe(1);
+      expect(outcome.lines.join("\n")).toMatch(/directory/);
+      expect(existsSync(join(proj, "dist", "app"))).toBe(false);
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+    }
+  });
+
+  it("rebuilds over its own previous output", () => {
+    const proj = mkdtempSync(join(tmpdir(), "yatta-build-rebuild-"));
+    try {
+      writeFileSync(join(proj, "server.ts"), ENTRY);
+      const first = runBuild(proj, ["--standalone", "--entry", "server.ts"]);
+      expect(first.code).toBe(0);
+      expect(statSync(join(proj, "dist", "app")).size).toBeGreaterThan(1_000_000);
+      const second = runBuild(proj, ["--standalone", "--entry", "server.ts"]);
+      expect(second.code).toBe(0);
+      expect(statSync(join(proj, "dist", "app")).size).toBeGreaterThan(1_000_000);
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("isDataOrSecretPath", () => {
   it("flags databases, env files, keys, and data directories", () => {
     for (const path of [
@@ -284,6 +361,22 @@ describe("isDataOrSecretPath", () => {
       "uploads/avatar.png",
       "storage/file.txt",
       "Database/app.db",
+    ]) {
+      expect(isDataOrSecretPath(path)).not.toBeNull();
+    }
+  });
+
+  it("flags env files in any case and under env-ish names", () => {
+    for (const path of [
+      ".ENV",
+      "FOO.ENV",
+      ".Env",
+      "config/.ENV.local",
+      "my.env.bak",
+      "public/.env.bak",
+      ".envrc",
+      ".envrc.local",
+      "a/b.env.c",
     ]) {
       expect(isDataOrSecretPath(path)).not.toBeNull();
     }
@@ -620,6 +713,42 @@ describe("bun check type gate", () => {
       expect(outcome.lines.join("\n")).toMatch(/Type gate failed/);
       expect(outcome.lines.join("\n")).toMatch(/TS2322/);
       expect(existsSync(join(fixture, "dist", "app"))).toBe(false);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("points a top-level-await-only entry at `export {};` (TS1375)", () => {
+    const fixture = gateFixture(`const value = await Promise.resolve(42);\nconsole.log(value);\n`);
+    try {
+      // --aot runs the gate (with the plain-check fallback on this Bun).
+      const aot = runBuild(fixture, ["--standalone", "--entry", "server.ts", "--aot"]);
+      expect(aot.code).toBe(1);
+      expect(aot.lines.join("\n")).toMatch(/TS1375/);
+      // The pointer is the fix's own line — the raw checker output
+      // says "Consider adding an empty 'export {}'", which is not this.
+      expect(aot.lines.join("\n")).toMatch(/Add `export \{\};` to the entrypoint/);
+      expect(existsSync(join(fixture, "dist", "app"))).toBe(false);
+      // The --check gate on a JIT build gets the same pointer.
+      const jit = runBuild(fixture, ["--standalone", "--entry", "server.ts", "--check"]);
+      expect(jit.code).toBe(1);
+      expect(jit.lines.join("\n")).toMatch(/TS1375/);
+      expect(jit.lines.join("\n")).toMatch(/Add `export \{\};` to the entrypoint/);
+      expect(existsSync(join(fixture, "dist", "app"))).toBe(false);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("builds a top-level-await entry under --aot once it is a module", () => {
+    const fixture = gateFixture(
+      `const value = await Promise.resolve(42);\nconsole.log(value);\nexport {};\n`,
+    );
+    try {
+      const outcome = runBuild(fixture, ["--standalone", "--entry", "server.ts", "--aot"]);
+      expect(outcome.code).toBe(0);
+      expect(outcome.lines.join("\n")).toMatch(/mode: AOT/);
+      expect(existsSync(join(fixture, "dist", "app"))).toBe(true);
     } finally {
       rmSync(fixture, { recursive: true, force: true });
     }

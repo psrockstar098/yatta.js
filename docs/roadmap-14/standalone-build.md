@@ -142,8 +142,13 @@ without listing it fails the gate until `tsconfig.json` says
 `"types": ["bun"]`. Second, if `package.json` has a `check`
 script, bare `bun check` runs that script instead of the
 typechecker; the gate passes `--no-script` so it always gets the
-checker. The framework's own `tsc` typecheck stays the push gate;
-`bun check` is the build gate, not a replacement for it.
+checker. Third, an entry that only uses top-level await — the
+framework's own entry shape, dynamic `await import(...)` with no
+static imports — is not a module, so the gate fails with TS1375
+until the entry has an import or an export; add `export {};` to
+it and the gate passes. The framework's own `tsc` typecheck stays
+the push gate; `bun check` is the build gate, not a replacement
+for it.
 
 ## Cross-compile
 
@@ -242,14 +247,21 @@ yatta build --standalone --asset uploads
 # Refusing --asset "uploads": directory "uploads" holds data, not static assets.
 ```
 
-Refused: `.env` files (including `.env.local` and friends),
-database files (`.db`, `.sqlite`, `.sqlite3`), key material
-(`.pem`, `.key`, `id_rsa*`), and directories named `uploads`,
-`storage`, or `Database` — including a data file hiding inside an
-otherwise innocent asset directory.
+Refused: `.env` files (including `.env.local` and friends, in any
+case — `.ENV` is `.env` on a case-insensitive filesystem — backups
+like `my.env.bak`, and `.envrc`), database files (`.db`, `.sqlite`,
+`.sqlite3`), key material (`.pem`, `.key`, `id_rsa*`), and
+directories named `uploads`, `storage`, or `Database` — including a
+data file hiding inside an otherwise innocent asset directory.
 
 ## Gotchas
 
+- `--out` never overwrites the entrypoint or an existing file that
+  is not a previous build output. A rebuild overwrites its own
+  previous binary; anything else at the output path — source, a
+  notes file, a hand-placed file — is refused, and must be moved
+  or deleted by hand first. There is no `--force`: overwriting a
+  file you did not mean to is a typo away.
 - No `--sourcemap`. An embedded sourcemap carries the build
   machine's paths into the binary, so the build does not pass the
   flag. If you need stack traces to map back, keep the build
