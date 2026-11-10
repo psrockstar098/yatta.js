@@ -100,6 +100,49 @@ describe("outbox — same-transaction atomicity", () => {
     expect(readChangeLog(db)).toHaveLength(0);
   });
 
+  it("creates the table and indexes once per store, not once per write", () => {
+    /*
+     * The outbox is on the write path of every feature that records a change.
+     * `CREATE TABLE IF NOT EXISTS` is not free just because it is conditional:
+     * it is parsed and planned, and there are five statements, so a relay or a
+     * write burst paid hundreds of DDL statements a second for a schema it
+     * created on the first one.
+     *
+     * The store identity is the unit: a second connection needs its own
+     * `ensure` (different connection, possibly different file), and gets one.
+     */
+    const db = memDb();
+    const counting = () => {
+      let ddl = 0;
+      const store = {
+        rawRun(sql: string, params?: any[]) {
+          if (/^\s*CREATE\s/i.test(sql)) ddl++;
+          return db.rawRun(sql, params);
+        },
+        rawAll(sql: string, params?: any[]) {
+          return db.rawAll(sql, params);
+        },
+        rawGet(sql: string, params?: any[]) {
+          return db.rawGet(sql, params);
+        },
+        get ddl() {
+          return ddl;
+        },
+      };
+      return store;
+    };
+
+    const first = counting();
+    recordOutbox(first, { eventType: "e", payload: { n: 1 } });
+    recordOutbox(first, { eventType: "e", payload: { n: 2 } });
+    recordOutbox(first, { eventType: "e", payload: { n: 3 } });
+    expect(first.ddl).toBe(5); // one table, four indexes
+
+    const second = counting();
+    recordOutbox(second, { eventType: "e", payload: { n: 4 } });
+    expect(second.ddl).toBe(5);
+  });
+
   it("rejects a duplicate event_id and a duplicate dedupe_key at record time", () => {
     const db = memDb();
     recordOutbox(db as any, { eventType: "a", payload: {}, eventId: "evt-1" });

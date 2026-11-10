@@ -78,10 +78,30 @@ export interface RecordOutboxInput {
 export const OUTBOX_TABLE = "_yatta_outbox";
 
 /**
+ * Stores whose outbox table has already been ensured, per connection object.
+ *
+ * `ensureOutboxTable` is called from every outbox entry point, and the outbox
+ * sits on the write path of every feature that records a change. Running five
+ * `CREATE ... IF NOT EXISTS` statements per write costs a parse and a plan each
+ * — 500 DDL statements for 100 recorded events — for a schema that exists after
+ * the first one. The store is the unit because it is the connection: a second
+ * connection (another file, or after a restore) is not in this set and gets its
+ * own ensure.
+ *
+ * The trade: a table dropped by something outside the framework mid-process is
+ * not silently recreated on the next write; the insert fails with SQLite's own
+ * "no such table" instead. Recreating it every write to guard against that is
+ * the cost this memo exists to remove.
+ */
+const outboxReady = new WeakSet<object>();
+
+/**
  * Creates the outbox table and its indexes if they do not exist yet.
- * Safe to call on every use; it never drops or rewrites existing rows.
+ * Safe to call on every use; it never drops or rewrites existing rows, and
+ * after the first call on a store it does no work at all.
  */
 export function ensureOutboxTable(store: OutboxStore): void {
+  if (outboxReady.has(store)) return;
   store.rawRun(`
     CREATE TABLE IF NOT EXISTS "${OUTBOX_TABLE}" (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,6 +137,9 @@ export function ensureOutboxTable(store: OutboxStore): void {
     ON "${OUTBOX_TABLE}" (dedupe_key)
     WHERE dedupe_key IS NOT NULL;
   `);
+  // Only after the last statement succeeded: a locked or broken connection
+  // must be retried on the next call, not remembered as ready.
+  outboxReady.add(store);
 }
 
 function serializePayload(payload: unknown): string {

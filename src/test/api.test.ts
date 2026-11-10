@@ -498,6 +498,72 @@ describe("API & HTTP Layer", () => {
       expect(secondRead.counter).toBe(10);
       expect(firstRead).toBe(secondRead); // Same cached instance
     });
+
+    it("reads a declared-length body without the streamed cap path", async () => {
+      /*
+       * Reading `req.body` chunk by chunk costs ~37µs per request in Bun,
+       * against ~1.6µs for `req.text()`. When `content-length` is present and
+       * within the cap there is nothing to protect against, so the native
+       * reader must be used. The `body` getter is the tell: the streamed path
+       * is the only thing that touches it.
+       */
+      const payload = JSON.stringify({ ok: true });
+      const req = new Request("http://localhost/test", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          // Constructed requests do not carry this header the way a real
+          // incoming request does; the server fills it in from the wire.
+          "Content-Length": String(payload.length),
+        },
+        body: payload,
+      });
+      let bodyWasRead = false;
+      Object.defineProperty(req, "body", {
+        get() {
+          bodyWasRead = true;
+          return null;
+        },
+      });
+
+      const ctx = new Context(req, {});
+      expect(await ctx.json<{ ok: boolean }>()).toEqual({ ok: true });
+      expect(bodyWasRead).toBe(false);
+    });
+
+    it("still caps a chunked body that declares no content-length", async () => {
+      /*
+       * The fast path above must not become an unbounded read: without
+       * content-length there is no proof the body fits, so the streamed cap
+       * stays. Four 4-byte chunks against an 8-byte limit is a 413, and the
+       * checker must fire before the whole body is buffered.
+       */
+      const chunks = ["aaaa", "bbbb", "cccc", "dddd"];
+      const req = new Request("http://localhost/test", {
+        method: "POST",
+        body: new ReadableStream({
+          start(controller) {
+            for (const c of chunks) controller.enqueue(new TextEncoder().encode(c));
+            controller.close();
+          },
+        }),
+        // @ts-ignore -- duplex is required for a streaming request body
+        duplex: "half",
+      });
+      expect(req.headers.get("content-length")).toBeNull();
+
+      const ctx = new Context(req, {});
+      const res = await (async () => {
+        try {
+          await ctx.json(undefined, { maxBytes: 8 });
+          return "read";
+        } catch (err) {
+          return err;
+        }
+      })();
+      expect(res).toBeInstanceOf(HttpError);
+      expect((res as HttpError).status).toBe(413);
+    });
   });
 
   // ──────────────────────────────────────────────────────────────────────────

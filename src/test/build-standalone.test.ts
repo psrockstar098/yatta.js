@@ -836,6 +836,72 @@ describe("bun check type gate", () => {
   });
 });
 
+describe("a Bun without `bun check`", () => {
+  /*
+   * `bun check` is a recent subcommand. On an older Bun the word is read as a
+   * package script, so the spawn fails with `Script not found "check"` — which
+   * is not a type error. Reporting it as "the entrypoint does not type-check"
+   * sent users looking for a bug in code that was fine, and blocked the build.
+   *
+   * A fake `bun` on PATH reproduces that Bun deterministically, on any Bun.
+   */
+  function withFakeBun<T>(body: (restore: () => void) => T): T {
+    const bin = mkdtempSync(join(tmpdir(), "yatta-fake-bun-"));
+    writeFileSync(
+      join(bin, "bun"),
+      `#!/bin/sh\necho 'error: Script not found "check"' >&2\nexit 1\n`,
+      { mode: 0o755 },
+    );
+    const original = process.env.PATH;
+    process.env.PATH = `${bin}:${original ?? ""}`;
+    const restore = () => {
+      process.env.PATH = original;
+      rmSync(bin, { recursive: true, force: true });
+    };
+    try {
+      return body(restore);
+    } finally {
+      restore();
+    }
+  }
+
+  const entry = `const port = 0;\nconst server = Bun.serve({ port, fetch: () => Response.json({ ok: true }) });\nconsole.log(server.port);\n`;
+
+  it("names the missing checker instead of blaming the entrypoint with --check", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "yatta-no-check-"));
+    writeFileSync(join(fixture, "server.ts"), entry);
+    try {
+      withFakeBun(() => {
+        const outcome = runBuild(fixture, ["--standalone", "--entry", "server.ts", "--check"]);
+        const text = outcome.lines.join("\n");
+        expect(outcome.code).toBe(1);
+        expect(text).toMatch(/has no `bun check`/);
+        expect(text).not.toMatch(/does not type-check/);
+        expect(existsSync(join(fixture, "dist", "app"))).toBe(false);
+      });
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("skips the implicit AOT gate with a note rather than refusing to build", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "yatta-no-check-aot-"));
+    writeFileSync(join(fixture, "server.ts"), entry);
+    try {
+      withFakeBun(() => {
+        const outcome = runBuild(fixture, ["--standalone", "--entry", "server.ts", "--aot"]);
+        const text = outcome.lines.join("\n");
+        // The fake bun also fails the compile, but the gate must not claim
+        // the entrypoint is broken: the note says the gate was skipped.
+        expect(text).not.toMatch(/Type gate failed/);
+        expect(text).toMatch(/type gate: skipped/);
+      });
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("build machinery is CLI-only", () => {
   it("is not imported by the server entrypoint", () => {
     const mainSource = readFileSync(new URL("../main.ts", import.meta.url), "utf8");

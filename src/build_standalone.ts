@@ -1075,6 +1075,26 @@ function isTs1375Only(output: string): boolean {
   return codes.size === 1 && codes.has("1375");
 }
 
+/**
+ * Whether the Bun running this build has no `check` subcommand at all.
+ *
+ * `bun check` is newer than the `engines` floor in package.json, and on an
+ * older Bun the word is resolved as a package script instead. The spawn then
+ * exits 1 with `Script not found "check"`, which the gate used to report as
+ * "the entrypoint does not type-check" — a false accusation with a real cost:
+ * the user goes looking for a type error that does not exist, and the build
+ * is refused for a reason unrelated to their code.
+ *
+ * `--no-script` is always passed, so a Bun that has `check` can never produce
+ * this message by honouring a project's package.json instead.
+ */
+function isMissingCheckCommand(output: string): boolean {
+  return (
+    /Script not found "check"/.test(output) ||
+    /\bunknown command[:\s]+["'`]?check\b/i.test(output)
+  );
+}
+
 /** A type-gate failure, with the TS1375 pointer when it applies. */
 function typeGateError(output: string): string {
   const base = `Type gate failed — the entrypoint does not type-check:\n${output}`;
@@ -1090,10 +1110,36 @@ function runTypeGate(
   cwd: string,
   entry: string,
   aot: boolean,
+  required: boolean,
 ): { ok: true; note?: string } | { error: string } {
   const first = runCheck(cwd, entry, aot);
   if (first.error) return { error: first.error };
   if (first.status === 0) return { ok: true };
+
+  /*
+   * No `bun check` on this Bun. An explicitly requested gate fails, because
+   * skipping it would answer "checked" to a request that was not checked. The
+   * implicit AOT gate skips with a note instead: AOT is the thing the user
+   * asked for, and refusing the build over an unrelated Bun version leaves
+   * them with no binary and no way forward. The note says the types are
+   * unverified rather than implying they passed.
+   */
+  if (isMissingCheckCommand(first.output)) {
+    if (required) {
+      return {
+        error:
+          `this Bun (${bunVersion()}) has no \`bun check\`, so --check cannot run.\n` +
+          `  Upgrade Bun, or drop --check to build without a type gate.`,
+      };
+    }
+    return {
+      ok: true,
+      note:
+        `type gate: skipped (Bun ${bunVersion()} has no \`bun check\`; ` +
+        `the entrypoint's types are unverified)`,
+    };
+  }
+
   // The --aot gate needs a newer Bun. Fall back to plain `bun check`
   // rather than refusing the build outright: the fallback still stops
   // type errors, and the build step itself is verified separately.
@@ -1268,7 +1314,7 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
   // Type gate: always for AOT, opt-in for JIT.
   let gateNote: string | undefined;
   if (opts.aot || opts.check) {
-    const gate = runTypeGate(cwd, entry, opts.aot);
+    const gate = runTypeGate(cwd, entry, opts.aot, opts.check);
     if ("error" in gate) {
       return { code: 1, lines: ["", `yatta build: ${gate.error}`] };
     }
@@ -1394,7 +1440,12 @@ export function runBuild(cwd: string, args: string[]): BuildOutcome {
       const detail = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
       return {
         code: res.status ?? 1,
-        lines: ["", "yatta build: `bun build --compile` failed.", ...(detail ? [detail] : [])],
+        lines: [
+          "",
+          "yatta build: `bun build --compile` failed.",
+          ...(gateNote ? [`  note: ${gateNote}`] : []),
+          ...(detail ? [detail] : []),
+        ],
       };
     }
     if (!existsSync(outAbs)) {
