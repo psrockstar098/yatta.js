@@ -41,6 +41,14 @@ Bun.file(join(import.meta.dir, "public", "hello.txt"));
   bundles the page's scripts and assets into the same executable,
   so a full-stack app ships as one unit with no extra flag. That is
   Bun's native HTML-import behaviour, not a Yatta step.
+- File routes: when the entry is a scaffolded app, the build lists
+  the `backend/` routes with Bun's own FileSystemRouter and bakes
+  the table into the binary — the build reports it as
+  `routes embedded: N file route(s)`. A compiled binary has no
+  backend directory on disk for a FileSystemRouter to scan, so the
+  routes are matched against that table instead, and the route
+  modules ride in the binary as code. The binary serves them the
+  same way `bun run` does, from any working directory.
 
 Out, by design:
 
@@ -322,11 +330,17 @@ data file hiding inside an otherwise innocent asset directory.
   easy to spot and delete by hand.
 - Worker entrypoints are not auto-detected. Bun compiles the
   entrypoints it is given; a worker spawned from a URL string at
-  runtime is not an import, so it is not bundled. A single-entrypoint
-  app — one `Bun.serve` entry that does its own work — compiles
-  and runs as-is. An app that leans on the framework's multi-worker
-  runtime pools needs its worker files handled before this build
-  covers it; that is a known gap, not a silent fallback.
+  runtime is not an import, so it is not bundled — and a worker
+  file the binary never embeds cannot be spawned from it at all.
+  A single-entrypoint app — one `Bun.serve` entry that does its
+  own work — compiles and runs as-is. A scaffolded app's runtime
+  fleet is the same case handled explicitly: in a compiled binary
+  the fleet stays down (the runtime prints a warning at boot and
+  the build prints a note), the server still boots and serves,
+  and subsystem execution (`runtime.execute`) fails with a clear
+  error instead of crashing the process. Run with `bun run` for
+  the full fleet. That is a stated degradation, not a silent
+  fallback: the limitation is printed at build time and at boot.
 - Do not import a database with an embed attribute. Bun can embed
   a SQLite file if the import asks for it — this build never does,
   and your app must not either. If a database file is inside the

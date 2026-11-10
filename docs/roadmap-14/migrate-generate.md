@@ -18,8 +18,9 @@ yatta migrate:generate --schema db.ts --allow-destructive
 
 The schema file must export a `schema` object of `col.*` builders — the same
 object passed to `createDatabase`. Without `--schema`, the command tries
-`db.ts`, `yatta/db.ts`, `src/db.ts`, `database.ts`, and `yatta/database.ts`
-in that order.
+`db.ts`, `yatta/db.ts`, `yatta/func/db.ts`, `src/db.ts`, `database.ts`,
+`yatta/database.ts`, `db.js`, and `src/db.js` in that order — so it finds
+the schema a fresh scaffold puts at `yatta/func/db.ts` with no flag at all.
 
 ```ts
 // db.ts — models only, no server boot
