@@ -105,6 +105,33 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
   );
 }
 
+/**
+ * Whether an error is SQLite lock contention (SQLITE_BUSY / "database is
+ * locked") — the error several processes opening the same file at once
+ * hit. Anything else must fail at once; retrying it would only hide it.
+ */
+function isSqliteBusy(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return (
+    code === "SQLITE_BUSY" ||
+    /database is locked|database table is locked/i.test(
+      String((err as Error | null)?.message ?? err),
+    )
+  );
+}
+
+/**
+ * Short synchronous wait for the open-time retries below. This runs once
+ * at construction, before the store serves traffic — the same shape as
+ * cache_queue's openWithRetry.
+ */
+function sleepBusy(ms: number): void {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    /* wait for the competing connection to finish */
+  }
+}
+
 export class YattaError extends Error {
   /**
    * @param message Human-readable error description.
@@ -2696,13 +2723,30 @@ export class YattaDB {
    * - `busy_timeout` waits for a contended lock instead of throwing SQLITE_BUSY.
    * - `synchronous = NORMAL` is safe under WAL and avoids an fsync per commit.
    *
+   * `busy_timeout` goes first, on its own: the WAL switch needs a write lock
+   * and fails at once without a timeout in place. The switch can still lose
+   * the race when four cluster workers open a fresh database at once, so it
+   * retries with a short escalating backoff — the same shape as
+   * cache_queue's openWithRetry. Without the retry the losers' constructors
+   * threw "database is locked" and the workers died at first boot.
+   *
    * Must be re-applied after any connection is replaced (see `restore()`).
    */
   private applyPragmas(): void {
-    this._sqlite.run("PRAGMA journal_mode = WAL;");
-    this._sqlite.run("PRAGMA foreign_keys = ON;");
     this._sqlite.run("PRAGMA busy_timeout = 5000;");
-    this._sqlite.run("PRAGMA synchronous = NORMAL;");
+    this.applyPragmasWithRetry(8);
+  }
+
+  private applyPragmasWithRetry(attempts: number): void {
+    try {
+      this._sqlite.run("PRAGMA journal_mode = WAL;");
+      this._sqlite.run("PRAGMA foreign_keys = ON;");
+      this._sqlite.run("PRAGMA synchronous = NORMAL;");
+    } catch (err) {
+      if (!isSqliteBusy(err) || attempts <= 1) throw err;
+      sleepBusy(20 * (9 - attempts));
+      this.applyPragmasWithRetry(attempts - 1);
+    }
   }
 
   /**
@@ -3023,8 +3067,27 @@ export class YattaDB {
    * 2. Adds newly added columns to existing tables safely via `ALTER TABLE ADD COLUMN`.
    * 3. Creates missing indexes.
    * 4. Validates foreign key integrity.
+   *
+   * First boot in cluster mode runs this in every worker at once; the
+   * loser of the write-lock race retries instead of crashing the worker.
+   * The migration is idempotent (CREATE TABLE IF NOT EXISTS, and it rolls
+   * back on error), so a retry is safe.
    */
   syncSchema(): void {
+    this.syncSchemaWithRetry(8);
+  }
+
+  private syncSchemaWithRetry(attempts: number): void {
+    try {
+      this.syncSchemaOnce();
+    } catch (err) {
+      if (!isSqliteBusy(err) || attempts <= 1) throw err;
+      sleepBusy(20 * (9 - attempts));
+      this.syncSchemaWithRetry(attempts - 1);
+    }
+  }
+
+  private syncSchemaOnce(): void {
     const schemaHash = crypto.createHash("sha256").update(JSON.stringify(this.schema)).digest("hex").slice(0, 16);
 
     this._sqlite.run("PRAGMA foreign_keys = OFF;");

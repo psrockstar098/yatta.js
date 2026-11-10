@@ -1144,3 +1144,152 @@ describe("stale shim cleanup", () => {
     }
   }, 180_000);
 });
+
+describe("a fresh scaffold's standalone binary (F3)", () => {
+  /*
+   * The regression that shipped 1.0.6: `yatta build --standalone` exited 0
+   * on a fresh scaffold, but the binary died on boot with
+   * "Unable to find directory: /$bunfs/backend" — the file router scanned
+   * a directory that does not exist in a compiled binary. The tiny
+   * server.ts fixture above never caught it: its entry never builds a
+   * FileSystemRouter. Only a real scaffold does, so this fixture builds
+   * one with `yatta new` and boots the binary it produces.
+   *
+   * The binary must also survive the second boot failure the router fix
+   * exposed: the runtime's worker fleet cannot spawn in a binary either
+   * (Bun's compiler never embeds the worker entrypoint), so the fleet
+   * stays down and the server still boots and serves.
+   */
+  let proj = "";
+  let appDir = "";
+  let binary = "";
+
+  beforeAll(async () => {
+    proj = mkdtempSync(join(tmpdir(), "yatta-build-scaffold-"));
+    const cwd = process.cwd();
+    process.chdir(proj);
+    try {
+      expect(await main(["new", "app"])).toBe(0);
+    } finally {
+      process.chdir(cwd);
+    }
+    appDir = join(proj, "app");
+    // The scaffold resolves the framework the way a real user project
+    // does: node_modules/yatta.js points at this checkout, and
+    // reflect-metadata sits hoisted next to it as a real directory.
+    mkdirSync(join(appDir, "node_modules"));
+    symlinkSync(ROOT, join(appDir, "node_modules", "yatta.js"), "dir");
+    cpSync(join(ROOT, "node_modules", "reflect-metadata"), join(appDir, "node_modules", "reflect-metadata"), {
+      recursive: true,
+    });
+    const outcome = runBuild(appDir, ["--standalone"]);
+    expect(outcome.code).toBe(0);
+    expect(outcome.lines.join("\n")).toMatch(/routes embedded: 5 file route\(s\)/);
+    binary = outcome.outPath!;
+  }, 180_000);
+
+  afterAll(() => {
+    if (proj) rmSync(proj, { recursive: true, force: true });
+  });
+
+  /** A free port for the scaffold binary (it takes PORT, default 4000). */
+  function freePort(): number {
+    const srv = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+    const port = srv.port!;
+    srv.stop();
+    return port;
+  }
+
+  /**
+   * Starts the scaffold binary, waiting for its "Yatta listening" line.
+   * The port is known up front (passed via PORT), so the line is the
+   * readiness signal, not a port announcement.
+   */
+  async function startScaffold(
+    bin: string,
+    cwd: string,
+    port: number,
+  ): Promise<ChildProcess> {
+    const child = spawn(bin, [], {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, PORT: String(port) },
+    });
+    let out = "";
+    let errOut = "";
+    await new Promise<void>((resolvePromise, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`scaffold binary did not start listening; got: ${out} ${errOut}`)),
+        60_000,
+      );
+      child.stdout!.on("data", (chunk: Buffer) => {
+        out += chunk.toString();
+        if (out.includes("Yatta listening")) {
+          clearTimeout(timer);
+          resolvePromise();
+        }
+      });
+      child.stderr!.on("data", (chunk: Buffer) => {
+        errOut += chunk.toString();
+      });
+      // A binary that crashes at startup never prints the line: fail
+      // fast with its stderr instead of waiting out the whole timeout.
+      child.on("exit", (code) => {
+        clearTimeout(timer);
+        reject(new Error(`scaffold binary exited with code ${code} before listening; stdout: ${out} stderr: ${errOut}`));
+      });
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    return child;
+  }
+
+  it("boots and serves / and /health", async () => {
+    const port = freePort();
+    const child = await startScaffold(binary, appDir, port);
+    try {
+      const root = await fetch(`http://localhost:${port}/`);
+      expect(root.status).toBe(200);
+      expect(await root.json()).toEqual({
+        ok: true,
+        message: "Edit yatta/backend/ to add your routes.",
+      });
+      const health = await fetch(`http://localhost:${port}/health`);
+      expect(health.status).toBe(200);
+      const body = await health.json();
+      expect(body.service).toBe("app");
+    } finally {
+      await stop(child);
+    }
+  }, 120_000);
+
+  it("serves the file routes from a foreign working directory", async () => {
+    // Running from an empty directory proves the routes came from the
+    // manifest baked into the binary, not from files read off disk —
+    // there is no yatta/backend here to scan.
+    const elsewhere = mkdtempSync(join(tmpdir(), "yatta-build-scaffold-elsewhere-"));
+    try {
+      const port = freePort();
+      const child = await startScaffold(binary, elsewhere, port);
+      try {
+        const root = await fetch(`http://localhost:${port}/`);
+        expect(root.status).toBe(200);
+        expect(await root.json()).toEqual({
+          ok: true,
+          message: "Edit yatta/backend/ to add your routes.",
+        });
+      } finally {
+        await stop(child);
+      }
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("carries no build-machine paths", () => {
+    const bytes = readFileSync(binary);
+    expect(bytes.includes(Buffer.from(proj))).toBe(false);
+  });
+});

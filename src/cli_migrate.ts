@@ -203,6 +203,7 @@ export function parseMigrateGenerateArgs(rest: string[]): { opts: MigrateGenerat
 const SCHEMA_CANDIDATES = [
   "db.ts",
   "yatta/db.ts",
+  "yatta/func/db.ts",
   "src/db.ts",
   "database.ts",
   "yatta/database.ts",

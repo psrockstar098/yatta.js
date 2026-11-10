@@ -145,8 +145,19 @@ describe("a scaffolded project compiles", () => {
   });
 
   it("refuses an unknown option rather than using it as a name", () => {
-    const output = run(["new", "--bogus"], workDir);
+    // The refusal must exit non-zero (F5: unknown options used to
+    // print usage and exit 0, which hid the mistake from scripts and
+    // CI), so execFileSync throws and the output rides on the error.
+    let output = "";
+    let code = 0;
+    try {
+      output = run(["new", "--bogus"], workDir);
+    } catch (err: any) {
+      code = err.status ?? 1;
+      output = String(err.stdout ?? "");
+    }
 
+    expect(code).toBe(1);
     expect(output).toMatch(/Unknown option/);
     expect(existsSync(join(workDir, "--bogus"))).toBe(false);
   });

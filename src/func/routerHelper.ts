@@ -8,6 +8,11 @@ import { createGrpcWebHandler } from "./grpcweb";
 import { createDoHHandler } from "./doh";
 import { createOAuthServer, clientsFromEnv } from "./oauth";
 import { createOIDC } from "./oidc";
+import {
+  createFileRouter,
+  loadRouteModule,
+  type FileRouterLike,
+} from "./standalone_routes";
 
 // One shared handler so WebDAV locks survive across requests.
 // storage.disk() is the raw disk API (upload/download/head/list);
@@ -50,10 +55,29 @@ oauthServer.setIdTokenIssuer(oidc.issueIdToken);
 // Always resolve relative to this file to guarantee correct path regardless of current working directory
 const backendDir = path.resolve(import.meta.dir, "../backend");
 
-export const router = new Bun.FileSystemRouter({
-  style: "nextjs",
-  dir: backendDir,
-});
+/**
+ * The file router, built on first use — not at import time. A
+ * compiled binary sets __yattaStandaloneRoutes after its imports
+ * evaluate, so reading the table at module top level would always
+ * miss it; and constructing a FileSystemRouter at top level is what
+ * used to crash the binary ("Unable to find directory:
+ * /$bunfs/backend"). Under `bun run` the table is absent and this
+ * is the same file router as before.
+ */
+let routerInstance: FileRouterLike | null = null;
+function getRouter(): FileRouterLike {
+  if (!routerInstance) routerInstance = createFileRouter(backendDir);
+  return routerInstance;
+}
+
+export const router: FileRouterLike = {
+  match(req: Request | string) {
+    return getRouter().match(req);
+  },
+  reload() {
+    getRouter().reload();
+  },
+};
 
 /**
  * Robustly pulls the API instance out of the imported module.
@@ -253,7 +277,10 @@ export default async function routers(
 
   let module: Record<string, unknown>;
   try {
-    module = await import(match.filePath);
+    // In a compiled binary the module is already bundled (see the
+    // standalone route table); everywhere else it is loaded from
+    // the matched file on disk.
+    module = await loadRouteModule(match);
   } catch (err) {
     console.error(`Failed to load route module ${match.filePath}:`, err);
     return withSecurityHeaders(

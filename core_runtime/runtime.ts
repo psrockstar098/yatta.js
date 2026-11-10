@@ -15,12 +15,32 @@ export interface RuntimeConfig extends SchedulerOptions {
   silent?: boolean;
 }
 
+/**
+ * True inside a compiled standalone binary (`bun build --compile`):
+ * every bundled module reports `/$bunfs/root` as its directory, and
+ * there are no source files on disk for a worker thread to load.
+ * Bun's compiler never embeds the fleet's worker entrypoint, and the
+ * subsystem files it would mount are bundled code, not files — so a
+ * binary can never spawn the fleet.
+ */
+function isStandaloneBinary(): boolean {
+  return (
+    typeof import.meta.dir === "string" && import.meta.dir.startsWith("/$bunfs")
+  );
+}
+
 export class FrameworkRuntime {
   private scheduler: HardwareAwareScheduler;
   private isInitialized = false;
   private startPromise: Promise<void> | null = null;
   private workerUrl: URL;
   private silent: boolean;
+  /**
+   * Set when start() runs inside a standalone binary: the fleet never
+   * spawns, subsystems are recorded by name only, and execute() fails
+   * with a clear error instead of hanging or crashing the process.
+   */
+  private fleetUnavailable = false;
 
   constructor(config?: RuntimeConfig) {
     this.scheduler = new HardwareAwareScheduler(config);
@@ -46,6 +66,24 @@ export class FrameworkRuntime {
   }
 
   private async doStart(): Promise<void> {
+    if (isStandaloneBinary()) {
+      // No worker file exists to spawn, so the fleet stays down and
+      // the server still boots and serves: crashing here would make
+      // every standalone binary unusable, while nothing on the basic
+      // request path needs the fleet. Subsystem execution reports
+      // this plainly when it is attempted; run with `bun run` for
+      // the full fleet.
+      this.fleetUnavailable = true;
+      if (!this.silent) {
+        console.warn(
+          "[Yatta Runtime] Worker fleet unavailable in this standalone binary: " +
+            "subsystem execution needs `bun run`. HTTP serving is unaffected.",
+        );
+      }
+      this.isInitialized = true;
+      return;
+    }
+
     if (!this.silent) {
       const topology = this.scheduler.getTopology();
       console.log(
@@ -66,6 +104,12 @@ export class FrameworkRuntime {
     if (!this.isInitialized) {
       throw new Error("Runtime must be started before registering subsystems.");
     }
+    if (this.fleetUnavailable) {
+      // Recorded by name only: there is no worker to mount it on,
+      // and mounting would throw. execute() reports the fleet as
+      // unavailable when it is attempted.
+      return `graph-${subsystem.name}`;
+    }
     return await this.scheduler.scheduleSubsystem(subsystem);
   }
 
@@ -74,6 +118,14 @@ export class FrameworkRuntime {
     handler: string,
     payload: TPayload,
   ): Promise<TResult> {
+    if (this.fleetUnavailable) {
+      return Promise.reject(
+        new Error(
+          "Subsystem execution is unavailable in this standalone binary: " +
+            "the worker fleet needs `bun run`.",
+        ),
+      );
+    }
     if (!this.isInitialized) {
       return Promise.reject(new Error("Runtime is not running."));
     }
@@ -89,6 +141,14 @@ export class FrameworkRuntime {
     handler: string,
     payload: TPayload,
   ): Promise<TResult> {
+    if (this.fleetUnavailable) {
+      return Promise.reject(
+        new Error(
+          "Subsystem execution is unavailable in this standalone binary: " +
+            "the worker fleet needs `bun run`.",
+        ),
+      );
+    }
     if (!this.isInitialized) {
       return Promise.reject(new Error("Runtime is not running."));
     }

@@ -60,6 +60,7 @@
     "./profiler": "./src/types/profiler.ts",
     "./grpcweb": "./src/func/grpcweb.ts",
     "./webdav": "./src/func/webdav.ts",
+    "./standalone-routes": "./src/func/standalone_routes.ts",
     "./webfinger": "./src/func/webfinger.ts",
     "./doh": "./src/func/doh.ts",
     "./oauth": "./src/func/oauth.ts",

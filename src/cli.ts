@@ -336,11 +336,17 @@ const TEMPLATE_ROUTER = `// yatta/backend/_router.ts
 
 import path from "node:path";
 import { API, throttledReload } from "yatta.js/api";
+import { createFileRouter, loadRouteModule, type FileRouterLike } from "yatta.js/standalone-routes";
 
-const fileRouter = new Bun.FileSystemRouter({
-  style: "nextjs",
-  dir: import.meta.dir,
-});
+// The file router, built on first use: under \`bun run\` it scans this
+// directory; in a compiled binary it matches against the route table
+// the build baked in (see yatta/func/routerHelper.ts — a binary has
+// no backend directory on disk for a FileSystemRouter to scan).
+let fileRouterInstance: FileRouterLike | null = null;
+function getFileRouter(): FileRouterLike {
+  if (!fileRouterInstance) fileRouterInstance = createFileRouter(import.meta.dir);
+  return fileRouterInstance;
+}
 
 /**
  * Pulls the API instance out of a route module.
@@ -359,9 +365,9 @@ function resolveApi(module: Record<string, unknown>): any {
 }
 
 export async function routers(req: Request, server: any): Promise<Response> {
-  if (process.env.NODE_ENV !== "production") throttledReload(fileRouter);
+  if (process.env.NODE_ENV !== "production") throttledReload(getFileRouter());
 
-  let match = fileRouter.match(req);
+  let match = getFileRouter().match(req);
   let basePath: string | undefined;
 
   // Try the trailing-slash variant.
@@ -370,7 +376,7 @@ export async function routers(req: Request, server: any): Promise<Response> {
     const alt = url.pathname.endsWith("/")
       ? url.pathname.slice(0, -1) || "/"
       : url.pathname + "/";
-    match = fileRouter.match(alt);
+    match = getFileRouter().match(alt);
   }
 
   // Walk up to a parent directory, e.g. /user/profile -> /user.
@@ -378,7 +384,7 @@ export async function routers(req: Request, server: any): Promise<Response> {
     const segments = new URL(req.url).pathname.split("/").filter(Boolean);
     while (segments.length > 0) {
       const parentPath = "/" + segments.join("/");
-      const candidate = fileRouter.match(parentPath);
+      const candidate = getFileRouter().match(parentPath);
       if (candidate) {
         match = candidate;
         basePath = parentPath;
@@ -392,7 +398,7 @@ export async function routers(req: Request, server: any): Promise<Response> {
 
   let module: Record<string, unknown>;
   try {
-    module = await import(match.filePath);
+    module = await loadRouteModule(match);
   } catch (err) {
     console.error(\`Failed to load route \${match.filePath}:\`, err);
     return new Response("Internal Server Error", { status: 500 });
@@ -1485,13 +1491,40 @@ import { API, throttledReload } from "yatta.js/api";
 import { realtime } from "./realtime";
 import { storage } from "./storage";
 
+// One file-based route, as the standalone build bakes it in
+// (\`yatta build --standalone\` sets __yattaStandaloneRoutes on
+// globalThis). \`pattern\` is the Next.js-style route, \`file\` is the
+// route file relative to the project root, and \`module\` is the
+// already-bundled module namespace — the binary has no backend
+// directory on disk, so the module cannot be imported by path.
+import { createFileRouter, loadRouteModule, type FileRouterLike } from "yatta.js/standalone-routes";
+
 // Resolved from this file, so it works regardless of cwd.
 const backendDir = path.resolve(import.meta.dir, "../backend");
 
-export const router = new Bun.FileSystemRouter({
-  style: "nextjs",
-  dir: backendDir,
-});
+/**
+ * The file router, built on first use — not at import time. A
+ * compiled binary sets __yattaStandaloneRoutes after its imports
+ * evaluate, so reading the table at module top level would always
+ * miss it; and constructing a FileSystemRouter at top level is what
+ * used to crash the binary ("Unable to find directory:
+ * /$bunfs/backend"). Under \`bun run\` the table is absent and this
+ * is the same file router as before.
+ */
+let routerInstance: FileRouterLike | null = null;
+function getRouter(): FileRouterLike {
+  if (!routerInstance) routerInstance = createFileRouter(backendDir);
+  return routerInstance;
+}
+
+export const router: FileRouterLike = {
+  match(req: Request | string) {
+    return getRouter().match(req);
+  },
+  reload() {
+    getRouter().reload();
+  },
+};
 
 /** Pulls the API instance out of a route module (handles default/api/CJS). */
 function resolveApi(module: Record<string, unknown>): API | undefined {
@@ -1564,7 +1597,10 @@ export default async function routers(
 
   let module: Record<string, unknown>;
   try {
-    module = await import(match.filePath);
+    // In a compiled binary the module is already bundled (see the
+    // standalone route table); everywhere else it is loaded from
+    // the matched file on disk.
+    module = await loadRouteModule(match);
   } catch (err) {
     console.error(\`Failed to load route module \${match.filePath}:\`, err);
     return applyHeaders(new Response("Internal Server Error", { status: 500 }), isHttps);
@@ -2330,6 +2366,46 @@ function runCapture(cmd: string, args: string[]): string | null {
   return res.status === 0 ? (res.stdout ?? "").trim() : null;
 }
 
+/**
+ * Whether the project has any file `bun test` would run: the same
+ * names it discovers (`*.test.*`, `*_test.*`, `*.spec.*`, `*_spec.*`
+ * in js/jsx/ts/tsx). A plain file in a `test/` directory does not
+ * count — `bun test` does not run it either.
+ */
+function hasTestFiles(cwd: string): boolean {
+  const patterns = [
+    "**/*.test.{ts,tsx,js,jsx}",
+    "**/*_test.{ts,tsx,js,jsx}",
+    "**/*.spec.{ts,tsx,js,jsx}",
+    "**/*_spec.{ts,tsx,js,jsx}",
+  ];
+  for (const pattern of patterns) {
+    for (const file of new Bun.Glob(pattern).scanSync(cwd)) {
+      if (!file.startsWith("node_modules/") && !file.includes("/node_modules/")) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * `yatta check`: typecheck, then the test suite — but only when the
+ * project has tests. `bun test` exits 1 with "No tests found!" on a
+ * project with zero test files, which made `check` fail on the very
+ * project `yatta new` creates. A project with no tests passes check
+ * once tsc is clean.
+ */
+function cmdCheck(): number {
+  const tsc = run("bun", ["x", "tsc", "--noEmit"]);
+  if (tsc !== 0) return tsc;
+  if (!hasTestFiles(process.cwd())) {
+    ok("check: no test files found — typecheck passed, skipping tests.");
+    return 0;
+  }
+  return run("bun", ["test"]);
+}
+
 // ── Entry ─────────────────────────────────────────────────────────────────
 
 export async function main(argv: string[]): Promise<number> {
@@ -2344,20 +2420,30 @@ export async function main(argv: string[]): Promise<number> {
    * rather than a message.
    *
    * -h/--help after a command prints that command's usage; anything else starting with
-   * "-" is refused with the usage, because no command in this CLI takes a flag.
+   * "-" is refused with the usage, because only deploy, build and
+   * migrate:generate take flags.
    */
   const firstArg = rest[0];
   if (firstArg === "-h" || firstArg === "--help") {
     return cmdUsage();
   }
-  // Deploy is the one command that takes flags (--platform, --dry-run,
-  // --yes, --registry), so it parses its own arguments instead of being
-  // refused here. Build is the same (--standalone, --entry, --out,
-  // --target, --asset, --minify). Every other command still takes no
-  // flags, by design.
-  if (command !== "deploy" && command !== "build" && firstArg !== undefined && firstArg.startsWith("-")) {
+  // Deploy takes flags (--platform, --dry-run, --yes, --registry), build
+  // takes flags (--standalone, --entry, --out, --target, --asset,
+  // --minify) and migrate:generate takes flags (--schema, --name,
+  // --allow-destructive, --dry-run), so those three parse their own
+  // arguments instead of being refused here. Every other command still
+  // takes no flags, by design. A refused option exits non-zero: usage
+  // on stdout with exit 0 used to hide the mistake from scripts and CI.
+  if (
+    command !== "deploy" &&
+    command !== "build" &&
+    command !== "migrate:generate" &&
+    firstArg !== undefined &&
+    firstArg.startsWith("-")
+  ) {
     fail(`Unknown option "${firstArg}".`);
-    return cmdUsage();
+    cmdUsage();
+    return 1;
   }
 
   switch (command) {
@@ -2394,7 +2480,7 @@ export async function main(argv: string[]): Promise<number> {
       // `bunx` is not on PATH in every Bun install (this VM's Bun ships
       // without it), which made `yatta check` fail before running anything.
       // `bun x` is the same mechanism and always exists alongside `bun`.
-      return run("bun", ["x", "tsc", "--noEmit"]) || run("bun", ["test"]);
+      return cmdCheck();
     case "info":
       return cmdInfo();
     case "doctor":

@@ -74,6 +74,21 @@ import fs from "node:fs";
 // ──────────────────────────────────────────────────────────────────────────
 
 /**
+ * Whether an error is SQLite lock contention (SQLITE_BUSY / "database is
+ * locked") — the error several processes opening the same file at once
+ * hit. Anything else must fail at once; retrying it would only hide it.
+ */
+function isSqliteBusy(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return (
+    code === "SQLITE_BUSY" ||
+    /database is locked|database table is locked/i.test(
+      String((err as Error | null)?.message ?? err),
+    )
+  );
+}
+
+/**
  * Standard error class thrown by Yatta Job Queue, Scheduler, and Event Bus.
  */
 /*
@@ -972,15 +987,58 @@ export class SQLiteJobStore implements JobStore {
       this.path = (this.db as any).filename || "database";
     }
 
-    this.db.run("PRAGMA journal_mode = WAL;");
+    // busy_timeout FIRST, on its own: the WAL switch needs a write lock
+    // and fails at once without a timeout in place. The switch can still
+    // lose the race when four cluster workers open a fresh database at
+    // once, so it retries with a short escalating backoff — the same
+    // shape as cache_queue's openWithRetry. Without the retry the
+    // losers' constructors threw "database is locked" and the workers
+    // died at first boot.
     this.db.run("PRAGMA busy_timeout = 5000;");
-    this.db.run("PRAGMA synchronous = NORMAL;");
+    this.applyPragmasWithRetry(8);
+  }
+
+  private applyPragmasWithRetry(attempts: number): void {
+    try {
+      this.db.run("PRAGMA journal_mode = WAL;");
+      this.db.run("PRAGMA synchronous = NORMAL;");
+    } catch (err) {
+      if (!isSqliteBusy(err) || attempts <= 1) throw err;
+      const delay = 20 * (9 - attempts);
+      const until = Date.now() + delay;
+      while (Date.now() < until) {
+        /* wait for the competing connection to finish */
+      }
+      this.applyPragmasWithRetry(attempts - 1);
+    }
   }
 
   /**
    * Creates the `_yatta_jobs` table and performance indexes.
+   *
+   * Retries on lock contention: first boot in cluster mode runs this in
+   * every worker at once, and the DDL is idempotent (CREATE TABLE/INDEX
+   * IF NOT EXISTS), so a retry is safe. A failed init used to be
+   * swallowed by the caller's `.catch(console.error)` while the jobs
+   * table stayed uncreated.
    */
   async init(): Promise<void> {
+    await this.initWithRetry(8);
+  }
+
+  private async initWithRetry(attempts: number): Promise<void> {
+    try {
+      this.initOnce();
+    } catch (err) {
+      if (!isSqliteBusy(err) || attempts <= 1) throw err;
+      await new Promise((resolve) =>
+        setTimeout(resolve, 20 * (9 - attempts)),
+      );
+      await this.initWithRetry(attempts - 1);
+    }
+  }
+
+  private initOnce(): void {
     this.db.run(`
       CREATE TABLE IF NOT EXISTS "_yatta_jobs" (
         id TEXT PRIMARY KEY,
