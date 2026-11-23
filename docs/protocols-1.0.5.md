@@ -16,6 +16,14 @@ curl -X PROPFIND -H "Depth: 1" http://localhost:4000/dav/
 Methods: OPTIONS, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY,
 LOCK, UNLOCK, PROPFIND (Depth 0 and 1).
 
+Active content downloads instead of displaying. GET serves images
+(PNG, JPEG, GIF, WebP, AVIF, BMP), audio, video, plain text, and JSON
+inline; everything else — HTML, SVG, JavaScript, XML — comes back with
+`Content-Disposition: attachment` and downloads. WebDAV takes no login,
+so anyone can PUT a file, and serving active content inline would run it
+on the app origin. Responses also carry `nosniff` and a sandboxed
+`Content-Security-Policy`.
+
 ## gRPC-Web — browser calls with protobuf
 
 Single-request, single-reply calls on

@@ -485,6 +485,32 @@ docker run -p 4000:4000 \
   yatta
 ```
 
+One command sets a project up for a platform instead:
+
+```bash
+yatta deploy [--platform docker|railway|northflank|render] [--registry ghcr|dockerhub] [--dry-run] [--yes]
+```
+
+It shows a plan first — exactly which files it will write, plus
+`.yatta/deploy.json` — and writes them only after you confirm (or with
+`--yes`). It never overwrites a file that already exists with different
+content (a conflict refuses the whole run), never pushes (you push; CI or
+the platform deploys from that push), and never writes secrets, only
+references them. `--dry-run` prints the plan and exits.
+
+What each platform gets: Docker writes a `Dockerfile`, `.dockerignore`,
+and a GitHub workflow; Railway writes `.railway/railway.ts` (not the
+deprecated `railway.json` / `railway.toml`) and a workflow; Render writes
+a `render.yaml` Blueprint — link it in the Render dashboard (New →
+Blueprint), committing it alone deploys nothing; Northflank writes a
+GitHub workflow that builds to GHCR and deploys with
+`northflank/deploy-to-northflank@v1` (needs `NORTHFLANK_PROJECT_ID` and
+`NORTHFLANK_SERVICE_ID` secrets).
+
+`yatta deploy providers` lists the four platforms, `yatta deploy config`
+shows the saved configuration, `yatta deploy status` shows the current
+state, and `yatta deploy doctor` checks the setup. Fly is not supported.
+
 The image runs non-root and ships a `HEALTHCHECK` wired to `/healthz`. Mount
 `Database/` and `storage/uploads` as volumes to persist data.
 
