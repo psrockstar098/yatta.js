@@ -305,3 +305,48 @@ describe("MemoryAuthStore is not a silent production default", () => {
   });
 });
 
+describe("OAuth callback revokes a pre-registered password (pre-hijacking)", () => {
+  it("clears the attacker's password hash and kills their sessions", async () => {
+    const { auth, callback } = build();
+
+    // The attacker registers the victim's address first, with a password only
+    // they know. The account is unverified, and with allowUnverifiedSession the
+    // sign-in below still mints them a live session.
+    const attacker = (await auth.signUp({
+      email: "oauth-user@t.dev",
+      password: "AttackerPassword123!",
+    })) as AuthResult;
+    const userId = attacker.user.id;
+
+    await auth.signIn({ email: "oauth-user@t.dev", password: "AttackerPassword123!" });
+    const attackerSessions = await auth.store.listSessionsByUserId(userId);
+    expect(attackerSessions.length).toBeGreaterThan(0);
+    const attackerIds = new Set(attackerSessions.map((s) => s.id));
+
+    // The victim then signs in with the provider, which verifies the address.
+    // The fixture returns emailVerified: true for oauth-user@t.dev.
+    const state = await realState(auth);
+    const result = await callback(state);
+    expect(result).toBeDefined();
+
+    const user = await auth.store.findUserByEmail("oauth-user@t.dev");
+    // The password is gone — null, the column's "no password" value. The old
+    // code passed `undefined` here, which the SQLite store drops from UPDATEs,
+    // so the attacker's hash survived while the address was marked verified.
+    expect(user!.passwordHash).toBeNull();
+    expect(user!.emailVerified).toBe(true);
+    expect(user!.credentialVersion).toBe(2);
+
+    // The attacker's sessions died with the password. The one session left is
+    // the victim's fresh OAuth sign-in, minted after the revocation.
+    const after = await auth.store.listSessionsByUserId(userId);
+    expect(after.filter((s) => attackerIds.has(s.id))).toEqual([]);
+    expect(after.length).toBe(1);
+
+    // And the password itself no longer works.
+    await expect(
+      auth.signIn({ email: "oauth-user@t.dev", password: "AttackerPassword123!" }),
+    ).rejects.toThrow();
+  });
+});
+

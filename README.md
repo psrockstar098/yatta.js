@@ -247,6 +247,16 @@ const incident = observer.analyzeIncident(fingerprint);
 
 The dashboard lives at `/_yatta` and answers `/_yatta/api/*`.
 
+### Access
+
+The dashboard is gated by `YATTA_OBSERVE_TOKEN` — a header
+(`x-yatta-observe-token`) for probes, or a `?token=` query parameter for a
+browser you cannot add headers to. The gate is open only in development; in
+every other environment without a token the surface answers 404 with a generic
+body that names nothing. A token sent over the query string is warned about in
+the logs only after it has verified, so a scanner probing `?token=anything`
+cannot flood them.
+
 ### It tells you what it does not know
 
 An analysis that reports a confident answer when it is guessing is worse than no
@@ -421,6 +431,11 @@ with a 5s busy timeout and `synchronous = NORMAL`, so concurrent processes share
 one file safely. For multi-*node* deployments, point `storage` at the S3 driver —
 local disk does not sync across machines.
 
+Single-node servers do not share their port: `reusePort` is on only for cluster
+workers, so a second process on the same port fails with `EADDRINUSE` instead of
+silently sharing it. An empty `CLUSTER_WORKER_ID` counts as unset — single node,
+not worker #.
+
 ## Reliability guarantees
 
 ## Verifying a change
@@ -469,7 +484,10 @@ Two smaller rules that follow from the same episode:
 - **Graceful shutdown.** `SIGINT`/`SIGTERM` stops accepting connections, drains
   in-flight work, then terminates threads and stops the observer. The drain
   budget is 30s — deliberately longer than the default task deadline, so a
-  legitimately long task is not reported as a failed drain.
+  legitimately long task is not reported as a failed drain. A fatal fault
+  (`uncaughtException`/`unhandledRejection`) skips the 5s pre-stop wait and
+  exits 1 instead of 0, so an orchestrator reads the crash as a crash; a second
+  signal during shutdown exits immediately.
 
 > Note: JavaScript cannot preempt a blocking loop inside a worker. A deadline
 > frees the host-side promise and scheduler bookkeeping, but the wedged thread

@@ -150,6 +150,7 @@ import api from "./backend/routes";
 import { realtime, sseResponse } from "./func/realtime";
 import { observer } from "./func/observe";
 import { rememberPeerAddress } from "./func/peer";
+import crypto from "node:crypto";
 
 const port = Number(process.env.PORT) || 4000;
 
@@ -205,7 +206,9 @@ const instrumented = observer.instrument(
 
 const server = Bun.serve({
   port,
-  reusePort: true,
+  // Single-node scaffold: no cluster mode here, so a second process on the same
+  // port must fail with EADDRINUSE instead of silently sharing it.
+  reusePort: false,
 
   fetch(req, srv) {
     serverRef = srv;
@@ -219,7 +222,7 @@ const server = Bun.serve({
 
   websocket: realtime.websocket,
 
-  development: process.env.NODE_ENV !== "production",
+  development: process.env.NODE_ENV === "development",
 
   error(err) {
     console.error("[server:error]", err);
@@ -233,6 +236,21 @@ const server = Bun.serve({
  * Kept out of fetch() so instrumentation covers the observer's own routes and
  * the runtime's liveness endpoints consistently.
  */
+
+// The observe token, hashed once at startup. Compared in constant time below;
+// hashing the supplied value to a fixed 32-byte digest avoids leaking the
+// expected token's length.
+const observeToken = process.env.YATTA_OBSERVE_TOKEN;
+const observeTokenHash = observeToken
+  ? crypto.createHash("sha256").update(observeToken).digest()
+  : null;
+
+function observeTokenMatches(supplied: string): boolean {
+  if (!observeTokenHash) return false;
+  const suppliedHash = crypto.createHash("sha256").update(supplied).digest();
+  return crypto.timingSafeEqual(suppliedHash, observeTokenHash);
+}
+
 async function dispatch(req: Request, srv: unknown): Promise<Response> {
   const url = new URL(req.url);
 
@@ -245,7 +263,34 @@ async function dispatch(req: Request, srv: unknown): Promise<Response> {
 
   // The observer owns everything under /_yatta/ — health, telemetry, the issue
   // queue and the dashboard — so those endpoints work without registering a route.
+  // Gated, exactly like the framework's own entrypoint: the dashboard HTML 404s
+  // in production, but the /api/* routes behind it answer to anyone unless the
+  // gate closes them too — including POSTs that purge jobs and clear caches.
+  // Open only in development; everywhere else a token is required, and the 404
+  // body stays generic so it names nothing.
   if (observer.router.matches(url.pathname)) {
+    if (process.env.NODE_ENV !== "development" && !observeToken) {
+      return Response.json({ error: "Not found" }, { status: 404 });
+    }
+
+    if (observeTokenHash) {
+      const headerToken = req.headers.get("x-yatta-observe-token");
+      const queryToken = url.searchParams.get("token");
+      const supplied = headerToken ?? queryToken;
+
+      if (!supplied || !observeTokenMatches(supplied)) {
+        return Response.json({ error: "Not authorised" }, { status: 401 });
+      }
+
+      if (queryToken && !headerToken) {
+        console.warn(
+          "[observe] WARNING: Observe token supplied via URL query parameter. " +
+            "This exposes the token in server logs, proxies, and browser history. " +
+            "Use the x-yatta-observe-token header instead.",
+        );
+      }
+    }
+
     return (await observer.router.handle(req)) ??
       Response.json({ error: "Not found" }, { status: 404 });
   }

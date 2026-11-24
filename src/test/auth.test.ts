@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from "bun:test";
+import crypto from "node:crypto";
 import {
   createAuth,
   AuthCrypto,
@@ -181,6 +182,24 @@ describe("Yatta Auth — Enterprise Security & Authentication Engine", () => {
 
       const isInvalid = await cryptoUtil.verifyPassword("IncorrectPassword", hash);
       expect(isInvalid).toBe(false);
+    });
+
+    it("verifies scrypt hashes minted by the non-Bun fallback, under Bun", async () => {
+      // hashPassword falls back to `scrypt:` when Bun.password is unavailable
+      // (Node deploy, migration, cross-runtime data). verifyPassword used to
+      // return inside the Bun branch before ever reaching the scrypt branch,
+      // so those accounts were silently locked out with no error.
+      const password = "hunter2-hunter2";
+      const salt = crypto.randomBytes(16).toString("hex");
+      const derived = crypto.scryptSync(password, salt, 64);
+      const scryptHash = `scrypt:${salt}:${derived.toString("hex")}`;
+
+      expect(await cryptoUtil.verifyPassword(password, scryptHash)).toBe(true);
+      expect(await cryptoUtil.verifyPassword("wrong-password", scryptHash)).toBe(false);
+
+      // And the argon2id path still works after the reorder.
+      const argonHash = await cryptoUtil.hashPassword(password);
+      expect(await cryptoUtil.verifyPassword(password, argonHash)).toBe(true);
     });
 
     it("should perform AES-256-GCM encryption and decryption round-trip", () => {

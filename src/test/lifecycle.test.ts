@@ -61,14 +61,18 @@ describe("The observe gate", () => {
   function gate(options: {
     supplied: string | null;
     token: string | undefined;
-    production: boolean;
+    nodeEnv: string;
   }): { status: number; body: unknown } {
-    const { supplied, token, production } = options;
+    const { supplied, token, nodeEnv } = options;
 
-    if (production && !token) {
+    // Fail closed everywhere except development. Test is not production, but it
+    // is not a developer's laptop either, and an open dashboard in a staging or
+    // CI run is the same disclosure. The body stays generic: naming the env var
+    // tells a scanner exactly what to set.
+    if (nodeEnv !== "development" && !token) {
       return {
         status: 404,
-        body: { error: "Observability is disabled. Set YATTA_OBSERVE_TOKEN to enable it." },
+        body: { error: "Not found" },
       };
     }
 
@@ -90,31 +94,41 @@ describe("The observe gate", () => {
 
   it("refuses everything in production when no token is set", () => {
     // 404 rather than 401: an unauthenticated caller should not learn the surface
-    // exists.
-    const result = gate({ supplied: "anything", token: undefined, production: true });
+    // exists. And a generic body: the old message named the env var to set.
+    const result = gate({ supplied: "anything", token: undefined, nodeEnv: "production" });
     expect(result.status).toBe(404);
+    expect(result.body).toEqual({ error: "Not found" });
+  });
+
+  it("refuses everything in test when no token is set", () => {
+    // Test used to fail open like development: NODE_ENV=test is not production,
+    // so the old production-only check left the dashboard unauthenticated in
+    // every staging and CI run.
+    const result = gate({ supplied: "anything", token: undefined, nodeEnv: "test" });
+    expect(result.status).toBe(404);
+    expect(result.body).toEqual({ error: "Not found" });
   });
 
   it("refuses a wrong token", () => {
-    expect(gate({ supplied: "wrong", token: "right", production: true }).status).toBe(401);
-    expect(gate({ supplied: null, token: "right", production: true }).status).toBe(401);
-    expect(gate({ supplied: "", token: "right", production: true }).status).toBe(401);
+    expect(gate({ supplied: "wrong", token: "right", nodeEnv: "production" }).status).toBe(401);
+    expect(gate({ supplied: null, token: "right", nodeEnv: "production" }).status).toBe(401);
+    expect(gate({ supplied: "", token: "right", nodeEnv: "production" }).status).toBe(401);
   });
 
   it("accepts the right token", () => {
-    expect(gate({ supplied: "right", token: "right", production: true }).status).toBe(200);
+    expect(gate({ supplied: "right", token: "right", nodeEnv: "production" }).status).toBe(200);
   });
 
   it("is open in development, so the first run is not broken", () => {
     // A token nobody has set yet would make the dashboard look like a failed install.
-    expect(gate({ supplied: null, token: undefined, production: false }).status).toBe(200);
+    expect(gate({ supplied: null, token: undefined, nodeEnv: "development" }).status).toBe(200);
   });
 
   it("still enforces the token outside production when one is set", () => {
     // Setting a token is a statement of intent; it must not be honoured only in
     // production, or a staging deploy with the variable set exposes everything.
-    expect(gate({ supplied: "wrong", token: "right", production: false }).status).toBe(401);
-    expect(gate({ supplied: "right", token: "right", production: false }).status).toBe(200);
+    expect(gate({ supplied: "wrong", token: "right", nodeEnv: "test" }).status).toBe(401);
+    expect(gate({ supplied: "right", token: "right", nodeEnv: "test" }).status).toBe(200);
   });
 
   it("compares without an early exit", () => {

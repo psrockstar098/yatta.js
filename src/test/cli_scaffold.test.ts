@@ -263,3 +263,33 @@ describe("The scaffolded auth routes handle a second factor", () => {
     expect(route).toContain("function isMfaChallenge(");
   });
 });
+
+describe("The scaffolded server gates the observe surface", () => {
+  it("fails the /_yatta routes closed outside development without a token", () => {
+    // The template used to hand observer.router.handle() every /_yatta request
+    // with no gate: the dashboard HTML 404d in production, but /api/* — telemetry,
+    // traces, errors, logs, and POSTs that purge jobs and clear caches — answered
+    // anyone. The framework's own entrypoint gates them; the scaffold must too.
+    // The templates are string literals, so tsc never sees them; this pins the
+    // gate's presence the way the import tests pin the file set. The gate logic
+    // itself is black-box tested against src/main.ts in main_entrypoint.test.ts.
+    expect(TEMPLATE_MAIN).toContain("observeTokenMatches");
+    expect(TEMPLATE_MAIN).toContain(
+      'process.env.NODE_ENV !== "development" && !observeToken',
+    );
+    expect(TEMPLATE_MAIN).toContain('req.headers.get("x-yatta-observe-token")');
+    expect(TEMPLATE_MAIN).toContain('url.searchParams.get("token")');
+    expect(TEMPLATE_MAIN).toContain('import crypto from "node:crypto"');
+  });
+
+  it("does not share its port or run Bun dev mode outside development", () => {
+    // Same two entrypoint bugs, mirrored in the template: reusePort let a second
+    // process silently share the port, and dev mode was on for every NODE_ENV
+    // except production. The scaffold is single-node, so the port is not shared.
+    expect(TEMPLATE_MAIN).not.toContain("reusePort: true");
+    expect(TEMPLATE_MAIN).toContain("reusePort: false");
+    expect(TEMPLATE_MAIN).toContain(
+      'development: process.env.NODE_ENV === "development"',
+    );
+  });
+});

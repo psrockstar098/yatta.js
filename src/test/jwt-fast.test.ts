@@ -449,7 +449,18 @@ describe("jwt-fast: signature malleability", () => {
     const parts = token.split(".");
     const sig = parts[2]!;
     const flipFirst = (sig[0] === "A" ? "B" : "A") + sig.slice(1);
-    const flipLast = sig.slice(0, -1) + (sig.at(-1) === "A" ? "B" : "A");
+    // The last base64url char of a 32-byte signature carries only 2
+    // meaningful bits — its low 2 bits are padding. Swapping "A" for
+    // "B" (values 0 and 1) therefore decodes to identical bytes
+    // whenever the minted signature happens to end in A–D (~6% of
+    // mints), and the token still verifies — a flaky test, not a
+    // verifier bug (byte comparison is the documented contract; see
+    // the non-canonical-spelling test below). Flip the top bit
+    // instead, so the decoded byte always changes.
+    const B64URL =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const lastIdx = B64URL.indexOf(sig.at(-1)!);
+    const flipLast = sig.slice(0, -1) + B64URL[(lastIdx + 32) % 64]!;
     expect(jwt.verifyToken(`${parts[0]}.${parts[1]}.${flipFirst}`)).toEqual({
       ok: false,
       error: "invalid or expired token",

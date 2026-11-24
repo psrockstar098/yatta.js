@@ -382,6 +382,27 @@ describe("Yatta Jobs, Scheduler & Events", () => {
       const isMonday = nextDate.getUTCDay() === 1;
       expect(isFirst || isMonday).toBe(true);
     });
+
+    it("does not skip a day when the day does not match", () => {
+      // The day-mismatch branch used to skip 48h — to the next midnight, then
+      // 24h on — so a weekly Monday job from a Sunday landed a week late and a
+      // monthly 15th job skipped two months. A mismatch skips to the next
+      // midnight only; the loop re-checks the day there.
+      const monday = new CronExpression("0 9 * * 1");
+      expect(monday.getNextDate(new Date("2026-11-22T10:00:00Z")).toISOString()).toBe(
+        "2026-11-23T09:00:00.000Z",
+      );
+
+      const saturday = new CronExpression("0 9 * * 6");
+      expect(saturday.getNextDate(new Date("2026-11-20T10:00:00Z")).toISOString()).toBe(
+        "2026-11-21T09:00:00.000Z",
+      );
+
+      const fifteenth = new CronExpression("0 9 15 * *");
+      expect(fifteenth.getNextDate(new Date("2026-11-14T10:00:00Z")).toISOString()).toBe(
+        "2026-11-15T09:00:00.000Z",
+      );
+    });
   });
 
   // ──────────────────────────────────────────────────────────────────────────

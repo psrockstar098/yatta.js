@@ -49,7 +49,7 @@ export function cmdDoctor(projectRoot: string = process.cwd()): number {
   const dbPath =
     process.env.DATABASE_URL ||
     process.env.DATABASE_PATH ||
-    join(projectRoot, "Database", "yatta.db");
+    join(projectRoot, "Database", "app.db");
   if (existsSync(dbPath)) {
     try {
       const stat = statSync(dbPath);

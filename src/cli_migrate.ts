@@ -34,7 +34,7 @@ function dbPath(projectRoot: string): string {
   // `DATABASE_URL` first, because that is what the server reads. `DATABASE_PATH` is
   // accepted as an alias so a project cannot configure its tools and its server against
   // two different databases.
-  return process.env.DATABASE_URL || process.env.DATABASE_PATH || join(projectRoot, "Database", "yatta.db");
+  return process.env.DATABASE_URL || process.env.DATABASE_PATH || join(projectRoot, "Database", "app.db");
 }
 
 export async function cmdMigrate(projectRoot: string = process.cwd()): Promise<number> {

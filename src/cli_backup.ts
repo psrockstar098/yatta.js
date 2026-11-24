@@ -39,7 +39,7 @@ function dbPath(projectRoot: string): string {
   return (
     process.env.DATABASE_URL ||
     process.env.DATABASE_PATH ||
-    join(projectRoot, "Database", "yatta.db")
+    join(projectRoot, "Database", "app.db")
   );
 }
 

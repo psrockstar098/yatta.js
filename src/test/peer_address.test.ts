@@ -141,7 +141,10 @@ describe("The framework's own server captures the address", () => {
   const auth = readFileSync(join(import.meta.dir, "..", "func", "auth.ts"), "utf8");
 
   it("records it at the edge, where the server exists", () => {
-    expect(main).toContain("rememberPeerAddress(req, server.requestIP(req)?.address)");
+    // The fetch handler's server parameter is named `srv` (the outer
+    // `server` binding is the live server handle); the call itself sits
+    // after the /healthz and /readyz branches, so probes never record.
+    expect(main).toContain("rememberPeerAddress(req, srv.requestIP(req)?.address)");
   });
 
   it("reads it in the auth config, so rate limits are per client", () => {

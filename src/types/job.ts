@@ -802,8 +802,8 @@ export class CronExpression {
           : domMatch && dowMatch;
 
       if (!dayMatches) {
-        // A whole zoned day: to the next midnight, then 24h on.
-        const skip = (48 - parts.hour) * 60 - parts.minute;
+        // A whole zoned day: to the next midnight.
+        const skip = (24 - parts.hour) * 60 - parts.minute;
         next.setTime(next.getTime() + skip * MINUTE);
         continue;
       }

@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 /*
  * The entrypoint, as a process.
  *
- * `src/main.ts` is 416 lines of top-level script: importing it boots a server, mounts
+ * `src/main.ts` is ~500 lines of top-level script: importing it boots a server, mounts
  * subsystems, opens sockets and installs signal handlers. That is why it had no unit
  * test — and it is the file every project inherits, so a regression there surfaces as a
  * boot failure in someone else's application rather than a red test here.
@@ -188,6 +188,82 @@ describe("The entrypoint boots", () => {
     expect(res.status).toBe(404);
     expect(server.output()).toContain("Mounted 8 subsystems");
   }, BOOT_TIMEOUT_MS);
+
+  it("keeps the observe surface closed under NODE_ENV=test without a token", async () => {
+    // The gate used to check production only, so test (and staging, and every CI
+    // run) served the dashboard unauthenticated. Test is not a developer's laptop.
+    freshDir();
+    const server = await start({ NODE_ENV: "test" });
+
+    const res = await fetch(`${server.url}/_yatta/api/telemetry`);
+    expect(res.status).toBe(404);
+
+    // And the 404 body must not name the env var that opens the gate.
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("Not found");
+    expect(body.error).not.toContain("YATTA_OBSERVE_TOKEN");
+  }, BOOT_TIMEOUT_MS);
+
+  it("does not warn about a query token before verifying it", async () => {
+    // The warning used to log before the token was checked, so any scanner
+    // probing ?token=anything flooded the logs. A bad token must be a silent 401.
+    freshDir();
+    const server = await start({ YATTA_OBSERVE_TOKEN: "entrypoint-observe-token" });
+
+    const bad = await fetch(`${server.url}/_yatta/api/telemetry?token=wrong`);
+    expect(bad.status).toBe(401);
+    expect(server.output()).not.toContain("[observe] WARNING");
+
+    // The gate itself still works: the right token over the header gets in.
+    const good = await fetch(`${server.url}/_yatta/api/telemetry`, {
+      headers: { "x-yatta-observe-token": "entrypoint-observe-token" },
+    });
+    expect(good.status).toBe(200);
+  }, BOOT_TIMEOUT_MS);
+
+  it("treats an empty CLUSTER_WORKER_ID as a single node, not a cluster worker", async () => {
+    // CLUSTER_WORKER_ID="" used to count as cluster mode (presence check), so the
+    // process logged "[Cluster Worker #]" with an empty id and ran one worker per
+    // core behind SO_REUSEPORT. An empty value means unset.
+    freshDir();
+    const server = await start({ CLUSTER_WORKER_ID: "" });
+
+    expect(server.output()).toContain("Yatta server running at");
+    expect(server.output()).not.toContain("Cluster Worker #");
+  }, BOOT_TIMEOUT_MS);
+
+  it("refuses a second single-node process on the same port", async () => {
+    // reusePort used to be unconditional, so a second process silently shared the
+    // port on Linux via SO_REUSEPORT instead of failing loudly. Only cluster
+    // workers share a port now.
+    freshDir();
+    const port = String(43000 + Math.floor(Math.random() * 5000));
+    const first = await start({ PORT: port });
+
+    let text = "";
+    const second = spawn(process.execPath, [ENTRYPOINT], { env: env({ PORT: port }) });
+    second.stdout?.on("data", (c: Buffer) => void (text += c.toString()));
+    second.stderr?.on("data", (c: Buffer) => void (text += c.toString()));
+
+    try {
+      const code = await new Promise<number | null>((resolveExit) => {
+        const timer = setTimeout(() => resolveExit(null), 30_000);
+        second.once("exit", (c) => {
+          clearTimeout(timer);
+          resolveExit(c);
+        });
+      });
+
+      expect(code).not.toBe(0);
+      expect(code).not.toBeNull();
+      expect(text).toMatch(/EADDRINUSE|address (already )?in use/i);
+    } finally {
+      if (second.exitCode === null) second.kill("SIGKILL");
+    }
+
+    // The first server is untouched by the failed bind.
+    expect((await fetch(`${first.url}/healthz`)).status).toBe(200);
+  }, BOOT_TIMEOUT_MS);
 });
 
 describe("The entrypoint refuses to start on bad configuration", () => {
@@ -222,6 +298,43 @@ describe("The entrypoint shuts down", () => {
     // difference between a deploy that drops in-flight requests and one that does not.
     expect(output).toContain("[shutdown] Complete.");
     expect(code).toBe(0);
+  }, BOOT_TIMEOUT_MS);
+
+  it("exits 1 quickly on a fatal fault, with no pre-stop wait", async () => {
+    // A fatal fault used to drain like a graceful signal and exit 0, so an
+    // orchestrator read the crash as a clean stop and a 5s pre-stop wait served
+    // traffic from a broken process. The driver boots the real entrypoint and
+    // then throws; the entrypoint's own uncaughtException handler shuts it down.
+    freshDir();
+    const started = Date.now();
+
+    let text = "";
+    const child = spawn(process.execPath, [resolve(import.meta.dir, "fatal-driver.ts")], {
+      env: env(),
+    });
+    child.stdout?.on("data", (c: Buffer) => void (text += c.toString()));
+    child.stderr?.on("data", (c: Buffer) => void (text += c.toString()));
+
+    try {
+      const code = await new Promise<number | null>((resolveExit) => {
+        const timer = setTimeout(() => resolveExit(null), 30_000);
+        child.once("exit", (c) => {
+          clearTimeout(timer);
+          resolveExit(c);
+        });
+      });
+
+      const elapsed = Date.now() - started;
+
+      expect(code).toBe(1);
+      expect(text).toContain("Fatal fault");
+      expect(text).toContain("[shutdown] Complete.");
+      // No 5s pre-stop sleep on this path: a graceful SIGTERM takes ~6s or more,
+      // a fatal fault should be done well inside 15s including boot.
+      expect(elapsed).toBeLessThan(15_000);
+    } finally {
+      if (child.exitCode === null) child.kill("SIGKILL");
+    }
   }, BOOT_TIMEOUT_MS);
 
   it("fails readiness before it stops accepting work", async () => {

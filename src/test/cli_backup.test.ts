@@ -31,10 +31,12 @@ afterEach(() => {
 /**
  * Where the CLI looks for the database.
  *
- * `Database/yatta.db` under the project root, overridable with DATABASE_PATH — the
- * layout the scaffold and Dockerfile both use.
+ * `Database/app.db` under the project root, overridable with DATABASE_PATH — the
+ * layout the scaffold and the server both use. The tools used to default to
+ * `Database/yatta.db`, a file the server never opens, so migrate/backup/restore
+ * operated on the wrong database.
  */
-const dbFile = () => join(dir, "Database", "yatta.db");
+const dbFile = () => join(dir, "Database", "app.db");
 
 /** A WAL database with rows written but deliberately left in the WAL. */
 function seed(rows: string[]): void {

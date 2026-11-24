@@ -219,7 +219,7 @@ describe("check and migrate:generate flags (F1, F2, F5)", () => {
     const dir = mkdtempSync(join(tmpdir(), "yatta-migrate-flag-"));
     try {
       mkdirSync(join(dir, "Database"));
-      writeFileSync(join(dir, "Database", "yatta.db"), "");
+      writeFileSync(join(dir, "Database", "app.db"), "");
       const { code, lines } = await inDir(dir, () =>
         runMainCaptured(["migrate:generate", "--schema", "nope.ts"]),
       );

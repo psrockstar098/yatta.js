@@ -13,7 +13,7 @@ import { diffSchemas, normalizeModelSchema, qIdent, renderMigrationFile, renderS
  * emit a real migration file, without ever silently destroying data.
  *
  * Each test gets its own project directory: a schema file the command can
- * import, and a Database/yatta.db seeded by hand (never by createDatabase,
+ * import, and a Database/app.db seeded by hand (never by createDatabase,
  * except for the no-diff test, where the point is that a synced database
  * reports clean). DATABASE_URL/DATABASE_PATH are cleared so the command
  * resolves the database from the project directory, not the environment.
@@ -30,7 +30,10 @@ function projectDir(): string {
 }
 
 function dbPath(dir: string): string {
-  return join(dir, "Database", "yatta.db");
+  // The default the CLI tools resolve to (Database/app.db); seeding a
+  // differently-named file would make `migrate:generate` report no live
+  // database and every diff test would fail.
+  return join(dir, "Database", "app.db");
 }
 
 function seed(dir: string, tables: Record<string, string[]>, rows: Record<string, Record<string, unknown>[]> = {}): void {

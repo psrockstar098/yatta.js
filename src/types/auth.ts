@@ -77,7 +77,7 @@ export interface PublicUser {
 }
 
 export interface AuthUser extends PublicUser {
-  passwordHash?: string;
+  passwordHash?: string | null;
   encryptedTwoFactorSecret?: string | null;
   twoFactorRecoveryCodes?: string[] | null;
   lastMfaStep?: number;
@@ -976,13 +976,10 @@ export class AuthCrypto {
   }
 
   async verifyPassword(password: string, hash: string): Promise<boolean> {
-    if (typeof Bun !== "undefined" && Bun.password?.verify) {
-      try {
-        return await Bun.password.verify(password, hash);
-      } catch {
-        return false;
-      }
-    }
+    // Dispatch on the hash format first. The scrypt branch used to sit below
+    // the Bun branch, which returns inside its try/catch — so a `scrypt:` hash
+    // minted by the non-Bun fallback (Node deploy, migration, cross-runtime
+    // data) could never verify under Bun: silent lockout, no error.
     if (hash.startsWith("scrypt:")) {
       const [, salt, key] = hash.split(":");
       return new Promise((resolve) => {
@@ -993,6 +990,13 @@ export class AuthCrypto {
           resolve(crypto.timingSafeEqual(keyBuffer, derivedKey));
         });
       });
+    }
+    if (typeof Bun !== "undefined" && Bun.password?.verify) {
+      try {
+        return await Bun.password.verify(password, hash);
+      } catch {
+        return false;
+      }
     }
     return false;
   }
@@ -3418,6 +3422,37 @@ export class AuthOAuth {
         user = await this.auth.store.findUserByEmail(
           profile.email.toLowerCase().trim(),
         );
+
+        /*
+         * The pre-hijacking shape, and the only place it is reachable: no
+         * identity, no session, a verified provider email matching a local
+         * account that was never verified. An attacker registers the victim's
+         * address first with a password they know; the victim later signs in
+         * with a provider that does verify it. Mark the address verified and
+         * revoke the password, or the attacker keeps a usable account under
+         * the victim's address. (The `if (!user)` branch below cannot see this
+         * case — the lookup above already resolved the user.)
+         *
+         * `null`, not `undefined`: the SQLite store drops `undefined` keys
+         * from UPDATEs, so `undefined` left the attacker's hash in place.
+         * The credential version is bumped and the attacker's live sessions
+         * are killed with the password, or a stolen session outlives the hash
+         * for up to 30 days. A verified local account keeps its password —
+         * its owner verified it themselves — and so does an account linked
+         * from a live session above.
+         */
+        if (user && !user.emailVerified && user.passwordHash) {
+          user = await this.auth.store.updateUser(user.id, {
+            emailVerified: true,
+            passwordHash: null,
+            credentialVersion: user.credentialVersion + 1,
+          });
+          await this.auth.store.deleteSessionsByUserId(user.id);
+        } else if (user && !user.emailVerified) {
+          user = await this.auth.store.updateUser(user.id, {
+            emailVerified: true,
+          });
+        }
       }
 
       if (!user) {
@@ -3447,13 +3482,21 @@ export class AuthOAuth {
            * the victim's address first, then signs in with a provider that
            * does verify it. Mark the address verified and revoke the password,
            * so the pre-registered credentials stop working.
+           *
+           * `null`, not `undefined`: the SQLite store drops `undefined` keys
+           * from UPDATEs, so `undefined` left the attacker's hash in place
+           * while marking the address verified. `null` is the column's "no
+           * password" value (OAuth-only accounts), and the password change
+           * convention applies too — bump the credential version and kill the
+           * attacker's live sessions, or a stolen session outlives the hash
+           * for up to 30 days.
            */
           user = await this.auth.store.updateUser(existing.id, {
             emailVerified: true,
-            // Revokes the pre-registered credentials: `undefined` is how this
-            // codebase represents "no password" (OAuth-only accounts).
-            passwordHash: undefined,
+            passwordHash: null,
+            credentialVersion: existing.credentialVersion + 1,
           });
+          await this.auth.store.deleteSessionsByUserId(existing.id);
         } else {
           user = await this.auth.store.createUser({
             id: crypto.randomUUID(),
