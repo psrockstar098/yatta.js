@@ -228,7 +228,11 @@ export class SqlCompiler {
         if (op.lte !== undefined) { clauses.push(`${safeKey} <= ${ph()}`); params.push(this.serializeValue(tableName, key, columns.get(key), op.lte)); }
 
         if (op.like !== undefined) {
-          clauses.push(`${safeKey} LIKE ${ph()}`);
+          // Goes through the dialect like contains/startsWith/endsWith do:
+          // SQLite's LIKE is ASCII case-insensitive, Postgres' LIKE is not,
+          // so Postgres needs ILIKE here to match. The hardcoded LIKE this
+          // replaced was a Postgres-parity bug, not a SQLite behaviour.
+          clauses.push(this.dialect.compileLikePredicate(safeKey, ph(), false));
           params.push(String(op.like));
         }
         if (op.contains !== undefined) {
@@ -311,20 +315,10 @@ export class SqlCompiler {
     void _next;
     const orderSql = this.compileOrderBy(tableName, columns, options.orderBy);
 
-    /*
-     * SQLite only accepts OFFSET as part of a `LIMIT … OFFSET …` clause, so a
-     * bare `OFFSET n` is a syntax error. `skip` on its own is a documented,
-     * reasonable thing to write, so it gets `LIMIT -1` — SQLite's "no upper
-     * bound" — rather than failing.
-     */
-    const hasSkip = options.skip !== undefined;
-    const limitSql =
-      options.take !== undefined
-        ? `LIMIT ${options.take}`
-        : hasSkip
-          ? "LIMIT -1"
-          : "";
-    const offsetSql = hasSkip ? `OFFSET ${options.skip}` : "";
+    // The LIMIT/OFFSET spelling is dialect-owned: SQLite uses LIMIT -1 for
+    // an unbounded read, Postgres uses LIMIT ALL (a negative LIMIT is a
+    // syntax error there). See SqlDialect.compileLimitOffset.
+    const limitOffsetSql = this.dialect.compileLimitOffset(options.take, options.skip);
 
     const selectedCols = options.select === undefined
       ? "*"
@@ -334,8 +328,7 @@ export class SqlCompiler {
       `SELECT ${selectedCols} FROM ${this.dialect.quoteIdent(tableName)}`,
       clause ? `WHERE ${clause}` : "",
       orderSql,
-      limitSql,
-      offsetSql,
+      limitOffsetSql,
     ]
       .filter(Boolean)
       .join(" ")

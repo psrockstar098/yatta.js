@@ -18,9 +18,12 @@
 import { YattaError } from "./errors";
 import type { DatabaseSchema, TableSchema } from "./schema";
 import type { OrderBy, WhereClause } from "./query";
+import type { SqlCompiler } from "./sql_compiler";
+import type { SqlDialect } from "./sql_dialect";
 import { SqliteAdapter, SqliteSession } from "./adapters/sqlite";
+import { PGliteAdapter, PGliteSession } from "./adapters/pglite";
 
-export { SqliteAdapter, SqliteSession };
+export { SqliteAdapter, SqliteSession, PGliteAdapter, PGliteSession };
 
 /** Relational drivers the ORM can target. ScyllaDB is deliberately absent: it is not relational. */
 export type RelationalDriverName = "sqlite" | "pglite" | "turso" | "duckdb" | "surrealdb";
@@ -31,6 +34,49 @@ export type ExecutionMode = "sync" | "async";
 
 /** A value in sync mode, a Promise of it in async mode. Sync callers never see a Promise. */
 export type ModeResult<M extends ExecutionMode, T> = M extends "sync" ? T : Promise<T>;
+
+/**
+ * Chains a value through a function that may itself return a mode result.
+ * Sync: calls `fn` directly — no Promise is ever created, so a sync call
+ * stays sync end to end. Async: `.then(fn)`, which flattens automatically
+ * (a `fn` returning a Promise is awaited, not wrapped).
+ */
+export function chainResult<M extends ExecutionMode, T, R>(
+  mode: M,
+  value: ModeResult<M, T>,
+  fn: (value: T) => R | ModeResult<M, R>,
+): ModeResult<M, R> {
+  if (mode === "sync") {
+    return fn(value as T) as ModeResult<M, R>;
+  }
+  return (value as Promise<T>).then(fn) as ModeResult<M, R>;
+}
+
+/** Lifts a plain value into the mode: the value itself in sync, a resolved Promise in async. */
+export function modeValue<M extends ExecutionMode, T>(mode: M, value: T): ModeResult<M, T> {
+  return (mode === "sync" ? value : Promise.resolve(value)) as ModeResult<M, T>;
+}
+
+/**
+ * Runs tasks strictly in order and discards their results. Sync: a plain
+ * loop. Async: a promise chain. A single-connection driver cannot run
+ * concurrent work on one transaction handle, so parallel helpers
+ * (Promise.all) are never used for per-row work inside a transaction —
+ * sequential here is the correctness rule, not a performance choice.
+ */
+export function runSequential<M extends ExecutionMode>(
+  mode: M,
+  tasks: Array<() => ModeResult<M, void>>,
+): ModeResult<M, void> {
+  if (mode === "sync") {
+    for (const task of tasks) task();
+    return undefined as ModeResult<M, void>;
+  }
+  return tasks.reduce<Promise<void>>(
+    (prev, task) => prev.then(task as () => Promise<void>),
+    Promise.resolve(),
+  ) as ModeResult<M, void>;
+}
 
 /** What a driver can and cannot do, declared honestly so the core can enforce it. */
 export interface AdapterCapabilities {
@@ -104,6 +150,40 @@ export interface IntrospectedColumn {
  */
 export interface DatabaseSession<M extends ExecutionMode = ExecutionMode> {
   readonly capabilities: AdapterCapabilities;
+
+  /**
+   * SQL dialect for this session. Owns every driver-specific SQL string:
+   * identifiers, placeholders, types, defaults, DDL, LIKE, and value
+   * conversion. Table reaches it (and the compiler below) through its db.
+   */
+  readonly dialect: SqlDialect;
+  /** Driver-neutral SQL compiler over this session's dialect. */
+  readonly compiler: SqlCompiler;
+  /** Whether this session is currently inside a transaction. */
+  readonly inTransaction: boolean;
+
+  /**
+   * Prepares (or retrieves from cache) and executes an SQL statement with
+   * parameters. The honest execution seam: Table compiles via the compiler
+   * and hands the strings here. `"get"` returns one row or null, `"all"`
+   * returns all rows, `"run"` returns the write result
+   * (`{ lastInsertRowid, changes }` — `lastInsertRowid` is 0 on drivers
+   * with no rowid, such as Postgres; use RETURNING to read an id back).
+   */
+  run(sql: string, params?: unknown[], mode?: "get" | "all" | "run"): ModeResult<M, unknown>;
+
+  /**
+   * Makes sure one table's full-text index exists and matches its
+   * searchable columns, creating or repairing it when it does not. A
+   * driver whose index maintains itself (a Postgres generated column)
+   * repairs the missing column/index instead; a driver with no index
+   * no-ops. Called by `search()` so a first search never fails on a
+   * missing index.
+   */
+  ensureSearchIndex(table: string, schema: TableSchema): ModeResult<M, void>;
+
+  /** Finalizes and purges cached prepared statements. A no-op when the driver keeps none. */
+  clearStatementCache(): void;
 
   insert(
     table: string,
@@ -192,6 +272,9 @@ export interface DatabaseAdapter<M extends ExecutionMode = ExecutionMode>
   extends DatabaseSession<M> {
   readonly driver: RelationalDriverName;
 
+  /** Resolved location of the database: file path, data directory, or `":memory:"`. */
+  readonly path: string;
+
   /** Eagerly wait for initialization (no-op on sync SQLite). */
   ready(): ModeResult<M, void>;
 
@@ -251,9 +334,7 @@ export function createAdapter(
     case "sqlite":
       return new SqliteAdapter((options ?? {}) as SqliteAdapterOptions);
     case "pglite":
-      throw new YattaError(
-        `Driver "pglite" is not available yet — PGlite support lands in Phase 2 of the multi-database build.`,
-      );
+      return new PGliteAdapter((options ?? {}) as PgliteAdapterOptions);
     default:
       throw new YattaError(`Driver "${driver}" is not implemented.`);
   }

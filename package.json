@@ -128,6 +128,7 @@
     "typescript": "^7"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.6.0",
     "@opentelemetry/api": "^1.9.1",
     "@simplewebauthn/server": "^14.0.2",
     "nodemailer": "^10.0.10",
