@@ -208,7 +208,10 @@ const policy = {
 Only `deleteRaw: true` deletes, and only the rows inside windows the
 tier just summarized — recent rows and rows in incomplete windows are
 never touched. Anything else, including omitting the flag, keeps every
-raw row. Deletion happens in the same transaction as the summary
+raw row. Only the coarsest tier (largest window) may set `deleteRaw`:
+a finer tier would delete rows a coarser tier still needs, so a policy
+with `deleteRaw` on a non-coarsest tier is rejected when it is
+normalized. Deletion happens in the same transaction as the summary
 insert, so a failed run deletes nothing. There is no undo: once raw
 rows are deleted, only their summaries remain.
 

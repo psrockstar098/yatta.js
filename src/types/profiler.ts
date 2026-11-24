@@ -268,7 +268,17 @@ export class SamplingProfiler {
   async profile<T>(
     fn: () => T | Promise<T>,
   ): Promise<{ result: T; profile: CpuProfile }> {
-    await this.start();
+    // start() returns false when a session is already running: a nested
+    // profile() used to ignore that, stop the outer session, and make
+    // the outer call throw "capture ended with no profile". Only stop
+    // a session this call started (the ownsProfile pattern
+    // ThresholdCapture already uses).
+    const ownsProfile = await this.start();
+    if (!ownsProfile) {
+      throw new ProfilerError(
+        "SamplingProfiler: a capture is already running on this profiler",
+      );
+    }
     try {
       const result = await fn();
       const profile = await this.stop();

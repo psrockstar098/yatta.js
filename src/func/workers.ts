@@ -12,6 +12,7 @@
 
 import { jobs } from "./jobs";
 import { mailer } from "./mail";
+import { auth } from "./auth";
 
 let registered = false;
 
@@ -36,7 +37,8 @@ export function registerWorkers(): void {
   });
 
   jobs.handle("cleanup-stale-tokens", async ({ log }) => {
-    log("Cleaning up expired verification tokens and sessions...");
+    const { tokens, sessions } = await auth.cleanupExpired();
+    log(`Cleaned up ${tokens} expired verification tokens and ${sessions} expired sessions.`);
   });
 
   defaultWorker();

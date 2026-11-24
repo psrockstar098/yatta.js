@@ -507,6 +507,17 @@ export class ReplicationApplier {
     return row !== null;
   }
 
+  /** Persists a checkpoint advance without applying an entry (see applyBatch). */
+  private advanceCheckpoint(source: string, file: string, seq: number): void {
+    ensureReplicationTables(this.store);
+    this.store.rawRun(
+      `INSERT INTO "${REPLICATION_CHECKPOINT_TABLE}" (source, file, checkpoint_seq, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(source, file) DO UPDATE SET checkpoint_seq = excluded.checkpoint_seq, updated_at = excluded.updated_at;`,
+      [source, file, seq, Date.now()],
+    );
+  }
+
   /** Replicated entries for one file, in seq order, for reads and inspection. */
   replicatedEntries(source: string, file: string, afterSeq = 0, limit = 100): OutboxEntry[] {
     ensureReplicationTables(this.store);
@@ -568,6 +579,15 @@ export class ReplicationApplier {
     let skipped = 0;
     for (const entry of entries) {
       if (entry.seq <= checkpoint || this.hasApplied(source, file, entry.eventId)) {
+        // An entry already applied at a different seq used to be skipped
+        // without advancing the checkpoint, so it was redelivered on
+        // every pull. It is applied — just not at this seq — so the
+        // checkpoint can safely advance past it: every entry below it
+        // in this batch was already applied or skipped in order above.
+        if (entry.seq > checkpoint && this.hasApplied(source, file, entry.eventId)) {
+          this.advanceCheckpoint(source, file, entry.seq);
+          checkpoint = entry.seq;
+        }
         skipped += 1;
         continue;
       }

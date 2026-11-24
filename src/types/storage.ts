@@ -598,7 +598,15 @@ export function parseSize(val?: HumanSize): number {
   // through to the 100MB default, so "0.5MB" became 100MB rather than 512KB —
   // a configured cap quietly 200x larger than asked for.
   const match = val.trim().match(/^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)$/i);
-  if (!match) return 100 * 1024 * 1024;
+  // An unparseable string is a config typo, not a missing value: silently
+  // defaulting it to 100MB used to turn "10XB" into a 100MB cap. parseDuration
+  // throws on invalid strings; parseSize does the same. `undefined` still
+  // means "no size given" and keeps the 100MB default above.
+  if (!match) {
+    throw new StorageError(
+      `Invalid size: expected a size like "10MB" or a number of bytes, got ${JSON.stringify(val)}.`,
+    );
+  }
 
   const count = parseFloat(match[1]!);
   const unit = match[2]!.toUpperCase();
@@ -808,14 +816,13 @@ export function verifyMagicBytes(
       buffer[3] === 0x46
     );
   }
-  // ZIP: 50 4B 03 04
+  // ZIP: 50 4B 03 04 (local file header), 50 4B 05 06 (empty archive /
+  // end of central directory) or 50 4B 07 08 (spanned archive). Only
+  // accepting the first rejected valid empty and spanned zips.
   if (declaredMime === "application/zip") {
-    return (
-      buffer[0] === 0x50 &&
-      buffer[1] === 0x4b &&
-      buffer[2] === 0x03 &&
-      buffer[3] === 0x04
-    );
+    if (buffer[0] !== 0x50 || buffer[1] !== 0x4b) return false;
+    const sig = (buffer[2]! << 8) | buffer[3]!;
+    return sig === 0x0304 || sig === 0x0506 || sig === 0x0708;
   }
   // MP4: [4 bytes length] 'ftyp'
   if (declaredMime === "video/mp4") {
@@ -914,6 +921,18 @@ function etagListMatches(list: string, etag?: string): boolean {
 
 function localEtag(size: number, mtimeMs: number): string {
   return `"${size.toString(16)}-${Math.floor(mtimeMs).toString(16)}"`;
+}
+
+/**
+ * Decodes a local-driver list cursor: the decimal offset of the next page
+ * into the sorted key order. Anything unparseable restarts from the
+ * beginning rather than failing a listing (a cursor minted by another
+ * driver is meaningless here).
+ */
+function parseListCursor(cursor: string | undefined): number {
+  if (!cursor) return 0;
+  const n = Number(cursor);
+  return Number.isInteger(n) && n > 0 ? n : 0;
 }
 
 async function unlinkQuiet(p: string): Promise<void> {
@@ -1530,7 +1549,17 @@ export class LocalStorageDriver implements IStorageDriver {
     }
 
     if (await Bun.file(`${srcPath}.meta.json`).exists()) {
-      await fs.copyFile(`${srcPath}.meta.json`, `${dstPath}.meta.json`);
+      // Stage the sidecar too: a direct copyFile that crashed mid-copy
+      // used to leave a truncated .meta.json behind, which readSidecar
+      // then swallowed as "no metadata".
+      const tmpMeta = `${dstPath}.meta.json.tmp.${crypto.randomUUID()}`;
+      try {
+        await fs.copyFile(`${srcPath}.meta.json`, tmpMeta);
+        await fs.rename(tmpMeta, `${dstPath}.meta.json`);
+      } catch (err) {
+        await fs.unlink(tmpMeta).catch(() => {});
+        throw err;
+      }
     } else {
       await unlinkQuiet(`${dstPath}.meta.json`); // don't inherit a stale sidecar
     }
@@ -1559,7 +1588,15 @@ export class LocalStorageDriver implements IStorageDriver {
     }
 
     if (await Bun.file(`${srcPath}.meta.json`).exists()) {
-      await fs.rename(`${srcPath}.meta.json`, `${dstPath}.meta.json`);
+      try {
+        await fs.rename(`${srcPath}.meta.json`, `${dstPath}.meta.json`);
+      } catch (err) {
+        // The data file already moved: a failed sidecar rename used to
+        // leave an orphan meta file at the source. Roll the data move
+        // back so the move reports failure with nothing moved.
+        await fs.rename(dstPath, srcPath).catch(() => {});
+        throw err;
+      }
     } else {
       await unlinkQuiet(`${dstPath}.meta.json`);
     }
@@ -1592,6 +1629,13 @@ export class LocalStorageDriver implements IStorageDriver {
     const rootStat = await statFile(scanRoot);
     if (rootStat && !rootStat.isDirectory()) return results;
 
+    // Keys are collected and sorted before paging, so `cursor` (a decimal
+    // offset into this order) pages stably: the old scan stopped after
+    // `limit` entries in glob order, so a caller paging past the cap
+    // re-read the same first window forever and files beyond it never
+    // aged out. Only the returned page is stat'ed.
+    const offset = parseListCursor(options?.cursor);
+    const keys: string[] = [];
     const glob = new Bun.Glob("**/*");
     try {
       // dot: true — Bun.Glob skips dotfiles by default, so `.htaccess` and
@@ -1608,27 +1652,30 @@ export class LocalStorageDriver implements IStorageDriver {
           continue;
         if (prefix && !cleanRel.startsWith(prefix)) continue;
 
-        const fullPath = path.join(this.baseDir, cleanRel);
-        const st = await statFile(fullPath);
-        if (!st) continue; // removed mid-scan, or not a regular file
-
-        const { contentType } = await readSidecar(fullPath);
-
-        results.push({
-          path: cleanRel,
-          size: st.size,
-          contentType: contentType ?? guessContentType(cleanRel),
-          lastModified: st.mtime,
-          etag: localEtag(st.size, st.mtimeMs),
-          url: this.publicUrl(cleanRel),
-        });
-
-        if (results.length >= limit) break;
+        keys.push(cleanRel);
       }
     } catch (err: any) {
       // Prefix directory doesn't exist yet, or a path component stopped
       // being a directory mid-scan — either way there is nothing to list.
       if (err?.code !== "ENOENT" && err?.code !== "ENOTDIR") throw err;
+    }
+
+    keys.sort();
+    for (const cleanRel of keys.slice(offset, offset + limit)) {
+      const fullPath = path.join(this.baseDir, cleanRel);
+      const st = await statFile(fullPath);
+      if (!st) continue; // removed mid-scan, or not a regular file
+
+      const { contentType } = await readSidecar(fullPath);
+
+      results.push({
+        path: cleanRel,
+        size: st.size,
+        contentType: contentType ?? guessContentType(cleanRel),
+        lastModified: st.mtime,
+        etag: localEtag(st.size, st.mtimeMs),
+        url: this.publicUrl(cleanRel),
+      });
     }
 
     return results;
@@ -2463,6 +2510,9 @@ export class FolderRef {
  * Primary storage disk instance managing file storage, validation, security, and streaming.
  */
 export class StorageDisk {
+  /** Per-key upload locks serializing precondition checks + writes (see upload()). */
+  private keyLocks = new Map<string, Promise<void>>();
+
   /**
    * @param driver Underlying storage driver implementation.
    * @param securityConfig Optional security and validation constraints.
@@ -2678,56 +2728,85 @@ export class StorageDisk {
     const needsLookup =
       ifExists !== "replace" || !!options?.ifMatch || !!options?.ifNoneMatch;
 
-    try {
-      if (needsLookup) {
-        const fileExists = await this.driver.exists(cleanKey);
+    // The precondition check and the write are one atomic section per key:
+    // without the lock, two concurrent PUTs with ifNoneMatch: "*" both
+    // passed the exists() check and the last writer won. This serializes
+    // same-key uploads in this process; different keys are unaffected, and
+    // cross-process races still need a driver that enforces the
+    // precondition itself (e.g. S3 conditional writes).
+    return this.withKeyLock(cleanKey, async () => {
+      try {
+        if (needsLookup) {
+          const fileExists = await this.driver.exists(cleanKey);
 
-        if (fileExists && options?.ifNoneMatch) {
-          const existingEtag =
-            options.ifNoneMatch === "*"
-              ? undefined
-              : (await this.driver.head(cleanKey)).etag;
-          if (
-            options.ifNoneMatch === "*" ||
-            etagListMatches(options.ifNoneMatch, existingEtag)
-          ) {
-            throw new PreconditionFailedError(
-              `File already exists: "${cleanKey}" (If-None-Match condition violated)`,
-            );
+          if (fileExists && options?.ifNoneMatch) {
+            const existingEtag =
+              options.ifNoneMatch === "*"
+                ? undefined
+                : (await this.driver.head(cleanKey)).etag;
+            if (
+              options.ifNoneMatch === "*" ||
+              etagListMatches(options.ifNoneMatch, existingEtag)
+            ) {
+              throw new PreconditionFailedError(
+                `File already exists: "${cleanKey}" (If-None-Match condition violated)`,
+              );
+            }
+          }
+
+          if (fileExists) {
+            if (ifExists === "error") throw new FileAlreadyExistsError(cleanKey);
+            if (ifExists === "skip") {
+              await discard();
+              return this.head(cleanKey);
+            }
+          }
+
+          if (options?.ifMatch) {
+            if (!fileExists) {
+              throw new PreconditionFailedError(
+                `Cannot match ETag. File does not exist: "${cleanKey}"`,
+              );
+            }
+            const existing = await this.driver.head(cleanKey);
+            if (!etagListMatches(options.ifMatch, existing.etag)) {
+              throw new PreconditionFailedError(
+                `ETag mismatch: expected "${options.ifMatch}", found "${existing.etag}"`,
+              );
+            }
           }
         }
-
-        if (fileExists) {
-          if (ifExists === "error") throw new FileAlreadyExistsError(cleanKey);
-          if (ifExists === "skip") {
-            await discard();
-            return this.head(cleanKey);
-          }
-        }
-
-        if (options?.ifMatch) {
-          if (!fileExists) {
-            throw new PreconditionFailedError(
-              `Cannot match ETag. File does not exist: "${cleanKey}"`,
-            );
-          }
-          const existing = await this.driver.head(cleanKey);
-          if (!etagListMatches(options.ifMatch, existing.etag)) {
-            throw new PreconditionFailedError(
-              `ETag mismatch: expected "${options.ifMatch}", found "${existing.etag}"`,
-            );
-          }
-        }
+      } catch (err) {
+        await discard();
+        throw err;
       }
-    } catch (err) {
-      await discard();
-      throw err;
-    }
 
-    return this.driver.upload(cleanKey, processed, {
-      ...options,
-      contentType: declaredType,
+      return this.driver.upload(cleanKey, processed, {
+        ...options,
+        contentType: declaredType,
+      });
     });
+  }
+
+  /**
+   * Runs `fn` holding this disk's per-key lock for `key`. Same-key calls
+   * serialize; different keys run concurrently. A failed waiter never
+   * blocks the chain behind it.
+   */
+  private async withKeyLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.keyLocks.get(key);
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.keyLocks.set(key, current);
+    await previous?.catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.keyLocks.get(key) === current) this.keyLocks.delete(key);
+    }
   }
 
   /**

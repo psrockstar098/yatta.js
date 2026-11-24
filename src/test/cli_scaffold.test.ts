@@ -1,9 +1,9 @@
 import { describe, it, expect, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { scaffoldInto, writeYattaFolder, TEMPLATE_MAIN } from "../cli";
+import { scaffoldBlockers, scaffoldInto, writeYattaFolder, TEMPLATE_MAIN } from "../cli";
 
 /*
  * `yatta new` produces the first project anyone touches, and it had thirteen
@@ -291,5 +291,81 @@ describe("The scaffolded server gates the observe surface", () => {
     expect(TEMPLATE_MAIN).toContain(
       'development: process.env.NODE_ENV === "development"',
     );
+  });
+});
+describe("yatta new . guards", () => {
+  it("scaffoldBlockers names the files that would be overwritten", () => {
+    const dir = join(scratch, "guarded");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "keep-me" }));
+    writeFileSync(join(dir, "tsconfig.json"), "{}");
+    mkdirSync(join(dir, "yatta"), { recursive: true });
+    writeFileSync(join(dir, "yatta", "main.ts"), "// mine\n");
+    created.push(dir);
+    expect(scaffoldBlockers(dir)).toEqual(["package.json", "tsconfig.json", "yatta/main.ts"]);
+    expect(scaffoldBlockers(join(scratch, "nope"))).toEqual([]);
+  });
+
+  it("scaffoldInto refuses to overwrite instead of silently clobbering", () => {
+    const dir = join(scratch, "guarded-2");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "keep-me" }));
+    created.push(dir);
+    expect(() => scaffoldInto(dir)).toThrow(/Refusing to scaffold over existing package\.json/);
+    expect(JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).name).toBe("keep-me");
+  });
+});
+
+describe("ensureTsconfigCompatible preserves comments", () => {
+  it("patches lib and paths without stripping user comments", async () => {
+    const { ensureTsconfigCompatible } = await import("../cli");
+    const dir = join(scratch, "tsconfig-comments");
+    mkdirSync(dir, { recursive: true });
+    created.push(dir);
+    const original = [
+      "{",
+      '  // My own note about this project.',
+      '  "compilerOptions": {',
+      '    // Keep strict on.',
+      '    "target": "ESNext",',
+      '    "lib": ["ESNext"], // trailing comment',
+      "  },",
+      "}",
+      "",
+    ].join("\n");
+    writeFileSync(join(dir, "tsconfig.json"), original);
+    expect(ensureTsconfigCompatible(dir)).toBe(true);
+    const patched = readFileSync(join(dir, "tsconfig.json"), "utf8");
+    expect(patched).toContain("// My own note about this project.");
+    expect(patched).toContain("// Keep strict on.");
+    expect(patched).toContain("// trailing comment");
+    expect(patched).toContain('"DOM"');
+    expect(patched).toContain("undici-types");
+    // And the result still parses as JSONC with the settings in place.
+    const parsed = Bun.JSON5.parse(patched) as {
+      compilerOptions: { lib: string[]; paths: Record<string, string[]> };
+    };
+    expect(parsed.compilerOptions.lib).toContain("DOM");
+    expect(parsed.compilerOptions.paths["undici-types"]).toEqual(["./node_modules/undici-types"]);
+  });
+
+  it("leaves an already-compatible tsconfig untouched", async () => {
+    const { ensureTsconfigCompatible } = await import("../cli");
+    const dir = join(scratch, "tsconfig-ok");
+    mkdirSync(dir, { recursive: true });
+    created.push(dir);
+    const original = JSON.stringify(
+      {
+        compilerOptions: {
+          lib: ["ESNext", "DOM"],
+          paths: { "undici-types": ["./node_modules/undici-types"] },
+        },
+      },
+      null,
+      2,
+    );
+    writeFileSync(join(dir, "tsconfig.json"), original);
+    expect(ensureTsconfigCompatible(dir)).toBe(false);
+    expect(readFileSync(join(dir, "tsconfig.json"), "utf8")).toBe(original);
   });
 });

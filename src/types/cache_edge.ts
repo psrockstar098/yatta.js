@@ -306,8 +306,11 @@ export class EdgeAwareCacheEngine extends MemoryCacheEngine {
     // all — not even a no-op attempt. The check is a single null test,
     // so unconfigured invalidation costs nothing measurable over the
     // plain engine (which this class otherwise is, unchanged).
+    // The edge purge is fire-and-forget: awaiting it (up to the
+    // provider's 5s timeout) delayed local invalidation returns, while
+    // purgeEdge is already fail-open with a warning on failure.
     if (this.edge) {
-      await this.purgeEdge({ tags: Array.isArray(tags) ? tags : [tags] });
+      void this.purgeEdge({ tags: Array.isArray(tags) ? tags : [tags] });
     }
     return evicted;
   }
@@ -357,14 +360,17 @@ export async function invalidateTagsWithEdge(
 ): Promise<number> {
   const evicted = await cache.invalidateTags(tags);
   if (!provider) return evicted;
-  try {
-    await provider.purge({ tags: Array.isArray(tags) ? tags : [tags] });
-  } catch (error) {
-    console.warn(
-      `[cache-edge] Edge purge via "${provider.name}" failed; local ` +
-        "invalidation still stands: " +
-        (error instanceof Error ? error.message : String(error)),
-    );
-  }
+  // Fire-and-forget, like EdgeAwareCacheEngine.invalidateTags: awaiting
+  // a slow provider would delay the local invalidation return. Fail-open
+  // with a warning, as before.
+  void provider
+    .purge({ tags: Array.isArray(tags) ? tags : [tags] })
+    .catch((error) => {
+      console.warn(
+        `[cache-edge] Edge purge via "${provider.name}" failed; local ` +
+          "invalidation still stands: " +
+          (error instanceof Error ? error.message : String(error)),
+      );
+    });
   return evicted;
 }

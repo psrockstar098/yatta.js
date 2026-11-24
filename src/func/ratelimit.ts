@@ -52,6 +52,13 @@
 // does — the leftmost entry is the one the client wrote, so it is never
 // trusted. The peer address (from `getClientIp`, or from the peer
 // address recorded at the edge) is the base address in both cases.
+//
+// `cf-connecting-ip` and `x-real-ip` carry a single value, so no
+// right-to-left counting can apply to them the way it does to
+// `x-forwarded-for` — they are taken as-is when `trustProxy` is set,
+// which is only safe behind a proxy that sets them itself (Cloudflare
+// does). Never enable `trustProxy` on an app clients can reach directly:
+// a direct client can mint arbitrary buckets through any of these headers.
 
 import type { Context, Middleware } from "../types/api";
 import { peerAddress } from "./peer";

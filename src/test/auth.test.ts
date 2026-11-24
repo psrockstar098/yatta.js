@@ -487,6 +487,80 @@ describe("Yatta Auth — MFA enrolment round trip", () => {
     // A second confirm must not succeed: the entry has to be consumed.
     await expect(auth.mfa.confirmSetup(userId, currentCode(secret))).rejects.toThrow();
   });
+
+  /*
+   * Enrolment used to take only a user id: any caller that could produce one
+   * could turn 2FA on for that account — and a merely-alive session was never
+   * asked how recently it authenticated. Passing the request gates both
+   * steps on a freshly authenticated session for this user, the same gate
+   * `disable` already has. The request stays optional so existing callers
+   * keep working, but an app that omits it is asserting it already checked.
+   */
+  async function signedInRequest(
+    auth: ReturnType<typeof createAuth>,
+    email: string,
+    ageMs = 0,
+  ) {
+    const result = await auth.signIn({ email, password: "Password123!" });
+    const token = (result as { tokens: { accessToken: string } }).tokens.accessToken;
+    if (ageMs > 0) {
+      const session = await auth.getSession(token);
+      await auth.store.updateSession(session!.session.id, {
+        lastAuthenticatedAt: new Date(Date.now() - ageMs),
+      });
+    }
+    return new Request("https://app.test", {
+      headers: { cookie: `yatta_session=${token}` },
+    });
+  }
+
+  it("requires a recently authenticated session to begin enrolment", async () => {
+    const { auth, userId } = await enrolledAuth();
+    const email = (await auth.store.findUserById(userId))!.email;
+
+    // Fresh session: enrolment proceeds.
+    const fresh = await signedInRequest(auth, email);
+    const { secret } = await auth.mfa.beginSetup(userId, "Yatta App", fresh);
+    expect(secret).toBeString();
+
+    // Stale session: the recent-auth window (10 minutes by default) has
+    // passed, so enrolment must refuse until the user re-authenticates.
+    const stale = await signedInRequest(auth, email, 20 * 60_000);
+    await expect(auth.mfa.beginSetup(userId, "Yatta App", stale)).rejects.toThrow(
+      /recent authentication required/i,
+    );
+  });
+
+  it("refuses enrolment for another user's session", async () => {
+    const { auth, userId } = await enrolledAuth();
+    const other = await auth.signUp({
+      email: `mfa-other-${Date.now()}@t.dev`,
+      password: "Password123!",
+    });
+    const otherEmail = "user" in other ? other.user.email : "";
+    const otherReq = await signedInRequest(auth, otherEmail);
+
+    await expect(auth.mfa.beginSetup(userId, "Yatta App", otherReq)).rejects.toThrow(
+      /your own MFA/i,
+    );
+  });
+
+  it("requires a recently authenticated session to confirm enrolment", async () => {
+    const { auth, userId } = await enrolledAuth();
+    const email = (await auth.store.findUserById(userId))!.email;
+
+    const { secret } = await auth.mfa.beginSetup(userId);
+    const stale = await signedInRequest(auth, email, 20 * 60_000);
+    await expect(
+      auth.mfa.confirmSetup(userId, currentCode(secret), stale),
+    ).rejects.toThrow(/recent authentication required/i);
+
+    // The refusal must not consume the pending enrolment: a fresh session
+    // can still complete it with the same code.
+    const fresh = await signedInRequest(auth, email);
+    const result = await auth.mfa.confirmSetup(userId, currentCode(secret), fresh);
+    expect(result.recoveryCodes).toHaveLength(10);
+  });
 });
 
 describe("Yatta Auth — signup rate limiting", () => {

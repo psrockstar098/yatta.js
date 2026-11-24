@@ -28,6 +28,17 @@ export function defineSubsystem<
       `Subsystem "${config.name}": timeoutMs must be >= 0 (0 disables).`,
     );
   }
+  // scheduleSubsystem used to silently treat 0/negative replicas as 1
+  // (Math.max(1, wanted)); fail fast instead so a typo'd replica count
+  // is a config error, not a silently different fleet.
+  if (
+    config.replicas !== undefined &&
+    (!Number.isInteger(config.replicas) || config.replicas < 1)
+  ) {
+    throw new RangeError(
+      `Subsystem "${config.name}": replicas must be an integer >= 1, got ${config.replicas}.`,
+    );
+  }
 
   return {
     name: config.name,

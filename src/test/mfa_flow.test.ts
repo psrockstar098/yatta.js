@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, setSystemTime } from "bun:test";
 import { z } from "zod";
 
 import {
@@ -63,9 +63,11 @@ async function userWithTwoFactor(auth: ReturnType<typeof createAuth>) {
    * in the step already used. It does mean enrolling and then signing in inside 30
    * seconds fails, which is why the refusal has its own message.
    *
-   * Winding the marker back is what "some time later" looks like.
+   * Advancing mocked time past the step is what "some time later" looks like.
+   * (Winding the store marker back alone no longer works: the replay guard
+   * also holds an in-process claim for the consumed step.)
    */
-  await auth.store.updateUser(userId, { lastMfaStep: 0 } as never);
+  setSystemTime(new Date(Date.now() + 31_000));
 
   return { userId, email, secret, recoveryCodes };
 }
@@ -75,6 +77,12 @@ describe("The MFA ticket", () => {
 
   beforeEach(() => {
     auth = build().auth;
+  });
+
+  // The enrol-then-sign-in helper advances mocked time past the consumed
+  // TOTP step (see userWithTwoFactor); reset the clock after each test.
+  afterEach(() => {
+    setSystemTime();
   });
 
   it("is issued instead of a bare user id", async () => {
@@ -131,11 +139,11 @@ describe("The MFA ticket", () => {
      * A second attempt with a *usable* code, so the ticket is what refuses it.
      *
      * Left alone, the TOTP replay guard would fire first and report "that code was
-     * already used" — true, but it would hide the thing being tested. Winding the
-     * step marker back is what a later code looks like.
+     * already used" — true, but it would hide the thing being tested. Advancing
+     * mocked time past the consumed step is what a later code looks like.
      */
     const user = await auth.store.findUserById(userId);
-    await auth.store.updateUser(userId, { lastMfaStep: 0 } as never);
+    setSystemTime(new Date(Date.now() + 31_000));
     expect(user).toBeTruthy();
 
     // A TOTP code stays valid for its whole window, so without single-use the ticket
@@ -208,8 +216,9 @@ describe("The MFA ticket", () => {
     // Disabling needs a recent-auth session, which is itself a guard worth having.
     // A code is mandatory here — skipping it once meant any session inside the
     // recent-auth window could turn 2FA off, and that window is exactly the period
-    // straight after signing in.
-    await auth.store.updateUser(userId, { lastMfaStep: 0 } as never);
+    // straight after signing in. Advance mocked time past the consumed TOTP step
+    // so the disable code is a fresh, usable one.
+    setSystemTime(new Date(Date.now() + 31_000));
     await auth.mfa.disable(
       new Request("https://app.test", {
         headers: { cookie: `yatta_session=${session.tokens.accessToken}` },

@@ -863,12 +863,22 @@ export class RaftNode {
   private becomeLeader(): void {
     this.role = "leader";
     this.leaderId = this.nodeId;
+    // Only peers that actually voted for this node count as acked: the
+    // old code stamped lastAckTime = now for every peer, so
+    // checkLeaderQuorum counted never-acked peers as live for up to
+    // electionMax after the election. Peers that did not vote stay
+    // unacked until a real AppendEntries reply arrives.
+    const voters = this.votesReceived;
     this.votesReceived = new Set();
     const last = this.log.lastSeq();
     for (const peer of this.peers) {
       this.nextIndex.set(peer, last + 1);
       this.matchIndex.set(peer, 0);
-      this.lastAckTime.set(peer, this.clock());
+      if (voters.has(peer)) {
+        this.lastAckTime.set(peer, this.clock());
+      } else {
+        this.lastAckTime.delete(peer);
+      }
     }
     this.lastHeartbeatSentAt = this.clock();
     this.clearTimers();
@@ -981,7 +991,6 @@ export class RaftNode {
       // resolved in favour of the node already sending AppendEntries.
       this.stepDown();
     }
-    this.leaderId = req.leaderId;
     // Log consistency check: the entry just before the new ones must
     // be one this node holds, at the same term. Seq 0 is the empty
     // prefix every log shares, so it always matches.
@@ -1009,8 +1018,12 @@ export class RaftNode {
         }
       }
     }
-    // Apply entries in order. A conflicting entry (same seq, different
-    // event) truncates the suffix from that seq — the pre-scan above
+    // Apply entries in order. The leader is only recorded once the
+    // message has passed every check above: the old code set leaderId
+    // before the consistency check, so currentLeaderId could point at a
+    // leader whose entries were rejected.
+    this.leaderId = req.leaderId;
+    // A conflicting entry (same seq, different event) truncates the suffix from that seq — the pre-scan above
     // already proved every conflict sits above the commit index, so
     // no truncation here can touch committed history.
     let firstConflict: number | null = null;
@@ -1385,7 +1398,11 @@ export function createRaftHttpHandler(
         }
         const res = node.handleRequestVote({
           term: reqBody.term as number,
-          candidateId: reqBody.candidateId as string,
+          // The candidate is the peer the token verified, not whoever the
+          // body names: a member used to be able to solicit votes for an
+          // arbitrary id. The body's candidateId is ignored; the verified
+          // sender is authoritative.
+          candidateId: sender,
           lastLogSeq: reqBody.lastLogSeq as number,
           lastLogTerm: reqBody.lastLogTerm as number,
         });
@@ -1544,45 +1561,79 @@ export class ChangeLogRaftLog implements RaftLog {
 
   append(entries: RaftLogEntry[]): { appended: number; skipped: number } {
     this.ensureTables();
-    let appended = 0;
-    let skipped = 0;
-    for (const entry of entries) {
-      const existing = this.rowAt(entry.seq);
-      if (existing) {
-        if (existing.event_id === entry.eventId) {
-          skipped += 1;
-          continue;
+    return this.inTx(() => {
+      let appended = 0;
+      let skipped = 0;
+      for (const entry of entries) {
+        const existing = this.rowAt(entry.seq);
+        if (existing) {
+          if (existing.event_id === entry.eventId) {
+            skipped += 1;
+            continue;
+          }
+          throw new RaftError(
+            `Raft log conflict at seq ${entry.seq}: use truncateFrom() before appending a different entry.`,
+          );
         }
-        throw new RaftError(
-          `Raft log conflict at seq ${entry.seq}: use truncateFrom() before appending a different entry.`,
-        );
-      }
-      this.store.rawRun(
-        `INSERT INTO "${REPLICATION_LOG_TABLE}"
+        this.store.rawRun(
+          `INSERT INTO "${REPLICATION_LOG_TABLE}"
            (source, file, seq, event_id, event_type, aggregate_type, aggregate_id,
             payload, occurred_at, created_at, status)
          VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 'pending');`,
-        [
-          this.source,
-          this.file,
-          entry.seq,
-          entry.eventId,
-          entry.eventType,
-          JSON.stringify(entry.payload),
-          entry.occurredAt,
-          entry.createdAt,
-        ],
-      );
-      this.persistent.saveTermAt(entry.seq, entry.term);
-      this.store.rawRun(
-        `INSERT INTO "${REPLICATION_CHECKPOINT_TABLE}" (source, file, checkpoint_seq, updated_at)
+          [
+            this.source,
+            this.file,
+            entry.seq,
+            entry.eventId,
+            entry.eventType,
+            JSON.stringify(entry.payload),
+            entry.occurredAt,
+            entry.createdAt,
+          ],
+        );
+        this.persistent.saveTermAt(entry.seq, entry.term);
+        this.store.rawRun(
+          `INSERT INTO "${REPLICATION_CHECKPOINT_TABLE}" (source, file, checkpoint_seq, updated_at)
          VALUES (?, ?, ?, ?)
          ON CONFLICT(source, file) DO UPDATE SET checkpoint_seq = MAX(checkpoint_seq, excluded.checkpoint_seq), updated_at = excluded.updated_at;`,
-        [this.source, this.file, entry.seq, Date.now()],
-      );
-      appended += 1;
+          [this.source, this.file, entry.seq, Date.now()],
+        );
+        appended += 1;
+      }
+      return { appended, skipped };
+    });
+  }
+
+  /**
+   * Runs `fn` inside one SQLite transaction when the store supports it.
+   * The log INSERT, the term annotation, and the checkpoint update used
+   * to be separate statements: a crash between them left term-0 entries
+   * or orphan term annotations. BEGIN IMMEDIATE via rawRun works on the
+   * real database; when it fails (already inside a transaction, or a
+   * minimal store that does not understand BEGIN) the writes run
+   * unwrapped, as before, rather than failing the append.
+   */
+  private inTx<T>(fn: () => T): T {
+    let locked = false;
+    try {
+      this.store.rawRun("BEGIN IMMEDIATE;");
+      locked = true;
+    } catch {
+      return fn();
     }
-    return { appended, skipped };
+    try {
+      const result = fn();
+      this.store.rawRun("COMMIT;");
+      locked = false;
+      return result;
+    } catch (err) {
+      if (locked) {
+        try {
+          this.store.rawRun("ROLLBACK;");
+        } catch {}
+      }
+      throw err;
+    }
   }
 
   /**
@@ -1625,17 +1676,21 @@ export class ChangeLogRaftLog implements RaftLog {
       );
     }
     this.ensureTables();
-    this.store.rawRun(
-      `DELETE FROM "${REPLICATION_LOG_TABLE}" WHERE source = ? AND file = ? AND seq >= ?;`,
-      [this.source, this.file, seq],
-    );
-    this.persistent.deleteTermsFrom(seq);
-    this.store.rawRun(
-      `INSERT INTO "${REPLICATION_CHECKPOINT_TABLE}" (source, file, checkpoint_seq, updated_at)
+    // One transaction, like append(): the row delete, the term cleanup,
+    // and the checkpoint rewind must land together.
+    this.inTx(() => {
+      this.store.rawRun(
+        `DELETE FROM "${REPLICATION_LOG_TABLE}" WHERE source = ? AND file = ? AND seq >= ?;`,
+        [this.source, this.file, seq],
+      );
+      this.persistent.deleteTermsFrom(seq);
+      this.store.rawRun(
+        `INSERT INTO "${REPLICATION_CHECKPOINT_TABLE}" (source, file, checkpoint_seq, updated_at)
        VALUES (?, ?, ?, ?)
        ON CONFLICT(source, file) DO UPDATE SET checkpoint_seq = MIN(checkpoint_seq, ?), updated_at = excluded.updated_at;`,
-      [this.source, this.file, seq - 1, Date.now(), seq - 1],
-    );
+        [this.source, this.file, seq - 1, Date.now(), seq - 1],
+      );
+    });
   }
 
   commitIndex(): number {

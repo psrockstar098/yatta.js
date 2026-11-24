@@ -240,24 +240,56 @@ function runWithTimeout<T>(
   signal: AbortSignal,
   timeoutMs: number,
 ): Promise<T> {
-  if (timeoutMs <= 0) return work;
+  // Already aborted: reject at once instead of waiting on work or a timer.
+  if (signal.aborted) {
+    return Promise.reject(
+      signal.reason instanceof Error
+        ? signal.reason
+        : new QueueError("Job aborted", "ABORTED"),
+    );
+  }
 
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       reject(
         signal.reason instanceof Error
           ? signal.reason
-          : new QueueError(`Job timed out after ${timeoutMs}ms`, "TIMEOUT"),
+          : new QueueError("Job aborted", "ABORTED"),
       );
-    }, timeoutMs);
+    };
+    // With no timeout the abort signal is the only deadline, so the race
+    // still applies: a lease loss or shutdown must release the slot even
+    // when the job has no timeout configured.
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new QueueError(`Job timed out after ${timeoutMs}ms`, "TIMEOUT"));
+      }, timeoutMs);
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
 
     work.then(
       (value) => {
-        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        cleanup();
         resolve(value);
       },
       (err) => {
-        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        cleanup();
         reject(err);
       },
     );
@@ -452,8 +484,19 @@ export interface WorkerOptions {
  */
 export function duration(value?: Duration, fallbackMs = 0): number {
   if (value == null) return fallbackMs;
-  if (typeof value === "number") return value; // numbers are strictly milliseconds
-
+  if (typeof value === "number") {
+    // A non-finite or negative number is not a duration: a NaN retry delay
+    // makes run_at NaN so the job never becomes claimable, and a NaN lock
+    // duration makes lock_expires_at NaN so the job is never reclaimed as
+    // stale. Reject it the way the string path rejects a bad format, and
+    // the way cache_queue's duration() already does.
+    if (!Number.isFinite(value) || value < 0) {
+      throw new QueueError(
+        `Invalid duration: expected a finite, non-negative number of milliseconds, got ${value}.`,
+      );
+    }
+    return value; // numbers are strictly milliseconds
+  }
   const match = value.trim().match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w)$/i);
   if (!match) throw new QueueError(`Invalid duration format: "${value}"`);
 
@@ -624,6 +667,10 @@ export class CronExpression {
     this.hours = this.parseField(parts[1]!, 0, 23, "hour");
     this.daysOfMonth = this.parseField(parts[2]!, 1, 31, "day-of-month");
     this.months = this.parseField(parts[3]!, 1, 12, "month");
+    // Day of week stays 0-6: the test suite pins 7 as out of bounds
+    // (job.test.ts "should reject out-of-bounds numbers in cron fields").
+    // Standard cron accepts 7 for Sunday, but changing that here would
+    // break the pinned contract — Dominic's call, not a silent fix.
     this.daysOfWeek = this.parseField(parts[4]!, 0, 6, "day-of-week");
   }
 
@@ -1117,12 +1164,30 @@ export class SQLiteJobStore implements JobStore {
         WHERE queue = ? AND unique_key = ? AND state IN ('queued', 'delayed', 'running')
       `,
         )
-        .get(job.queue, job.uniqueKey) as any;
+        .get(job.queue, job.uniqueKey ?? "") as any;
 
       if (existing) return this.deserialize(existing);
     }
 
-    const sql = `
+    /*
+     * The dedup is atomic, not check-then-insert: the SELECT above is only
+     * a fast path. Two workers enqueueing the same unique key at the same
+     * time used to race past it and the loser got a UNIQUE-constraint throw
+     * from the partial index instead of the existing job. INSERT ...
+     * ON CONFLICT DO NOTHING makes the loser insert nothing, and the
+     * re-select below returns the winner's row. Without a unique key there
+     * is no dedup to race, so the plain INSERT stays.
+     */
+    const sql = job.uniqueKey
+      ? `
+      INSERT INTO "_yatta_jobs" (
+        id, queue, name, data, state, attempts, max_attempts,
+        priority, run_at, timeout, retry_policy, progress, unique_key, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+      ON CONFLICT DO NOTHING
+      RETURNING *;
+    `
+      : `
       INSERT INTO "_yatta_jobs" (
         id, queue, name, data, state, attempts, max_attempts,
         priority, run_at, timeout, retry_policy, progress, unique_key, created_at, updated_at
@@ -1147,6 +1212,22 @@ export class SQLiteJobStore implements JobStore {
         now,
         now,
       ) as any;
+
+    if (!row) {
+      // Lost the race: another worker inserted this unique key first.
+      const existing = this.db
+        .query(
+          `
+        SELECT * FROM "_yatta_jobs"
+        WHERE queue = ? AND unique_key = ? AND state IN ('queued', 'delayed', 'running')
+      `,
+        )
+        .get(job.queue, job.uniqueKey ?? "") as any;
+      if (existing) return this.deserialize(existing);
+      throw new QueueError(
+        `Failed to enqueue job "${job.id}": the insert was skipped but no existing job with the same unique key was found.`,
+      );
+    }
 
     return this.deserialize(row);
   }
@@ -1587,10 +1668,15 @@ export class MemoryJobStore implements JobStore {
         continue;
       }
 
-      // Priority desc, then runAt asc
+      // Priority desc, then runAt asc, then id asc — the same tie-break
+      // the SQLite store's ORDER BY uses, so the two stores pick the same
+      // job when priority and runAt are equal.
       if (
         j.priority > selected.priority ||
-        (j.priority === selected.priority && j.runAt < selected.runAt)
+        (j.priority === selected.priority && j.runAt < selected.runAt) ||
+        (j.priority === selected.priority &&
+          j.runAt === selected.runAt &&
+          j.id < selected.id)
       ) {
         selected = j;
       }
@@ -1771,7 +1857,13 @@ export class MemoryJobStore implements JobStore {
     for (const [id, j] of this.jobs.entries()) {
       if (j.queue === queue && (!state || j.state === state)) {
         this.jobs.delete(id);
-        if (j.uniqueKey) this.uniqueKeys.delete(`${j.queue}:${j.uniqueKey}`);
+        // Only release the dedup key when it still points at this job:
+        // a newer live job may have reused the key after this one
+        // completed, and deleting it unconditionally let a third enqueue
+        // duplicate the live job.
+        if (j.uniqueKey && this.uniqueKeys.get(`${j.queue}:${j.uniqueKey}`) === id) {
+          this.uniqueKeys.delete(`${j.queue}:${j.uniqueKey}`);
+        }
         removed++;
       }
     }
@@ -1945,17 +2037,22 @@ export class EventBus {
     const exact = this.exactListeners.get(event);
     if (exact) for (const h of exact) targets.add(h);
 
-    // 2. Segmented prefix / suffix match
-    const dotIndex = event.indexOf(".");
-    if (dotIndex !== -1) {
-      const prefix = event.slice(0, dotIndex);
-      const prefixHandlers = this.prefixListeners.get(prefix);
-      if (prefixHandlers) for (const h of prefixHandlers) targets.add(h);
+    // 2. Segmented prefix / suffix match. A pattern like "order.eu.*" is
+    // stored under its full prefix "order.eu", and "*.eu.paid" under its
+    // full suffix "eu.paid", so every prefix/suffix of the emitted name
+    // must be tried — checking only the first/last segment meant
+    // multi-segment patterns never fired.
+    const segments = event.split(".");
+    if (segments.length > 1) {
+      for (let i = 1; i < segments.length; i++) {
+        const prefix = segments.slice(0, i).join(".");
+        const prefixHandlers = this.prefixListeners.get(prefix);
+        if (prefixHandlers) for (const h of prefixHandlers) targets.add(h);
 
-      const lastDotIndex = event.lastIndexOf(".");
-      const suffix = event.slice(lastDotIndex + 1);
-      const suffixHandlers = this.suffixListeners.get(suffix);
-      if (suffixHandlers) for (const h of suffixHandlers) targets.add(h);
+        const suffix = segments.slice(i).join(".");
+        const suffixHandlers = this.suffixListeners.get(suffix);
+        if (suffixHandlers) for (const h of suffixHandlers) targets.add(h);
+      }
     }
 
     // 3. Global wildcards
@@ -2246,6 +2343,8 @@ export class WorkerPool {
         );
       }
     }, staleInterval);
+    // A pool that is never stop()d must not keep the process alive on its own.
+    this.staleTimer.unref?.();
 
     this.tick();
     return this;
@@ -2310,6 +2409,7 @@ export class WorkerPool {
     if (!this.isRunning) return;
     const pollInterval = duration(this.options.pollInterval, 1_000);
     this.pollTimer = setTimeout(() => void this.tick(), pollInterval);
+    this.pollTimer.unref?.();
   }
 
   private async executeJob(job: JobRecord, lockDuration: number) {
@@ -2812,6 +2912,10 @@ export class CronScheduler {
     handler: () => Promise<void> | void,
     options: { timezone?: string; concurrency?: "skip" | "allow" } = {},
   ): this {
+    // Re-scheduling a name stops the old task first: overwriting the map
+    // entry alone left the old timer armed, so the old handler kept firing
+    // on its old schedule and stop(name) could no longer reach it.
+    this.stop(name);
     const task: ScheduledTask = {
       name,
       schedule: cronExpression,
@@ -2839,6 +2943,10 @@ export class CronScheduler {
     handler: () => Promise<void> | void,
     name = `interval-${crypto.randomUUID().slice(0, 8)}`,
   ): this {
+    // Re-scheduling a name stops the old task first: overwriting the map
+    // entry alone left the old timer armed, so the old handler kept firing
+    // on its old schedule and stop(name) could no longer reach it.
+    this.stop(name);
     const task: ScheduledTask = {
       name,
       schedule: interval,

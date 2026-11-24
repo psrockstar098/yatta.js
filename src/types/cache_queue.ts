@@ -351,6 +351,13 @@ export class DoublyLinkedList<T> {
    * @param node The node to decouple.
    */
   unlink(node: ListNode<T>): void {
+    // Membership guard: unlinking a node that is not in this list used
+    // to decrement size anyway (and, for a node whose prev/next had been
+    // cleared by an earlier unlink, corrupt the count). A node with no
+    // neighbours is only a member when it is the head (a one-element
+    // list); anything else is foreign or already removed.
+    if (node.prev === null && node.next === null && node !== this.head) return;
+    if (this.size <= 0) return;
     if (node.prev) node.prev.next = node.next;
     if (node.next) node.next.prev = node.prev;
     if (node === this.head) this.head = node.next;
@@ -715,6 +722,16 @@ export class MemoryCacheEngine {
   private misses = 0;
   private writes = 0;
   private evictions = 0;
+  /*
+   * Keys evicted from L1 while their value still sits in L2. Without this,
+   * the next get() backfilled the evicted key from L2 and re-inserted it
+   * into L1, so maxItems was not a bound at all whenever L2 was
+   * configured. A tombstoned key is a miss until it is set() again (which
+   * clears the tombstone) or delete()d/clear()ed. Capped at one cache-full
+   * so the set itself cannot grow without bound; dropping the oldest
+   * tombstone only re-admits that one key to backfill.
+   */
+  private evictedKeys = new Set<string>();
 
   private readonly maxItems: number;
   private readonly defaultTtlMs: number;
@@ -766,26 +783,38 @@ export class MemoryCacheEngine {
       return entry.value as T;
     }
 
-    // Try L2 Storage with TTL-preserving backfill
-    if (this.l2) {
-      const l2Record = await this.l2.get<T>(key);
-      if (l2Record !== null) {
-        const remainingTtl =
-          l2Record.expiresAt !== null
-            ? Math.max(0, l2Record.expiresAt - Date.now())
-            : undefined;
-
-        await this.set(key, l2Record.value, {
-          ttl: remainingTtl,
-          consistency: "async",
-        });
+    // Try L2 Storage with TTL-preserving backfill — unless this key was
+    // evicted from L1, in which case backfilling would undo the eviction.
+    if (this.l2 && !this.evictedKeys.has(key)) {
+      const backfilled = await this.backfillFromL2<T>(key);
+      if (backfilled !== null) {
         this.hits++;
-        return l2Record.value;
+        return backfilled;
       }
     }
 
     this.misses++;
     return null;
+  }
+
+  /**
+   * Reads one key from L2 and re-inserts it into L1, preserving the
+   * remaining TTL. Returns null when L2 has nothing (or it expired).
+   * Shared by get() and remember(); both must respect eviction tombstones.
+   */
+  private async backfillFromL2<T = unknown>(key: string): Promise<T | null> {
+    if (!this.l2) return null;
+    const l2Record = await this.l2.get<T>(key);
+    if (l2Record === null) return null;
+    const remainingTtl =
+      l2Record.expiresAt !== null
+        ? Math.max(0, l2Record.expiresAt - Date.now())
+        : undefined;
+    await this.set(key, l2Record.value, {
+      ttl: remainingTtl,
+      consistency: "async",
+    });
+    return l2Record.value;
   }
 
   /**
@@ -820,6 +849,9 @@ export class MemoryCacheEngine {
     const swrUntil = expiresAt !== null && swrMs > 0 ? expiresAt + swrMs : null;
 
     const tags = new Set(options?.tags ?? []);
+
+    // A fresh set re-admits the key: an eviction tombstone must not outlive it.
+    this.evictedKeys.delete(key);
 
     if (this.map.has(key)) {
       this.deleteInternal(key);
@@ -918,6 +950,17 @@ export class MemoryCacheEngine {
       }
     }
 
+    // L2 backfill, like get(): a key evicted from L1 to L2 must not
+    // re-run the factory when L2 still holds a fresh value. Tombstoned
+    // (evicted) keys stay a miss until they are set() again.
+    if (!options?.force && this.l2 && !this.evictedKeys.has(key)) {
+      const backfilled = await this.backfillFromL2<T>(key);
+      if (backfilled !== null) {
+        this.hits++;
+        return backfilled;
+      }
+    }
+
     // Singleflight coalescing: exactly one execution runs
     if (this.inFlight.has(key)) {
       return this.inFlight.get(key)! as Promise<T>;
@@ -975,6 +1018,7 @@ export class MemoryCacheEngine {
    */
   async delete(key: string): Promise<boolean> {
     const existed = this.deleteInternal(key);
+    this.evictedKeys.delete(key);
     if (this.l2) await this.l2.delete(key);
     return existed;
   }
@@ -1049,6 +1093,17 @@ export class MemoryCacheEngine {
     if (!this.list.tail) return;
     const oldestKey = this.list.tail.value.key;
     this.deleteInternal(oldestKey);
+    // Tombstone so the L2 backfill in get()/remember() does not resurrect
+    // the evicted key and undo the eviction. The L2 copy itself stays:
+    // it is still a cache entry with its own TTL, and delete() /
+    // invalidateTags() remove it when asked.
+    this.evictedKeys.add(oldestKey);
+    const cap = Math.max(1, this.maxItems);
+    while (this.evictedKeys.size > cap) {
+      const first = this.evictedKeys.values().next().value;
+      if (first === undefined) break;
+      this.evictedKeys.delete(first);
+    }
     this.evictions++;
   }
 
@@ -1060,6 +1115,7 @@ export class MemoryCacheEngine {
     this.list.clear();
     this.tagIndex.clear();
     this.inFlight.clear();
+    this.evictedKeys.clear();
     if (this.l2) await this.l2.clear();
   }
 
@@ -1134,6 +1190,8 @@ export class SQLiteL2CacheStore implements L2CacheStore {
       this.sweepTimer = setInterval(() => {
         this.cleanupExpired().catch(console.error);
       }, sweepIntervalMs);
+      // A store that is never close()d must not keep the process alive.
+      this.sweepTimer.unref?.();
     }
   }
 
@@ -1276,10 +1334,13 @@ export class SQLiteL2CacheStore implements L2CacheStore {
         )
         .run(key, rawVal, expiresAt);
 
+      // Old tag rows are always cleared, even when the new set is empty:
+      // re-setting a key with no tags used to leave the old rows behind,
+      // so a later invalidateTags() deleted a live entry.
+      this.db
+        .query(`DELETE FROM "_yatta_cache_tags" WHERE cache_key = ?`)
+        .run(key);
       if (tags && tags.length > 0) {
-        this.db
-          .query(`DELETE FROM "_yatta_cache_tags" WHERE cache_key = ?`)
-          .run(key);
         const insertTag = this.db.query(
           `INSERT OR IGNORE INTO "_yatta_cache_tags" (tag, cache_key) VALUES (?, ?)`,
         );

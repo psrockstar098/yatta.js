@@ -1511,9 +1511,11 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
      */
     if (keys.length === 0) {
       const sql = `INSERT INTO "${this.name.replace(/"/g, '""')}" DEFAULT VALUES RETURNING *;`;
-      const row = this.deserializeRow(this.db.run(sql, [], "get") as any);
-      this.syncFtsRow(row);
-      return row;
+      return this.db.transaction(() => {
+        const row = this.deserializeRow(this.db.run(sql, [], "get") as any);
+        this.syncFtsInsert(row);
+        return row;
+      });
     }
 
     const columns = keys.map((k) => `"${k.replace(/"/g, '""')}"`).join(", ");
@@ -1521,11 +1523,15 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     const values = keys.map((k) => this.serializeValue(k, payload[k]));
 
     const sql = `INSERT INTO "${this.name.replace(/"/g, '""')}" (${columns}) VALUES (${placeholders}) RETURNING *;`;
-    const row = this.deserializeRow(this.db.run(sql, values, "get") as any);
-    // Same connection, so a surrounding transaction rollback rolls the
-    // index write back with the row — the index cannot outlive its row.
-    this.syncFtsRow(row);
-    return row;
+    // Row write and index sync share one transaction, so an FTS error
+    // (e.g. a corrupt index) rolls the row back instead of leaving a
+    // landed row behind a failed insert — a retry would otherwise create
+    // a duplicate or a UNIQUE error.
+    return this.db.transaction(() => {
+      const row = this.deserializeRow(this.db.run(sql, values, "get") as any);
+      this.syncFtsInsert(row);
+      return row;
+    });
   }
 
   /**
@@ -1650,6 +1656,19 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     let selectedCols = "*";
     if (options.select) {
       const cols = new Set(options.select.map(String));
+      // Validate like where/orderBy do: SQLite silently reads a
+      // double-quoted unknown identifier in a SELECT list as a string
+      // literal, so a typo used to return literal text instead of erroring.
+      if (this.columns.size > 0) {
+        for (const c of cols) {
+          if (c !== "*" && !this.columns.has(c)) {
+            const known = [...this.columns.keys()].join(", ");
+            throw new YattaError(
+              `Unknown column "${c}" in select for "${this.name}". Known columns: ${known}.`,
+            );
+          }
+        }
+      }
       if (options.include) {
         cols.add(this.primaryKeyColumn);
         for (const relName of Object.keys(options.include)) {
@@ -1829,6 +1848,21 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     this.db.ftsUpsert(this.name, (row as any)[this.primaryKeyColumn], row as any);
   }
 
+  /**
+   * Writes a freshly inserted row into the FTS index. Unlike `syncFtsRow`
+   * this skips the DELETE: a row that just inserted has no prior FTS
+   * entry, and the DELETE is a full FTS scan (`__yatta_pk` is UNINDEXED),
+   * so it dominated insert cost on large tables (~2.7 ms at 10k rows).
+   * A stale entry for a re-inserted pk can only exist after rows were
+   * changed outside the Table paths; the next search's count check
+   * rebuilds the index in that case.
+   */
+  private syncFtsInsert(row: T | null | undefined): void {
+    if (!row) return;
+    if (this.ftsColumns.length === 0) return;
+    this.db.ftsInsert(this.name, (row as any)[this.primaryKeyColumn], row as any);
+  }
+
   /** Removes one primary key from the FTS index, or does nothing when the table is not searchable. */
   private syncFtsDelete(pk: string | number): void {
     if (this.ftsColumns.length === 0) return;
@@ -1907,26 +1941,30 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
 
     const sql = `UPDATE "${this.name.replace(/"/g, '""')}" SET ${setSql}${clause ? ` WHERE ${clause}` : ""};`;
 
-    const res = this.db.run(sql, [...setParams, ...whereParams], "run") as { changes: number };
+    // Row write and index sync share one transaction, like insert(): an
+    // FTS error must not leave updated rows behind a failed update.
+    return this.db.transaction(() => {
+      const res = this.db.run(sql, [...setParams, ...whereParams], "run") as { changes: number };
 
-    if (searchable) {
-      // A primary-key change moves the row's index entry: reindex under the
-      // new key and drop the old one, or the old entry would point at a row
-      // that no longer exists under that key.
-      const resolved = this.resolveAliases(options.data as Record<string, any>);
-      const pkChanged = resolved[this.primaryKeyColumn] !== undefined;
-      for (const oldPk of affectedPks) {
-        const newPk = pkChanged ? resolved[this.primaryKeyColumn] : oldPk;
-        const row = this.findById(newPk);
-        if (row) {
-          this.syncFtsRow(row);
-          if (String(newPk) !== String(oldPk)) this.syncFtsDelete(oldPk);
-        } else {
-          this.syncFtsDelete(oldPk);
+      if (searchable) {
+        // A primary-key change moves the row's index entry: reindex under the
+        // new key and drop the old one, or the old entry would point at a row
+        // that no longer exists under that key.
+        const resolved = this.resolveAliases(options.data as Record<string, any>);
+        const pkChanged = resolved[this.primaryKeyColumn] !== undefined;
+        for (const oldPk of affectedPks) {
+          const newPk = pkChanged ? resolved[this.primaryKeyColumn] : oldPk;
+          const row = this.findById(newPk);
+          if (row) {
+            this.syncFtsRow(row);
+            if (String(newPk) !== String(oldPk)) this.syncFtsDelete(oldPk);
+          } else {
+            this.syncFtsDelete(oldPk);
+          }
         }
       }
-    }
-    return { changes: res.changes };
+      return { changes: res.changes };
+    });
   }
 
   /**
@@ -1947,15 +1985,18 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
 
     const pkCol = `"${this.primaryKeyColumn.replace(/"/g, '""')}"`;
     const sql = `UPDATE "${this.name.replace(/"/g, '""')}" SET ${setSql} WHERE ${pkCol} = ? RETURNING *;`;
-    const raw = this.db.run(sql, [...setParams, id], "get") as any;
-    const row = raw ? this.deserializeRow(raw) : null;
-    if (row) {
-      this.syncFtsRow(row);
-      if (String((row as any)[this.primaryKeyColumn]) !== String(id)) this.syncFtsDelete(id);
-    } else {
-      this.syncFtsDelete(id);
-    }
-    return row;
+    // Row write and index sync share one transaction, like insert().
+    return this.db.transaction(() => {
+      const raw = this.db.run(sql, [...setParams, id], "get") as any;
+      const row = raw ? this.deserializeRow(raw) : null;
+      if (row) {
+        this.syncFtsRow(row);
+        if (String((row as any)[this.primaryKeyColumn]) !== String(id)) this.syncFtsDelete(id);
+      } else {
+        this.syncFtsDelete(id);
+      }
+      return row;
+    });
   }
 
   /**
@@ -2025,21 +2066,24 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
       );
     }
 
-    // Index entries are removed with the same filter, before the rows go:
-    // one statement, same parameters, so a row deleted here cannot leave a
-    // searchable ghost behind. Keys are cast to text because the index
-    // stores every primary key as text.
-    if (this.ftsColumns.length > 0 && this.db.ftsTableExists(this.name)) {
-      const fts = this.db.ftsTableName(this.name);
-      const qfts = `"${fts.replace(/"/g, '""')}"`;
-      const pkCol = `"${this.primaryKeyColumn.replace(/"/g, '""')}"`;
-      const ghostSql = `DELETE FROM ${qfts} WHERE "__yatta_pk" IN (SELECT CAST(${pkCol} AS TEXT) FROM "${this.name.replace(/"/g, '""')}"${clause ? ` WHERE ${clause}` : ""});`;
-      this.db.run(ghostSql, params, "run");
-    }
+    // Rows first, index second, inside one transaction. The old code
+    // deleted the FTS entries before the rows: a row delete that then
+    // failed (e.g. an FK RESTRICT violation) left live rows unsearchable.
+    // The affected keys are captured before the write (afterwards the
+    // filter may no longer match), and the transaction rolls the row
+    // delete back if the index sync fails.
+    const searchable =
+      this.ftsColumns.length > 0 && this.db.ftsTableExists(this.name);
+    const affectedPks = searchable
+      ? this.ftsPkValuesForWhere(options.where)
+      : [];
 
-    const sql = `DELETE FROM "${this.name.replace(/"/g, '""')}"${clause ? ` WHERE ${clause}` : ""};`;
-    const res = this.db.run(sql, params, "run") as { changes: number };
-    return { changes: res.changes };
+    return this.db.transaction(() => {
+      const sql = `DELETE FROM "${this.name.replace(/"/g, '""')}"${clause ? ` WHERE ${clause}` : ""};`;
+      const res = this.db.run(sql, params, "run") as { changes: number };
+      for (const pk of affectedPks) this.syncFtsDelete(pk);
+      return { changes: res.changes };
+    });
   }
 
   /**
@@ -2156,6 +2200,18 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
           );
         }
         if (decoded.some((v) => v !== null && typeof v === "object")) {
+          throw new YattaError(
+            "Invalid cursor token provided to cursorPaginate()",
+          );
+        }
+        // A 1-element cursor with distinct cursor/tie-breaker columns
+        // leaves tbVal undefined, which buildWhere drops — so the
+        // tie-breaker clause vanishes and a page can repeat rows.
+        // Cursors minted by this method always carry both values.
+        if (
+          cursorCol !== tieBreaker &&
+          decoded.length < 2
+        ) {
           throw new YattaError(
             "Invalid cursor token provided to cursorPaginate()",
           );
@@ -2661,6 +2717,14 @@ export interface DatabaseOptions {
  */
 export class YattaDB {
   private _sqlite: Database;
+  /**
+   * Whether this connection is currently inside a transaction.
+   * Generated async migrations check this so they can skip their own
+   * BEGIN IMMEDIATE when `migrate()` already holds the write lock.
+   */
+  get inTransaction(): boolean {
+    return this._sqlite.inTransaction;
+  }
   /** Active database schema definition. */
   readonly schema: DatabaseSchema;
   /** Active relational associations graph. */
@@ -2674,6 +2738,22 @@ export class YattaDB {
   private dbSearchSynonyms: Map<string, string[][]>;
   /** Searchable tables whose FTS table is known to exist, so writes skip a lookup. */
   private ftsReady = new Set<string>();
+  /**
+   * Tables whose FTS row counts have been verified against the base table
+   * at least once in this process. The count check is a full FTS scan, so
+   * it runs once per open, not on every search: Table writes keep the
+   * counts in sync, so only rows changed outside the Table paths (raw
+   * SQL, a copied database file) can diverge afterwards, and those are
+   * caught on the next process start.
+   */
+  private ftsVerified = new Set<string>();
+  /**
+   * Cached typo-correction vocabulary per table. Invalidated on every
+   * FTS write through this instance; rows changed outside the Table
+   * paths can leave it stale until the process restarts (a stale term
+   * only affects typo suggestions, never ranking).
+   */
+  private ftsVocabCache = new Map<string, Set<string>>();
   /** Lazily created vector store (see `vectors`). Null until first access. */
   private vectorStore: VectorStore | null = null;
   private static readonly MAX_STMT_CACHE = 500;
@@ -3289,6 +3369,48 @@ export class YattaDB {
    * renaming a table with it off makes SQLite rewrite references to that name in every
    * other table, which would turn other tables' foreign keys into dangling text.
    */
+  /**
+   * Inserts `, <fragment>` just before the `)` that closes the column list
+   * of a CREATE TABLE statement. Trailing clauses (WITHOUT ROWID, STRICT,
+   * ...) follow that paren and are left untouched.
+   */
+  private insertIntoColumnList(createSql: string, fragment: string): string {
+    const open = createSql.indexOf("(");
+    if (open === -1) {
+      throw new YattaError(
+        `Cannot add a column: the stored CREATE TABLE text has no column list.`,
+      );
+    }
+    let depth = 0;
+    let quote: string | null = null;
+    for (let i = open; i < createSql.length; i++) {
+      const ch = createSql[i]!;
+      if (quote !== null) {
+        // Doubled quotes are an escaped quote inside the string, not its end.
+        if (ch === quote && createSql[i + 1] === quote) {
+          i++;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") {
+        quote = ch;
+        continue;
+      }
+      if (ch === "(") depth++;
+      else if (ch === ")") {
+        depth--;
+        if (depth === 0) {
+          return `${createSql.slice(0, i)}, ${fragment}${createSql.slice(i)}`;
+        }
+      }
+    }
+    throw new YattaError(
+      `Cannot add a column: the stored CREATE TABLE text has an unbalanced column list.`,
+    );
+  }
+
   private rebuildTableWithColumn(tableName: string, colName: string, def: ColumnDefinition): void {
     const quoted = tableName.replace(/"/g, '""');
     const original = this._sqlite
@@ -3319,7 +3441,13 @@ export class YattaDB {
       .map((n) => `"${n.replace(/"/g, '""')}"`)
       .join(", ");
 
-    const rebuilt = original.sql.replace(/\)\s*;?\s*$/, `, ${fragment});`);
+    // Insert the new column before the closing paren of the column list.
+    // The old regex only matched a `)` at the very end of the statement,
+    // so a CREATE TABLE with trailing clauses (e.g. WITHOUT ROWID) was
+    // silently rebuilt without the column and no error was raised. Scan
+    // for the paren that closes the first `(` — the column list — honouring
+    // quoted strings, so a `)` inside a default value cannot end the scan.
+    const rebuilt = this.insertIntoColumnList(original.sql, fragment);
 
     this._sqlite.run(`DROP TABLE IF EXISTS "_yatta_rebuild_${quoted}"`);
     this._sqlite.run(
@@ -3347,6 +3475,65 @@ export class YattaDB {
    * @returns Object listing newly applied migration names.
    */
   async migrate(migrations: Migration[]): Promise<{ applied: string[] }> {
+    /*
+     * Cross-process lock: two processes migrating at once used to both
+     * read the marker table, both run up() for the same migration, and
+     * the second marker INSERT threw UNIQUE — after a non-idempotent up
+     * had already applied twice. BEGIN IMMEDIATE takes the write lock
+     * up front (busy_timeout makes the loser wait, then fail loudly
+     * instead of double-applying). It is held across async migrations:
+     * they run on this same connection, inside this transaction.
+     * If a transaction is already open on this connection (manual BEGIN),
+     * the lock cannot be taken and migration proceeds inside it.
+     *
+     * Foreign keys are switched off *before* the transaction starts: the
+     * pragma is a no-op inside one, and generated rebuild migrations
+     * drop and recreate tables whose child rows would otherwise be
+     * cascade-deleted (see syncSchemaOnce, which does the same).
+     */
+    let locked = false;
+    let fkWasOn = false;
+    try {
+      const fkRow = this._sqlite.query("PRAGMA foreign_keys").get() as {
+        foreign_keys: number;
+      } | null;
+      fkWasOn = fkRow?.foreign_keys === 1;
+      if (fkWasOn) this._sqlite.run("PRAGMA foreign_keys = OFF;");
+      try {
+        this._sqlite.run("BEGIN IMMEDIATE;");
+      } catch (beginErr: any) {
+        // The pragma above already ran: restore FK before bailing out.
+        try { this._sqlite.run("PRAGMA foreign_keys = ON;"); } catch {}
+        fkWasOn = false;
+        throw beginErr;
+      }
+      locked = true;
+    } catch (err: any) {
+      if (!/cannot start a transaction within a transaction/i.test(String(err?.message))) {
+        throw err;
+      }
+      // Already inside a transaction: the lock cannot be taken and the
+      // FK pragma (if it ran) stays as set — restore it below via fkWasOn.
+    }
+
+    try {
+      return await this.migrateLocked(migrations);
+    } catch (err) {
+      if (locked) {
+        try { this._sqlite.run("ROLLBACK;"); } catch {}
+      }
+      throw err;
+    } finally {
+      if (locked) {
+        try { this._sqlite.run("COMMIT;"); } catch {}
+      }
+      if (fkWasOn) {
+        try { this._sqlite.run("PRAGMA foreign_keys = ON;"); } catch {}
+      }
+    }
+  }
+
+  private async migrateLocked(migrations: Migration[]): Promise<{ applied: string[] }> {
     this._sqlite.run(`
       CREATE TABLE IF NOT EXISTS "_yatta_migrations" (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3539,6 +3726,8 @@ export class YattaDB {
     const fts = this.ftsTableName(tableName).replace(/"/g, '""');
     this._sqlite.run(`DROP TABLE IF EXISTS "${vocab}";`);
     this._sqlite.run(`DROP TABLE IF EXISTS "${fts}";`);
+    this.ftsVerified.delete(tableName);
+    this.ftsVocabCache.delete(tableName);
   }
 
   private populateFtsTable(tableName: string, cols: string[]): void {
@@ -3655,12 +3844,16 @@ export class YattaDB {
       return;
     }
     this.ftsReady.add(tableName);
+    // The counts are a full FTS scan (~1 ms at 5k rows, growing with the
+    // table), so they run once per process open, not on every search.
+    if (this.ftsVerified.has(tableName)) return;
     try {
       const fts = this.ftsTableName(tableName).replace(/"/g, '""');
       const base = tableName.replace(/"/g, '""');
       const ftsCount = (this._sqlite.query(`SELECT COUNT(*) AS c FROM "${fts}"`).get() as { c: number }).c;
       const baseCount = (this._sqlite.query(`SELECT COUNT(*) AS c FROM "${base}"`).get() as { c: number }).c;
       if (ftsCount !== baseCount) this.rebuildSearchIndex(tableName);
+      this.ftsVerified.add(tableName);
     } catch {
       // Counting is a repair heuristic, not the search itself. A failure
       // here must not mask the search that follows.
@@ -3696,6 +3889,9 @@ export class YattaDB {
       this.createFtsTable(target, cols);
       this.populateFtsTable(target, cols);
       this.ftsReady.add(target);
+      // A fresh rebuild matches the base table by construction.
+      this.ftsVerified.add(target);
+      this.ftsVocabCache.delete(target);
     }
     this.clearStatementCache();
   }
@@ -3708,6 +3904,8 @@ export class YattaDB {
    * correction dictionary — ranking still comes from FTS5 itself.
    */
   ftsVocabulary(tableName: string): Set<string> {
+    const cached = this.ftsVocabCache.get(tableName);
+    if (cached) return cached;
     const vocab = this.ftsVocabTableName(tableName);
     const vocabExists = this.run(
       `SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1;`,
@@ -3718,7 +3916,9 @@ export class YattaDB {
       try {
         const qvocab = `"${vocab.replace(/"/g, '""')}"`;
         const rows = this.run(`SELECT DISTINCT term FROM ${qvocab};`, [], "all") as { term: string }[];
-        return new Set(rows.map((r) => r.term));
+        const loaded = new Set(rows.map((r) => r.term));
+        this.ftsVocabCache.set(tableName, loaded);
+        return loaded;
       } catch {
         // Fall through to the scan below.
       }
@@ -3737,7 +3937,51 @@ export class YattaDB {
         }
       }
     }
+    this.ftsVocabCache.set(tableName, terms);
     return terms;
+  }
+
+  /**
+   * Inserts one row's FTS entry without deleting a prior one. Only correct
+   * for freshly inserted rows: a successful base-table insert means the pk
+   * is new, so there is nothing to delete — and the DELETE is a full FTS
+   * scan (`__yatta_pk` is UNINDEXED), which dominated insert cost on
+   * large tables. Updates still go through `ftsUpsert`.
+   */
+  ftsInsert(tableName: string, pk: string | number, row: Record<string, any>): void {
+    const cols = this.searchableColumns(tableName);
+    if (cols.length === 0) return;
+    if (!this.ftsReady.has(tableName)) {
+      if (!this.ftsTableExists(tableName)) return;
+      this.ftsReady.add(tableName);
+    }
+    try {
+      this.ftsInsertRow(tableName, cols, String(pk), row);
+      this.ftsVocabCache.delete(tableName);
+    } catch (err: any) {
+      if (String(err?.message ?? err).includes("no such table")) {
+        this.ftsReady.delete(tableName);
+        this.ftsVerified.delete(tableName);
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /** Shared INSERT half of the FTS write paths. */
+  private ftsInsertRow(tableName: string, cols: string[], pkText: string, row: Record<string, any>): void {
+    const fts = this.ftsTableName(tableName).replace(/"/g, '""');
+    const colSql = cols.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
+    const placeholders = cols.map(() => "?").join(", ");
+    const values = cols.map((c) => {
+      const v = row[c];
+      return v === null || v === undefined ? "" : String(v);
+    });
+    this.run(
+      `INSERT INTO "${fts}" (${colSql}, "__yatta_pk") VALUES (${placeholders}, ?);`,
+      [...values, pkText],
+      "run",
+    );
   }
 
   /**
@@ -3756,17 +4000,8 @@ export class YattaDB {
     const pkText = String(pk);
     try {
       this.run(`DELETE FROM "${fts}" WHERE "__yatta_pk" = ?;`, [pkText], "run");
-      const colSql = cols.map((c) => `"${c.replace(/"/g, '""')}"`).join(", ");
-      const placeholders = cols.map(() => "?").join(", ");
-      const values = cols.map((c) => {
-        const v = row[c];
-        return v === null || v === undefined ? "" : String(v);
-      });
-      this.run(
-        `INSERT INTO "${fts}" (${colSql}, "__yatta_pk") VALUES (${placeholders}, ?);`,
-        [...values, pkText],
-        "run",
-      );
+      this.ftsInsertRow(tableName, cols, pkText, row);
+      this.ftsVocabCache.delete(tableName);
     } catch (err: any) {
       // The cache can go stale when the index is dropped outside this
       // instance's knowledge (restore of an older backup, a manual DROP).
@@ -3775,6 +4010,7 @@ export class YattaDB {
       // search rebuild. Any other error still propagates.
       if (String(err?.message ?? err).includes("no such table")) {
         this.ftsReady.delete(tableName);
+        this.ftsVerified.delete(tableName);
         return;
       }
       throw err;
@@ -3792,11 +4028,13 @@ export class YattaDB {
     const fts = this.ftsTableName(tableName).replace(/"/g, '""');
     try {
       this.run(`DELETE FROM "${fts}" WHERE "__yatta_pk" = ?;`, [String(pk)], "run");
+      this.ftsVocabCache.delete(tableName);
     } catch (err: any) {
       // Same stale-cache reasoning as ftsUpsert: a missing index must not
       // break a delete. Any other error still propagates.
       if (String(err?.message ?? err).includes("no such table")) {
         this.ftsReady.delete(tableName);
+        this.ftsVerified.delete(tableName);
         return;
       }
       throw err;
@@ -3877,8 +4115,10 @@ export class YattaDB {
        * exactly the one a failed `cp`, an interrupted upload or an empty log file
        * produces — and it is the one that destroys the most.
        *
-       * So the backup has to contain a schema. Yatta always writes `_yatta_migrations`,
-       * so an empty-but-valid file can be told from one of ours.
+       * So the backup has to contain a schema: at least one table. (Not
+       * `_yatta_migrations` specifically — a database created by schema
+       * sync that never ran `migrate()` is still a real Yatta database,
+       * and its backup must restore.)
        */
       const tables = testDb
         .query("SELECT name FROM sqlite_master WHERE type = 'table';")
@@ -3895,27 +4135,53 @@ export class YattaDB {
     const tempPath = `${this.path}.restore.${Date.now()}`;
     const rollbackPath = `${this.path}.rollback.${Date.now()}`;
 
+    // Set once the restored file is in place: a failure after that point
+    // (e.g. deleting the rollback copy) must not roll the live database
+    // back to the old file.
+    let swapped = false;
     try {
       fs.copyFileSync(backupPath, tempPath);
 
       this.clearStatementCache();
+      // Checkpoint first so committed transactions are folded from the
+      // WAL into the main file before the connection closes; the WAL
+      // files are then moved alongside the rollback copy, not deleted,
+      // so a failed swap can still restore the live database whole.
+      try {
+        this._sqlite.run("PRAGMA wal_checkpoint(TRUNCATE);");
+      } catch {}
       this._sqlite.close(true);
 
       if (fs.existsSync(this.path)) {
         fs.renameSync(this.path, rollbackPath);
       }
 
-      if (fs.existsSync(`${this.path}-wal`)) fs.unlinkSync(`${this.path}-wal`);
-      if (fs.existsSync(`${this.path}-shm`)) fs.unlinkSync(`${this.path}-shm`);
+      const walPath = `${this.path}-wal`;
+      const shmPath = `${this.path}-shm`;
+      const rollbackWal = `${rollbackPath}-wal`;
+      const rollbackShm = `${rollbackPath}-shm`;
+      if (fs.existsSync(walPath)) fs.renameSync(walPath, rollbackWal);
+      if (fs.existsSync(shmPath)) fs.renameSync(shmPath, rollbackShm);
 
       fs.renameSync(tempPath, this.path);
+      swapped = true;
 
       if (fs.existsSync(rollbackPath)) {
         fs.unlinkSync(rollbackPath);
       }
+      if (fs.existsSync(rollbackWal)) fs.unlinkSync(rollbackWal);
+      if (fs.existsSync(rollbackShm)) fs.unlinkSync(rollbackShm);
     } catch (err: any) {
-      if (fs.existsSync(rollbackPath)) {
+      if (!swapped && fs.existsSync(rollbackPath)) {
         try { fs.renameSync(rollbackPath, this.path); } catch {}
+      }
+      // The rollback is only whole with its WAL: without it, every
+      // committed transaction that lived only in the WAL is silently gone.
+      if (!swapped && fs.existsSync(`${rollbackPath}-wal`)) {
+        try { fs.renameSync(`${rollbackPath}-wal`, `${this.path}-wal`); } catch {}
+      }
+      if (!swapped && fs.existsSync(`${rollbackPath}-shm`)) {
+        try { fs.renameSync(`${rollbackPath}-shm`, `${this.path}-shm`); } catch {}
       }
       if (fs.existsSync(tempPath)) {
         try { fs.unlinkSync(tempPath); } catch {}

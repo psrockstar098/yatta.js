@@ -180,6 +180,56 @@ describe("db:restore", () => {
     expect(safety).toHaveLength(1);
     expect(existsSync(join(dir, "Database", safety[0]!))).toBe(true);
   });
+
+  it("removes stale -wal/-shm sidecars instead of replaying them over the restore", () => {
+    seed(["restore-a@t.dev"]);
+    cmdDbBackup(dir);
+    const backup = readdirSync(join(dir, "backups")).find((f) => f.endsWith(".db"))!;
+
+    // After the backup, write a row and leave it in the WAL (no
+    // checkpoint): those frames belong to the old database. The
+    // connection stays open, as a running server's would — a clean
+    // close checkpoints and removes the -wal, so only a live writer
+    // leaves one behind. Restoring over it without removing the
+    // sidecars would replay the row — or corrupt the file — on the
+    // next open.
+    const live = new Database(dbFile(), { create: true });
+    live.run("PRAGMA journal_mode = WAL");
+    live.run("INSERT INTO users (email) VALUES ('stale-wal@t.dev')");
+    expect(existsSync(dbFile() + "-wal")).toBe(true);
+
+    expect(cmdDbRestore(join("backups", backup), dir)).toBe(0);
+    live.close();
+    expect(existsSync(dbFile() + "-wal")).toBe(false);
+    expect(existsSync(dbFile() + "-shm")).toBe(false);
+
+    const restored = new Database(dbFile(), { readonly: true });
+    const rows = restored.query("SELECT email FROM users ORDER BY email").all();
+    restored.close();
+    expect(rows).toEqual([{ email: "restore-a@t.dev" }]);
+  });
+
+  it("takes the safety backup as a consistent snapshot, not a bare file copy", () => {
+    seed(["precious@t.dev"]);
+    cmdDbBackup(dir);
+    const backup = readdirSync(join(dir, "backups")).find((f) => f.endsWith(".db"))!;
+
+    // A row left uncheckpointed in the WAL when the restore runs: a
+    // bare copy of the main file would lose it.
+    const live = new Database(dbFile(), { create: true });
+    live.run("PRAGMA journal_mode = WAL");
+    live.run("INSERT INTO users (email) VALUES ('in-the-wal@t.dev')");
+    live.close();
+
+    expect(cmdDbRestore(join("backups", backup), dir)).toBe(0);
+
+    const safety = readdirSync(join(dir, "Database")).filter((f) => f.includes("pre-restore"));
+    expect(safety).toHaveLength(1);
+    const snap = new Database(join(dir, "Database", safety[0]!), { readonly: true });
+    const rows = snap.query("SELECT email FROM users ORDER BY email").all() as Array<{ email: string }>;
+    snap.close();
+    expect(rows.map((r) => r.email)).toEqual(["in-the-wal@t.dev", "precious@t.dev"]);
+  });
 });
 
 describe("The backup targets the database the server uses", () => {

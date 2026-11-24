@@ -12,7 +12,7 @@
 // no `-wal` or `-shm` beside it. The file copy remains as a fallback for a database
 // that is not actually SQLite, so the command still produces something to look at.
 
-import { existsSync, mkdirSync, copyFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, statSync, unlinkSync } from "node:fs";
 import { join, basename } from "node:path";
 import { Database } from "bun:sqlite";
 
@@ -134,21 +134,72 @@ export function cmdDbRestore(backupFile: string, projectRoot: string = process.c
     mkdirSync(destDir, { recursive: true });
   }
 
-  // Safety: backup the current database before overwriting
+  // A live server holding the database open would keep writing to the
+  // file we are about to replace, and its -wal frames belong to the old
+  // database. There is no lock to take here, so say so loudly when the
+  // WAL sidecar shows recent writer activity.
+  if (existsSync(dest + "-wal")) {
+    console.log(
+      `  ${c.yellow("!")} ${dest}-wal exists — the server may still be running. ` +
+        `Stop it before restoring, or the restore can be overwritten or corrupted.`,
+    );
+  }
+
+  // Safety: back up the current database before overwriting it, with the
+  // same consistent snapshot `db:backup` uses. The old code copied only
+  // the main file — exactly the torn-copy pattern this file's header
+  // warns about: a WAL-mode database with uncheckpointed frames cannot
+  // be restored from its main file alone.
   if (existsSync(dest)) {
     const safety = dest + `.pre-restore-${Date.now()}.bak`;
-    copyFileSync(dest, safety);
-    console.log(`  ${c.yellow("Current database backed up to:")} ${c.dim(safety)}`);
+    try {
+      const db = new Database(dest, { create: true });
+      try {
+        // Merge any uncheckpointed WAL frames into the main file first,
+        // so the snapshot below is complete even if the server died
+        // mid-write.
+        try {
+          db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+        } catch {
+          // Not a WAL database, or not actually SQLite — VACUUM INTO
+          // below will fail and the copy fallback takes over.
+        }
+        db.run("VACUUM INTO ?", [safety]);
+      } finally {
+        db.close();
+      }
+      console.log(`  ${c.yellow("Current database backed up to:")} ${c.dim(safety)}`);
+    } catch (error) {
+      copyFileSync(dest, safety);
+      console.log(`  ${c.yellow("Current database backed up to:")} ${c.dim(safety)}`);
+      console.log(
+        `  ${c.yellow("!")} Safety backup is a plain copy, not a consistent snapshot: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  // Stale sidecars belong to the database being replaced. In WAL mode
+  // SQLite replays them over the restored file on next open — wrong data
+  // or "database disk image is malformed". The backup itself is a
+  // self-contained VACUUM INTO file with no sidecars, so the backup's
+  // -wal/-shm (if any) are never copied over either.
+  for (const ext of ["-wal", "-shm"]) {
+    const sidecar = dest + ext;
+    if (existsSync(sidecar)) {
+      try {
+        unlinkSync(sidecar);
+      } catch {
+        // Best effort only: unlink failing here is rare (permissions),
+        // and the copy below still proceeds — the stale frames are the
+        // risk, so a failure to remove them is worth a loud note, not
+        // a silent pass.
+        console.log(`  ${c.yellow("!")} Could not remove stale ${sidecar} — check it before starting the server.`);
+      }
+    }
   }
 
   copyFileSync(src, dest);
-  // Copy WAL/SHM if present in backup
-  for (const ext of ["-wal", "-shm"]) {
-    const walSrc = src + ext;
-    if (existsSync(walSrc)) {
-      copyFileSync(walSrc, dest + ext);
-    }
-  }
 
   console.log(`  ${c.green("✓")} Restored from: ${c.dim(backupFile)}`);
   return 0;

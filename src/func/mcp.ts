@@ -441,7 +441,10 @@ function errorResult(message: string) {
 export function createMCPHandler(options: McpOptions) {
   const path = (options.path ?? "/mcp").replace(/\/+$/, "") || "/";
   const serverName = options.serverName ?? "yatta";
-  const serverVersion = options.serverVersion ?? "1.0.5";
+  // Fallback only: the default router passes the package version, so
+  // this should never be what a client sees. Kept in sync with the
+  // package on release; a stale literal here was the 1.0.5 bug.
+  const serverVersion = options.serverVersion ?? "1.0.6";
 
   async function loadTools(): Promise<Map<string, ToolDef>> {
     const surface = await options.getSurface();

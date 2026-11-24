@@ -60,7 +60,12 @@ function decodeSegment(value: string): string {
   }
 }
 
-/** Matches a pathname against one Next.js-style pattern, or null. */
+/** Matches a pathname against one Next.js-style pattern, or null.
+ *
+ * `pathSegs` arrive already decoded exactly once (see manifestRouter):
+ * decoding here as well turned `%252F` into `/` and let one segment
+ * smuggle a path separator into a param.
+ */
 function matchStandalonePattern(
   pattern: string,
   pathSegs: string[],
@@ -73,12 +78,12 @@ function matchStandalonePattern(
     if (seg.startsWith("[...") && seg.endsWith("]")) {
       // Catch-all: takes the rest of the path (at least one segment).
       if (j >= pathSegs.length) return null;
-      params[seg.slice(4, -1)] = pathSegs.slice(j).map(decodeSegment).join("/");
+      params[seg.slice(4, -1)] = pathSegs.slice(j).join("/");
       return params;
     }
     if (seg.startsWith("[") && seg.endsWith("]")) {
       if (j >= pathSegs.length) return null;
-      params[seg.slice(1, -1)] = decodeSegment(pathSegs[j]!);
+      params[seg.slice(1, -1)] = pathSegs[j]!;
       j++;
       continue;
     }
@@ -97,13 +102,12 @@ function manifestRouter(routes: StandaloneRoute[]): FileRouterLike {
   return {
     match(req: Request | string): StandaloneRouteMatch | null {
       const raw = typeof req === "string" ? req : new URL(req.url).pathname;
-      let pathname: string;
-      try {
-        pathname = decodeURIComponent(raw);
-      } catch {
-        pathname = raw;
-      }
-      const clean = pathname === "/" ? "/" : pathname.replace(/\/+$/, "");
+      // Decode each segment exactly once. The old code decoded the whole
+      // pathname here and then decoded every param again in
+      // matchStandalonePattern, so `%252F` in a param became `/`.
+      const rawSegs = raw.split("/").filter(Boolean);
+      const decodedSegs = rawSegs.map(decodeSegment);
+      const clean = decodedSegs.length === 0 ? "/" : `/${decodedSegs.join("/")}`;
       for (const route of routes) {
         if (route.pattern === clean) {
           return {
@@ -115,7 +119,7 @@ function manifestRouter(routes: StandaloneRoute[]): FileRouterLike {
           };
         }
       }
-      const pathSegs = clean.split("/").filter(Boolean);
+      const pathSegs = decodedSegs;
       let best: {
         route: StandaloneRoute;
         params: Record<string, string>;

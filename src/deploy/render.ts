@@ -33,7 +33,7 @@ import type {
   StorageCapabilities,
   ValidationResult,
 } from "./types";
-import { DEPLOY_TEMPLATE_VERSION } from "./types";
+import { DEPLOY_TEMPLATE_VERSION, yamlQuote } from "./types";
 
 /** Disk names stay in [a-zA-Z0-9_-]; the service name keeps the app name as-is. */
 function diskName(project: ProjectInfo): string {
@@ -65,7 +65,7 @@ function blueprint(project: ProjectInfo): string {
     "",
     "services:",
     "  - type: web",
-    `    name: ${project.name}`,
+    `    name: ${yamlQuote(project.name)}`,
     "    runtime: node",
     "    buildCommand: bun install",
     `    startCommand: bun ${project.entry}`,
@@ -102,7 +102,7 @@ function workflow(manifest: DeployManifest): string {
     "",
     "on:",
     "  push:",
-    `    branches: [${manifest.deployment.branch}]`,
+    `    branches: [${yamlQuote(manifest.deployment.branch)}]`,
     "",
     "permissions:",
     "  contents: read",

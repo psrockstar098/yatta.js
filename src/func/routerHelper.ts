@@ -1,6 +1,7 @@
 import type { Server } from "bun";
+import { readFileSync } from "node:fs";
 import path from "node:path";
-import { API } from "../types/api";
+import { API, Context, throttledReload } from "../types/api";
 import { realtime } from "./realtime";
 import { storage } from "./storage";
 import { createWebDAVHandler, createStorageDavStore } from "./webdav";
@@ -8,6 +9,7 @@ import { createGrpcWebHandler } from "./grpcweb";
 import { createDoHHandler } from "./doh";
 import { createOAuthServer, clientsFromEnv } from "./oauth";
 import { createOIDC } from "./oidc";
+import { oauthTokenRateLimit } from "./ratelimit";
 import {
   createFileRouter,
   loadRouteModule,
@@ -24,10 +26,10 @@ const webdavHandler = createWebDAVHandler(createStorageDavStore(storage.disk()),
 // gRPC-Web services, shared across requests.
 const grpcWebHandler = createGrpcWebHandler();
 
-// DNS over HTTPS (1.0.5) on /dns-query.
+// DNS over HTTPS (1.0.6) on /dns-query.
 const dohHandler = createDoHHandler();
 
-// OAuth 2.0 + OpenID Connect (1.0.5), shared across requests.
+// OAuth 2.0 + OpenID Connect (1.0.6), shared across requests.
 // Clients come from OAUTH_CLIENTS (JSON) when set; more can be
 // registered in code. The auth engine is loaded lazily inside the
 // callbacks so importing this router never pulls the DB in early.
@@ -51,6 +53,52 @@ const oidc = createOIDC({
   },
 });
 oauthServer.setIdTokenIssuer(oidc.issueIdToken);
+
+// The package version, for the MCP server info: read from package.json
+// instead of a hardcoded string that goes stale on every release (the
+// MCP endpoint reported 1.0.5 while the package was 1.0.6).
+function pkgVersion(): string {
+  try {
+    const parsed = JSON.parse(readFileSync(path.join(import.meta.dir, "../package.json"), "utf8")) as {
+      version?: unknown;
+    };
+    return typeof parsed.version === "string" ? parsed.version : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+// The OAuth token endpoint has no rate limiting of its own, and the
+// limiter is a Context middleware — this router is a plain handler, so
+// it is invoked here with a fresh Context per request. One shared
+// instance: buckets are keyed per route, so /oauth/token and
+// /oauth/revoke get separate budgets from the same limiter. 5 requests
+// per minute per IP, the `oauthTokenRateLimit()` preset.
+const oauthTokenLimiter = oauthTokenRateLimit();
+async function withOAuthTokenLimit(
+  req: Request,
+  next: () => Promise<Response>,
+): Promise<Response> {
+  let downstream: Response | undefined;
+  const result = await oauthTokenLimiter(new Context(req, {}), async () => {
+    downstream = await next();
+    return downstream;
+  });
+  if (result instanceof Response) return result;
+  if (downstream) return downstream;
+  return new Response("Internal Server Error", { status: 500 });
+}
+
+// WebFinger answers account-existence questions, so it is scoped to the
+// app's own host: without `hosts`, anyone could test whether ANY email
+// address, at any domain, has an account here.
+function webFingerHosts(): string[] {
+  try {
+    return [new URL(process.env.APP_URL || "http://localhost:4000").hostname.toLowerCase()];
+  } catch {
+    return ["localhost"];
+  }
+}
 
 // Always resolve relative to this file to guarantee correct path regardless of current working directory
 const backendDir = path.resolve(import.meta.dir, "../backend");
@@ -154,22 +202,22 @@ export default async function routers(
     return withSecurityHeaders(res, isHttps);
   }
 
-  // 2b. WebDAV file operations (1.0.5), backed by the storage engine.
+  // 2b. WebDAV file operations (1.0.6), backed by the storage engine.
   if (url.pathname === "/dav" || url.pathname.startsWith("/dav/")) {
     return withSecurityHeaders(await webdavHandler(req), isHttps);
   }
 
-  // 2c. gRPC-Web unary calls (1.0.5).
+  // 2c. gRPC-Web unary calls (1.0.6).
   if (url.pathname === "/grpc-web" || url.pathname.startsWith("/grpc-web/")) {
     return withSecurityHeaders(await grpcWebHandler(req), isHttps);
   }
 
-  // 2d. DNS over HTTPS (1.0.5).
+  // 2d. DNS over HTTPS (1.0.6).
   if (url.pathname === "/dns-query") {
     return withSecurityHeaders(await dohHandler(req), isHttps);
   }
 
-  // 2e. WebFinger discovery (1.0.5), backed by the auth store.
+  // 2e. WebFinger discovery (1.0.6), backed by the auth store.
   if (url.pathname === "/.well-known/webfinger") {
     const { createWebFingerHandler, createUserWebFingerLookup } = await import(
       "./webfinger"
@@ -179,20 +227,27 @@ export default async function routers(
       createUserWebFingerLookup({
         findUserByEmail: (email) => new SQLiteAuthStore().findUserByEmail(email),
         appUrl: process.env.APP_URL || "http://localhost:4000",
+        hosts: webFingerHosts(),
       }),
     );
     return withSecurityHeaders(await handler(req), isHttps);
   }
 
-  // 2f. OAuth 2.0 + OpenID Connect (1.0.5).
+  // 2f. OAuth 2.0 + OpenID Connect (1.0.6).
   if (url.pathname === "/oauth/authorize") {
     return withSecurityHeaders(await oauthServer.handleAuthorize(req), isHttps);
   }
   if (url.pathname === "/oauth/token") {
-    return withSecurityHeaders(await oauthServer.handleToken(req), isHttps);
+    return withSecurityHeaders(
+      await withOAuthTokenLimit(req, () => oauthServer.handleToken(req)),
+      isHttps,
+    );
   }
   if (url.pathname === "/oauth/revoke") {
-    return withSecurityHeaders(await oauthServer.handleRevoke(req), isHttps);
+    return withSecurityHeaders(
+      await withOAuthTokenLimit(req, () => oauthServer.handleRevoke(req)),
+      isHttps,
+    );
   }
   if (url.pathname === "/oauth/userinfo") {
     return withSecurityHeaders(await oidc.handleUserinfo(req), isHttps);
@@ -204,7 +259,7 @@ export default async function routers(
     return withSecurityHeaders(oidc.handleDiscovery(), isHttps);
   }
 
-  // 2g. MCP server (1.0.5): every app serves /mcp, on by default.
+  // 2g. MCP server (1.0.6): every app serves /mcp, on by default.
   // One line turns it off: MCP_ENABLED=0. Tools come from the app's
   // own database collections (auth tables are never exposed); the
   // caller must be signed in with a Yatta session or an OAuth token
@@ -213,6 +268,7 @@ export default async function routers(
     const { createMCPHandler, surfaceFromTables } = await import("./mcp");
     const { db } = await import("./db");
     const handler = createMCPHandler({
+      serverVersion: pkgVersion(),
       resolveUser: async (req) => {
         const { auth } = await import("./auth");
         const user = await auth.getUser(req);
@@ -239,9 +295,11 @@ export default async function routers(
     return withSecurityHeaders(await handler(req), isHttps);
   }
 
-  // 3. Hot-reload routes in development mode so new files (e.g. user/index.ts) are instantly detected
+  // 3. Hot-reload routes in development mode so new files (e.g. user/index.ts) are instantly detected.
+  // Throttled, not per-request: a full directory scan on every dev request
+  // cost ~200µs on top of a ~5µs dispatch.
   if (process.env.NODE_ENV !== "production") {
-    router.reload();
+    throttledReload(router);
   }
 
   // 4. Match Next.js style file-based API routes

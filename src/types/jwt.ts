@@ -120,6 +120,9 @@ const MISSING_BEARER = "missing bearer token";
 const INVALID_OR_EXPIRED = "invalid or expired token";
 const INVALID_PAYLOAD = "invalid token payload";
 
+/** base64url of `{"alg":"HS256","typ":"JWT"}` — the exact header the framework's own minter emits. */
+const CANONICAL_HEADER_B64 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+
 /**
  * Create a fast HS256 verifier for `secret`.
  *
@@ -148,20 +151,29 @@ export function createJwtVerifier(secret: string): JwtVerifier {
     // Header first: the algorithm gate must hold before any HMAC work,
     // and a malformed header fails here with the same string the
     // reference reports when its joint header+payload parse throws.
-    let headerObj: unknown;
-    try {
-      headerObj = JSON.parse(
-        Buffer.from(headerB64, "base64url").toString("utf8"),
-      );
-    } catch {
-      return { ok: false, error: INVALID_OR_EXPIRED };
-    }
-    if (
-      typeof headerObj !== "object" ||
-      headerObj === null ||
-      (headerObj as { alg?: unknown }).alg !== "HS256"
-    ) {
-      return { ok: false, error: INVALID_OR_EXPIRED };
+    //
+    // Fast path: the framework's own minter emits exactly
+    // `{"alg":"HS256","typ":"JWT"}` (see auth.ts), whose base64url form
+    // is constant. Comparing the segment skips a base64url decode and a
+    // JSON.parse per verification. Anything else falls through to the
+    // parse below, so other spellings (different key order, extra
+    // fields) keep working.
+    if (headerB64 !== CANONICAL_HEADER_B64) {
+      let headerObj: unknown;
+      try {
+        headerObj = JSON.parse(
+          Buffer.from(headerB64, "base64url").toString("utf8"),
+        );
+      } catch {
+        return { ok: false, error: INVALID_OR_EXPIRED };
+      }
+      if (
+        typeof headerObj !== "object" ||
+        headerObj === null ||
+        (headerObj as { alg?: unknown }).alg !== "HS256"
+      ) {
+        return { ok: false, error: INVALID_OR_EXPIRED };
+      }
     }
 
     // Signature before payload: a forged token never pays for a

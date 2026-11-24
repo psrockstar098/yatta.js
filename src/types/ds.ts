@@ -366,6 +366,45 @@ function isTypedField(t: FieldType): boolean {
   return t in typedArrayCtor;
 }
 
+/*
+ * Valid range per typed field, as [min, max] (inclusive) plus whether
+ * the field holds only integers. Typed-array assignment silently wraps
+ * or clamps out-of-range values (u32 -1 became 4294967295, NaN became
+ * 0), so append()/set() validate before storing. Non-numeric fields
+ * pass through untouched.
+ */
+const TYPED_RANGES: Record<string, { min: number; max: number; integer: boolean }> = {
+  u8: { min: 0, max: 255, integer: true },
+  u16: { min: 0, max: 65535, integer: true },
+  u32: { min: 0, max: 4294967295, integer: true },
+  i8: { min: -128, max: 127, integer: true },
+  i16: { min: -32768, max: 32767, integer: true },
+  i32: { min: -2147483648, max: 2147483647, integer: true },
+  f32: { min: -3.4028234663852886e38, max: 3.4028234663852886e38, integer: false },
+  f64: { min: -Infinity, max: Infinity, integer: false },
+};
+
+function validateTypedValue(t: FieldType, v: unknown, name: string): unknown {
+  if (!isTypedField(t)) return v;
+  const range = TYPED_RANGES[t]!;
+  if (typeof v !== "number" || !Number.isFinite(v)) {
+    throw new TypeError(
+      `ColumnStore field "${name}" (${t}) needs a finite number, got ${typeof v === "number" ? String(v) : typeof v}.`,
+    );
+  }
+  if (range.integer && !Number.isInteger(v)) {
+    throw new RangeError(
+      `ColumnStore field "${name}" (${t}) needs an integer, got ${v}.`,
+    );
+  }
+  if (v < range.min || v > range.max) {
+    throw new RangeError(
+      `ColumnStore field "${name}" (${t}) is out of range: ${v} is outside [${range.min}, ${range.max}].`,
+    );
+  }
+  return v;
+}
+
 function growTyped(old: any, next: number): any {
   const ctor = (old as any).constructor as new (n: number) => any;
   const fresh = new ctor(next);
@@ -443,7 +482,9 @@ export class ColumnStore<S extends FieldSchema> {
       const t = this.schema[name]!;
       const v = (row as any)[name];
       this.columns[name][i] =
-        v === undefined ? (isTypedField(t) ? 0 : undefined) : v;
+        v === undefined
+          ? (isTypedField(t) ? 0 : undefined)
+          : validateTypedValue(t, v, name);
     }
     this._len++;
   }
@@ -460,8 +501,9 @@ export class ColumnStore<S extends FieldSchema> {
   set(i: number, row: Partial<RowOf<S>>): void {
     this.checkIndex(i);
     for (const name of this.fieldNames) {
+      const t = this.schema[name]!;
       const v = (row as any)[name];
-      if (v !== undefined) this.columns[name][i] = v;
+      if (v !== undefined) this.columns[name][i] = validateTypedValue(t, v, name);
     }
   }
 
@@ -491,8 +533,9 @@ export class ColumnStore<S extends FieldSchema> {
 
   /**
    * A live view of one column over the used rows. Numeric fields return a
-   * typed-array subarray (zero-copy); string/any fields return the backing
-   * array sliced to length. Mutating the view mutates the list.
+   * typed-array subarray (zero-copy), so mutating the view mutates the
+   * list; string/any fields return a copy (slice), so mutating the
+   * returned array does NOT affect the list.
    */
   field<K extends keyof S & string>(
     name: K,
@@ -620,6 +663,8 @@ export class TaskGroup {
       // Without this, a cancelled group still executed queued tasks as
       // slots freed.
       if (this.groupController.signal.aborted) {
+        this.groupController.signal.removeEventListener("abort", onGroupAbort);
+        this.controllers.delete(controller);
         reject(this.cancelled ?? new Error("TaskGroup cancelled"));
         (task as any).done = true;
         this.running--;
@@ -634,6 +679,10 @@ export class TaskGroup {
           (e) => reject(e),
         )
         .finally(() => {
+          // The abort listener was added per spawned task and never
+          // removed when the task finished: listeners accumulated until
+          // cancel(). Remove it here (a no-op when it already fired).
+          this.groupController.signal.removeEventListener("abort", onGroupAbort);
           this.controllers.delete(controller);
           (task as any).done = true;
           this.running--;
@@ -735,6 +784,8 @@ export class Batch {
   private readonly concurrency: number;
   private readonly timeoutMs?: number;
   private readonly signal?: AbortSignal;
+  /** Guards against concurrent run() calls executing each op twice. */
+  private running = false;
 
   constructor(options: BatchOptions = {}) {
     this.concurrency = options.concurrency ?? Infinity;
@@ -806,6 +857,21 @@ export class Batch {
    * the queue.
    */
   async run(options?: { throwOnError?: boolean }): Promise<BatchResult[]> {
+    // Two concurrent run() calls shared the ops array and executed each
+    // op twice. A batch runs one at a time; re-run it after the first
+    // call settles.
+    if (this.running) {
+      throw new Error("Batch is already running: await the in-flight run() first.");
+    }
+    this.running = true;
+    try {
+      return await this.runInner(options);
+    } finally {
+      this.running = false;
+    }
+  }
+
+  private async runInner(options?: { throwOnError?: boolean }): Promise<BatchResult[]> {
     const results: BatchResult[] = new Array(this.ops.length);
     if (this.signal?.aborted) {
       throw this.signal.reason ?? new Error("Batch aborted before run");

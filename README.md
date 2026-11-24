@@ -118,13 +118,13 @@ persistent stores, and supports TypeScript module augmentation for typed keys.
 |--------|--------------|
 | `yatta/api` | Unified API: router with onion middleware, typed params, schema validation (Zod/Valibot/ArkType), CORS, cookies, streaming, typed client, universal routes (define once, call directly or over HTTP), path utilities, DataLoader batching |
 | `yatta/db` | `bun:sqlite` ORM — column builder, relations, transactions with savepoints, pagination, cursor pagination, schema sync, backup/restore |
-| `yatta/auth` | Argon2id, rotating access/refresh JWTs, AES-256-GCM sessions, TOTP 2FA, WebAuthn passkeys, hashed API keys, RBAC, rate-limit lockouts |
+| `yatta/auth` | Argon2id, rotating access/refresh JWTs, AES-256-GCM sessions, TOTP 2FA (one code, one use — replays are refused, including racing requests; enrolment needs a recently authenticated session, so pass the request to `mfa.beginSetup`/`confirmSetup`), WebAuthn passkeys, hashed API keys, RBAC, rate-limit lockouts |
 | `yatta/jwt` | Fast stateless HS256 verification — `Bun.CryptoHasher` HMAC, no caching, reference-compatible error strings |
 | `yatta/jobs` | Job queue, worker pools, cron (Vixie semantics, tz-aware), event bus, atomic leases, DLQ, backoff + jitter |
 | `yatta/cache` | L1 LRU + SQLite L2, singleflight, stale-while-revalidate, tag invalidation; plus an O(1) priority queue |
 | `yatta/storage` | Local + S3 drivers, RFC 9110 range streaming, magic-byte inspection, HMAC signed URLs |
 | `yatta/mail` | SMTP/Resend/Postmark/SendGrid/SES/Gmail, layouts, pipe templating, md→html, RFC 8058 unsubscribe |
-| `yatta/realtime` | Unified SSE + WebSocket, topic pub/sub, AI token streaming, job tracking, backpressure |
+| `yatta/realtime` | Unified SSE + WebSocket, topic pub/sub, AI token streaming, job tracking, backpressure. The scaffolded `/realtime` endpoint requires a signed-in Yatta session — unauthenticated WebSocket and SSE connections are refused. |
 | `yatta/observe` | Tracing, metrics, logs, issue grouping, incident correlation, adaptive baselines, SLOs, N+1 detection, golden traces |
 | `yatta/otel` | OpenTelemetry bridge — Yatta spans flow to any OTel backend (Jaeger, Tempo, Datadog) |
 
@@ -161,6 +161,12 @@ authentication** of its own: pass `authenticate`, or keep it behind the auth
 wall you already run. WebDAV locks live in the process, so they are not shared
 between nodes and do not survive a restart. OAuth and OIDC state is in memory by
 default for the same reason.
+
+Two defaults worth knowing as well. `/oauth/token` (and `/oauth/revoke`) are
+rate-limited to 5 requests per minute per IP in the default wiring
+(`oauthTokenRateLimit()`), and WebFinger only answers for the app's own host
+(derived from `APP_URL`) — without that scope it would answer
+account-existence questions for any domain.
 
 ### Typed keys
 
@@ -438,6 +444,36 @@ not worker #.
 
 ## Reliability guarantees
 
+Subsystem graphs never see the host's full environment: each graph gets an
+allowlist of non-secret variables plus exactly the `env` its subsystem
+definition passes. The framework's own subsystems get the validated config
+(`STORAGE_SECRET`, `AUTH_SECRET`, `DATABASE_URL`, `APP_URL`, S3 credentials,
+`CLUSTER_WORKER_ID`) from `main.ts` — anything else a subsystem reads from
+`process.env` is invisible inside the graph, by design.
+
+`db.migrate()` holds a write lock (`BEGIN IMMEDIATE`) across all migrations,
+so two processes migrating at once cannot double-apply one; the loser waits
+on `busy_timeout`, then fails loudly. `db.restore()` only accepts a backup holding at least one table (an empty
+SQLite file is rejected), checkpoints the WAL before the swap, and keeps
+the rollback copy (with its WAL) until the swap succeeds.
+
+Strict inputs fail fast instead of failing silently: `findMany({ select })`
+rejects unknown columns, `duration()` and `parseSize()` throw on NaN,
+negative, or unparseable values, a timeseries `deleteRaw` is only allowed
+on the coarsest tier, `defineSubsystem` rejects `replicas < 1`, and a
+`Batch` rejects a concurrent `run()`. An outbox publish that times out
+counts as a failed attempt (and retries with backoff); if the slow publish
+later succeeds, the row is still marked published, so it is not delivered
+twice. Edge-cache purges are fire-and-forget: local invalidation returns
+immediately and the purge runs in the background.
+
+Full-text search verifies each table's index counts once per process open
+instead of on every search, and caches the typo-correction vocabulary
+(invalidated on every index write) — searches on a 5k-row table went from
+~1.3 ms to ~0.1 ms, and typo-corrected searches from ~7.9 ms to ~0.13 ms.
+Inserts into searchable tables skip the full-scan FTS delete for the fresh
+row, so insert cost stays flat as the table grows.
+
 ## Verifying a change
 
 A local `bun run check` says nothing about what GitHub Actions did with your push, and
@@ -528,6 +564,12 @@ GitHub workflow that builds to GHCR and deploys with
 `yatta deploy providers` lists the four platforms, `yatta deploy config`
 shows the saved configuration, `yatta deploy status` shows the current
 state, and `yatta deploy doctor` checks the setup. Fly is not supported.
+`--registry` only applies to `--platform docker`; on any other platform it
+warns and is ignored. A hand-edited `.yatta/deploy.json` that is incomplete
+or corrupt is reported as such by `status`, `config`, and `doctor` instead
+of crashing. And `yatta new .` refuses to scaffold over an existing
+`package.json`, `tsconfig.json`, or `yatta/main.ts` rather than overwriting
+them.
 
 The image runs non-root and ships a `HEALTHCHECK` wired to `/healthz`. Mount
 `Database/` and `storage/uploads` as volumes to persist data.

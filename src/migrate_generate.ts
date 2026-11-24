@@ -180,17 +180,55 @@ function readLiveTable(db: Database, table: string, sql: string | null): LiveTab
   };
 }
 
-/** Pull a CHECK("col" IN (...)) list out of stored CREATE TABLE text. */
-function parseCheckValues(sql: string | null, column: string): readonly string[] | null {
+/** Pull a CHECK("col" IN (...)) list out of stored CREATE TABLE text. Exported for tests. */
+export function parseCheckValues(sql: string | null, column: string): readonly string[] | null {
   if (!sql) return null;
   const escaped = column.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = sql.match(new RegExp(`CHECK\\s*\\(\\s*"${escaped}"\\s+IN\\s*\\(([^)]*)\\)\\s*\\)`, "i"));
-  if (!match) return null;
+  // Find the opening paren of the IN list, then scan to its match by
+  // hand: `[^)]*` stopped at the first `)` even inside a quoted value,
+  // so CHECK("status" IN ('a)b','c')) misread and every generate
+  // reported a phantom changed column. The scan tracks quoted strings
+  // (with '' escapes) and paren depth, so a `)` inside a value is data.
+  const open = sql.match(new RegExp(`CHECK\\s*\\(\\s*"${escaped}"\\s+IN\\s*\\(`, "i"));
+  if (!open || open.index === undefined) return null;
+  let i = open.index + open[0].length;
+  let depth = 1;
+  let inQuote = false;
+  let inner = "";
+  for (; i < sql.length; i++) {
+    const ch = sql[i]!;
+    if (inQuote) {
+      inner += ch;
+      if (ch === "'") {
+        if (sql[i + 1] === "'") {
+          inner += sql[i + 1];
+          i++;
+        } else {
+          inQuote = false;
+        }
+      }
+      continue;
+    }
+    if (ch === "'") {
+      inQuote = true;
+      inner += ch;
+    } else if (ch === "(") {
+      depth++;
+      inner += ch;
+    } else if (ch === ")") {
+      depth--;
+      if (depth === 0) break;
+      inner += ch;
+    } else {
+      inner += ch;
+    }
+  }
+  if (depth !== 0) return null;
   // Tokenise quoted strings rather than splitting on commas: a value may
   // itself contain a comma or a parenthesis, and a naive split would then
   // misread the list and report a phantom change on every run.
   const values: string[] = [];
-  const tokens = match[1]!.match(/'([^']|'')*'/g);
+  const tokens = inner.match(/'([^']|'')*'/g);
   if (!tokens) return null;
   for (const token of tokens) {
     values.push(token.slice(1, -1).replace(/''/g, "'"));
@@ -805,23 +843,36 @@ export function migrationFileName(name: string): { filename: string; migrationNa
 function renderBody(statements: string[], asyncBody: boolean): string {
   const runs = statements
     .filter((s) => !s.startsWith("-- NOTE"))
-    .map((s) => `    db.run(\`${s.replace(/`/g, "\\`").replace(/\$/g, "\\$")}\`);`)
+    // Backslashes first: a default like 'C:\new' would otherwise become
+    // a real newline inside the SQL string when the generated file is
+    // imported — a silent definition change. Then backticks and `${`.
+    .map((s) => `    db.run(\`${s.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$/g, "\\$")}\`);`)
     .join("\n");
   const notes = statements.filter((s) => s.startsWith("-- NOTE")).map((s) => `    // ${s.slice(3).trim()}`);
   const body = [...notes, runs].filter(Boolean).join("\n");
   if (!asyncBody) return body || "    // No statements.";
   // Async so foreign keys can be switched off outside the runner's
-  // transaction; the runner does not wrap an async `up` in one.
+  // transaction. When migrate() already holds its cross-process write
+  // lock, the migration runs inside that transaction instead: a second
+  // BEGIN IMMEDIATE would throw "cannot start a transaction within a
+  // transaction", and a COMMIT/ROLLBACK here would end the runner's
+  // transaction early. migrate() switches foreign keys off before
+  // opening its transaction, so the pragma here is redundant but
+  // harmless in that case — and it is what keeps the migration safe
+  // when run standalone.
   return [
     "    db.run(`PRAGMA foreign_keys = OFF;`);",
     "    try {",
-    "      db.run(`BEGIN IMMEDIATE;`);",
+    "      const __yattaInTx = db.inTransaction === true;",
+    "      if (!__yattaInTx) db.run(`BEGIN IMMEDIATE;`);",
     "      try {",
     ...body.split("\n").map((line) => `        ${line}`),
-    "        db.run(`COMMIT;`);",
+    "        if (!__yattaInTx) db.run(`COMMIT;`);",
     "      } catch (err) {",
-    "        try { db.run(`ROLLBACK;`); } catch {",
-    "          // Already rolled back by SQLite.",
+    "        if (!__yattaInTx) {",
+    "          try { db.run(`ROLLBACK;`); } catch {",
+    "            // Already rolled back by SQLite.",
+    "          }",
     "        }",
     "        throw err;",
     "      }",
@@ -843,7 +894,7 @@ export function renderMigrationFile(
   // developer's own models, but a generated file must never be an injection
   // vector for them, so control characters are stripped from header text.
   // (Statement text is different: it travels inside template literals with
-  // backticks and `${` escaped, and identifiers are always quoted.)
+  // backslashes, backticks and `${` escaped, and identifiers are always quoted.)
   const clean = (line: string): string => line.replace(/[\r\n\x00-\x1f\x7f]/g, " ");
   const header: string[] = [
     `// Migration: ${migrationName}`,

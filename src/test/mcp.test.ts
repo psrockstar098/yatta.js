@@ -294,3 +294,36 @@ describe("MCP server", () => {
     expect(names).toContain("list_a_b");
   });
 });
+
+describe("MCP server version", () => {
+  async function initVersion(options: { serverVersion?: string } = {}) {
+    const { table } = memoryTable();
+    const handler = createMCPHandler({
+      ...options,
+      resolveUser: async () => "user-1",
+      getSurface: () => surfaceFromTables({ posts: table }),
+    });
+    const res = await post(handler, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } },
+    });
+    const json = (await res.json()) as {
+      result: { serverInfo: { name: string; version: string } };
+    };
+    return json.result.serverInfo;
+  }
+
+  it("reports the serverVersion it was given", async () => {
+    expect(await initVersion({ serverVersion: "9.9.9" })).toEqual({ name: "yatta", version: "9.9.9" });
+  });
+
+  it("defaults to the package version, not a stale literal", async () => {
+    const { readFileSync } = await import("node:fs");
+    const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
+      version: string;
+    };
+    expect((await initVersion()).version).toBe(pkg.version);
+  });
+});

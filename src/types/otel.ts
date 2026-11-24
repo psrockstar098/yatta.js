@@ -12,8 +12,10 @@
 //   enableOpenTelemetry({ tracerName: "my-service", version: "1.0.0" });
 //
 // The bridge is zero-config when the OTel SDK is set up: Yatta spans
-// automatically become OTel spans with the same trace/span IDs, so
-// distributed traces work across Yatta and non-Yatta services.
+// become OTel spans under the same trace ID, so distributed traces work
+// across Yatta and non-Yatta services. The OTel span keeps its own
+// SDK-generated span ID (the public OTel API cannot force a span ID) and
+// is created as a child of the Yatta span's context.
 
 import { trace, context, SpanStatusCode, SpanKind as OtelSpanKind } from "@opentelemetry/api";
 import type { Span as OtelSpan, Tracer } from "@opentelemetry/api";
@@ -115,15 +117,27 @@ function installSpanBridge(): void {
 function bridgeSpanToOtel(yattaSpan: Span): void {
   if (!otelTracer) return;
 
+  // Parent the OTel span under the Yatta span's context so the trace ID
+  // is preserved across the bridge. The OTel span itself gets a fresh
+  // SDK-generated span ID; the Yatta span ID is kept as an attribute.
+  const parentCtx = trace.setSpanContext(context.active(), {
+    traceId: yattaSpan.traceId,
+    spanId: yattaSpan.spanId,
+    traceFlags: yattaSpan.sampled ? 1 : 0,
+    isRemote: false,
+  });
+
   const otelSpan = otelTracer.startSpan(
     yattaSpan.name,
     {
       kind: toOtelKind(yattaSpan.kind),
       startTime: yattaSpan.startTime,
-      attributes: flattenAttributes(yattaSpan.attributes),
+      attributes: {
+        ...flattenAttributes(yattaSpan.attributes),
+        "yatta.span_id": yattaSpan.spanId,
+      },
     },
-    // Use the Yatta span's trace context for continuity
-    undefined,
+    parentCtx,
   );
 
   // Add events

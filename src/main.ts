@@ -52,46 +52,84 @@ export const runtime = createRuntime({
   taskTimeoutMs: 30_000,
 });
 
+/*
+ * Env the framework's own subsystems need, passed explicitly across the
+ * tenant boundary. `doMount` only forwards an allowlist of non-secret
+ * vars plus each subsystem's own `env` — the host's full process.env
+ * never crosses it (tenant isolation). So the deployer — this file —
+ * must name exactly what a subsystem may see. Anything not listed here
+ * is invisible inside a subsystem graph, and adding a key here is a
+ * deliberate decision, not an accident of spreading process.env.
+ * (Without this, production boot failed: the mounted auth subsystem
+ * re-validates its env and could not see STORAGE_SECRET/AUTH_SECRET.)
+ */
+const subsystemEnv: Record<string, string> = {};
+for (const [key, value] of Object.entries({
+  NODE_ENV: env.NODE_ENV,
+  PORT: String(env.PORT),
+  STORAGE_SECRET: env.STORAGE_SECRET,
+  AUTH_SECRET: process.env.AUTH_SECRET,
+  DATABASE_URL: env.DATABASE_URL,
+  DATABASE_PATH: process.env.DATABASE_PATH,
+  APP_URL: process.env.APP_URL,
+  RP_ID: process.env.RP_ID,
+  S3_BUCKET: process.env.S3_BUCKET,
+  S3_ENDPOINT: process.env.S3_ENDPOINT,
+  AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+  AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+  CLUSTER_WORKER_ID: process.env.CLUSTER_WORKER_ID,
+})) {
+  if (value !== undefined) subsystemEnv[key] = value;
+}
+
 const subsystems = [
   defineSubsystem({
     name: "auth",
     entrypoint: new URL("./func/auth.ts", import.meta.url),
     workload: "cpu",
+    env: subsystemEnv,
   }),
   defineSubsystem({
     name: "jobs",
     entrypoint: new URL("./func/jobs.ts", import.meta.url),
     workload: "cpu",
+    env: subsystemEnv,
   }),
   defineSubsystem({
     name: "db",
     entrypoint: new URL("./func/db.ts", import.meta.url),
     workload: "io",
+    env: subsystemEnv,
   }),
   defineSubsystem({
     name: "cache",
     entrypoint: new URL("./func/cache.ts", import.meta.url),
     workload: "io",
+    env: subsystemEnv,
   }),
   defineSubsystem({
     name: "mail",
     entrypoint: new URL("./func/mail.ts", import.meta.url),
     workload: "io",
+    env: subsystemEnv,
   }),
   defineSubsystem({
     name: "storage",
     entrypoint: new URL("./func/storage.ts", import.meta.url),
     workload: "io",
+    env: subsystemEnv,
   }),
   defineSubsystem({
     name: "events",
     entrypoint: new URL("./func/events.ts", import.meta.url),
     workload: "io",
+    env: subsystemEnv,
   }),
   defineSubsystem({
     name: "cron",
     entrypoint: new URL("./func/cron.ts", import.meta.url),
     workload: "io",
+    env: subsystemEnv,
   }),
 ];
 

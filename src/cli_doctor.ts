@@ -7,7 +7,7 @@
 //   - Disk space for database and uploads
 //   - Configuration validity
 
-import { existsSync, statSync } from "node:fs";
+import { existsSync, statSync, statfsSync } from "node:fs";
 import { join } from "node:path";
 
 const c = {
@@ -104,6 +104,47 @@ export function cmdDoctor(projectRoot: string = process.cwd()): number {
       name: "Production config",
       pass: true,
       message: process.env.NODE_ENV === "production" ? "APP_URL set" : "Not production, skipping",
+    });
+  }
+
+  // AUTH_SECRET, production only — env.ts requires it there, because
+  // without it JWTs can be forged and encrypted 2FA secrets decrypted.
+  // Doctor used to say "All checks passed" on a project that would not
+  // boot in production for exactly this reason.
+  if (process.env.NODE_ENV === "production" && !process.env.AUTH_SECRET) {
+    checks.push({
+      name: "AUTH_SECRET",
+      pass: false,
+      message: "AUTH_SECRET is required in production — generate one with: openssl rand -base64 32",
+    });
+  } else {
+    checks.push({
+      name: "AUTH_SECRET",
+      pass: true,
+      message: process.env.NODE_ENV === "production" ? "AUTH_SECRET set" : "Not production, skipping",
+    });
+  }
+
+  // Disk space — the header promised this check and it was never
+  // implemented. Fails under 100 MB free on the project volume: a
+  // database and uploads need headroom, and a full disk corrupts
+  // SQLite writes rather than failing cleanly.
+  try {
+    const fs = statfsSync(projectRoot);
+    const freeMb = (fs.bavail * fs.bsize) / (1024 * 1024);
+    const ok = freeMb >= 100;
+    checks.push({
+      name: "Disk space",
+      pass: ok,
+      message: ok
+        ? `${freeMb.toFixed(0)} MB free on the project volume`
+        : `Only ${freeMb.toFixed(1)} MB free on the project volume — free space before the database grows`,
+    });
+  } catch {
+    checks.push({
+      name: "Disk space",
+      pass: true,
+      message: "Could not measure free disk space (skipped)",
     });
   }
 

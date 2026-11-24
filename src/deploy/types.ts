@@ -94,3 +94,15 @@ export interface DeployManifest {
 
 /** Bump when a generated file template changes shape. */
 export const DEPLOY_TEMPLATE_VERSION = 1;
+
+/**
+ * Quote a value for YAML output (single-quoted, `'` doubled).
+ *
+ * Generated files interpolate project names and branch names, and an
+ * unquoted `@scope/name` is invalid YAML while a branch like `fix: x`
+ * changes meaning — so every interpolated scalar goes through here
+ * instead of bare `${...}`.
+ */
+export function yamlQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}

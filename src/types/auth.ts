@@ -426,6 +426,17 @@ export interface AuthStore {
     type?: AuthVerificationToken["type"],
   ): Promise<void>;
 
+  /*
+   * Removes verification tokens / sessions whose expiry has passed, for the
+   * nightly cleanup job. Optional so existing custom stores keep working:
+   * a store without them contributes zero to `Auth.cleanupExpired()` and the
+   * job must not claim it cleaned anything. `MemoryAuthStore` and
+   * `SQLiteAuthStore` implement both; a store that cannot enumerate its rows
+   * should leave them out rather than fake a count.
+   */
+  deleteExpiredTokens?(now?: Date): Promise<number>;
+  deleteExpiredSessions?(now?: Date): Promise<number>;
+
   savePasskey(cred: AuthPasskeyCredential): Promise<void>;
   findPasskeyById(id: string): Promise<AuthPasskeyCredential | null>;
   listPasskeysByUserId(userId: string): Promise<AuthPasskeyCredential[]>;
@@ -696,6 +707,36 @@ export class MemoryAuthStore implements AuthStore {
       if (t.userId === userId && (!type || t.type === type))
         this.tokens.delete(id);
     }
+  }
+
+  /*
+   * The rows the nightly cleanup removes. Tokens had no sweep at all — the
+   * session map is swept every 60 seconds by the constructor timer, but an
+   * expired verification token sat in this map forever — so this is the half
+   * that actually leaks. `expiresAt <= now` matches `findTokenByHash`, which
+   * treats a token expiring exactly now as already dead.
+   */
+  async deleteExpiredTokens(now = new Date()): Promise<number> {
+    let removed = 0;
+    for (const [id, t] of this.tokens.entries()) {
+      if (t.expiresAt <= now) {
+        this.tokens.delete(id);
+        removed++;
+      }
+    }
+    return removed;
+  }
+
+  async deleteExpiredSessions(now = new Date()): Promise<number> {
+    let removed = 0;
+    for (const [id, s] of this.sessions.entries()) {
+      if (s.expiresAt <= now) {
+        this.sessions.delete(id);
+        this.refreshTokenIndex(s.sessionTokenHash);
+        removed++;
+      }
+    }
+    return removed;
   }
 
   async savePasskey(cred: AuthPasskeyCredential) {
@@ -1739,6 +1780,24 @@ export class Auth {
   }
 
   /**
+   * Deletes expired verification tokens and sessions, for the nightly
+   * `cleanup-stale-tokens` job.
+   *
+   * The job used to only log that it was cleaning up, while nothing was ever
+   * deleted — expired tokens accumulated in the store forever. A store that
+   * does not implement the `deleteExpired*` methods contributes zero rather
+   * than throwing, so the caller can report the honest count instead of
+   * assuming the sweep happened.
+   */
+  async cleanupExpired(
+    now = new Date(),
+  ): Promise<{ tokens: number; sessions: number }> {
+    const tokens = (await this.store.deleteExpiredTokens?.(now)) ?? 0;
+    const sessions = (await this.store.deleteExpiredSessions?.(now)) ?? 0;
+    return { tokens, sessions };
+  }
+
+  /**
    * Whether a session is still inside its lifetime.
    *
    * Checked here rather than left to the store. `MemoryAuthStore` filters expired
@@ -2761,7 +2820,50 @@ export class AuthPasswordSubsystem {
 export class AuthMfa {
   constructor(private auth: Auth) {}
 
-  async beginSetup(userId: string, appName = "Yatta App") {
+  /*
+   * Time-steps already spent in this process, keyed `${userId}:${step}`.
+   *
+   * `lastMfaStep` on the stored user is the durable guard, but a caller holds
+   * the user object it fetched *before* another request spent the step — and
+   * the store write in `verifyCode` is fire-and-forget, so the second caller
+   * never sees it. Two `completeMfa` calls racing with two tickets and one
+   * captured code both read a stale snapshot and both passed. A claim made
+   * synchronously here, inside the same tick as the check, cannot be raced
+   * by another call in this process: JavaScript runs `verifyCode` to
+   * completion before the next call starts. Entries older than the previous
+   * step are pruned on each call — otplib checks with window 0, so a code is
+   * only ever valid for its own step and an older claim can never be
+   * consulted again. This is the in-process half only; the store write below
+   * stays the cross-process half.
+   */
+  private usedCodeSteps = new Set<string>();
+
+  /**
+   * Checks that the requester recently authenticated as this user.
+   *
+   * Enrolment turns a second factor on, so it gets the same gate `disable`
+   * already has: a session that is merely alive is not enough, it must be
+   * freshly authenticated, and it must belong to the user being enrolled —
+   * otherwise any signed-in user could enrol MFA on someone else's account.
+   */
+  private async requireRecentAuthFor(
+    userId: string,
+    req: Request,
+  ): Promise<void> {
+    const authState = await this.auth.requireRecentAuth(req);
+    if (authState.user.id !== userId) {
+      throw new ForbiddenError("You can only manage your own MFA settings");
+    }
+  }
+
+  async beginSetup(userId: string, appName = "Yatta App", req?: Request) {
+    /*
+     * The request is what proves recent authentication. Pass it — an app
+     * that calls this with only a user id is asserting it already checked,
+     * and nothing here can verify that claim.
+     */
+    if (req) await this.requireRecentAuthFor(userId, req);
+
     const user = await this.auth.store.findUserById(userId);
     if (!user) throw new AuthError("User not found", 404);
 
@@ -2808,13 +2910,27 @@ export class AuthMfa {
    */
   verifyCode(secret: string, code: string, user?: AuthUser): boolean | "replayed" {
     const step = Math.floor(Date.now() / 30000);
-    if (user?.lastMfaStep && user.lastMfaStep >= step) {
+
+    for (const key of this.usedCodeSteps) {
+      const claimedStep = Number(key.slice(key.lastIndexOf(":") + 1));
+      if (claimedStep < step - 1) this.usedCodeSteps.delete(key);
+    }
+
+    const claimKey = user ? `${user.id}:${step}` : null;
+    if (
+      (user?.lastMfaStep && user.lastMfaStep >= step) ||
+      (claimKey !== null && this.usedCodeSteps.has(claimKey))
+    ) {
       // Only a replay if the code itself is good for this step. A wrong code in a
       // spent step is just wrong, and saying "already used" would be misleading.
       return authenticator.check(code, secret) ? "replayed" : false;
     }
     const valid = authenticator.check(code, secret);
     if (valid && user) {
+      // Claimed synchronously, before the store write lands: a second caller
+      // holding a stale user snapshot sees this claim even though its own
+      // `lastMfaStep` still reads as unspent.
+      if (claimKey !== null) this.usedCodeSteps.add(claimKey);
       this.auth.store
         .updateUser(user.id, { lastMfaStep: step })
         .catch(console.error);
@@ -2825,7 +2941,12 @@ export class AuthMfa {
   async confirmSetup(
     userId: string,
     code: string,
+    req?: Request,
   ): Promise<{ recoveryCodes: string[] }> {
+    // Same gate as beginSetup: turning 2FA on needs a freshly authenticated
+    // session for this user, not just a user id. See beginSetup.
+    if (req) await this.requireRecentAuthFor(userId, req);
+
     const user = await this.auth.store.findUserById(userId);
     if (!user) throw new AuthError("User not found", 404);
 

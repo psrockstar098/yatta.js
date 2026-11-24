@@ -462,15 +462,40 @@ export function outboxBackoffMs(attempts: number, baseMs = 1000, maxMs = 60000):
 }
 
 /**
+ * A publish that exceeded `publishTimeoutMs`. It is recorded as a
+ * failure (attempts + 1 with backoff, so a hung publish is retried and
+ * eventually dead-lettered instead of stalling the row forever) — but
+ * the publish itself is still running, and if it later succeeds the
+ * row is marked published (see OutboxRelay), so a merely slow publish
+ * is not delivered twice.
+ */
+export class OutboxPublishTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Outbox publish timed out after ${timeoutMs}ms.`);
+  }
+}
+
+/**
  * Relay worker: publishes pending outbox rows, in seq order, with
  * at-least-once delivery.
  *
  * A row is marked published only after publish resolves. A crash
  * between publish and the mark leaves the row pending, so the next
  * scan publishes it again; consumers dedupe by event_id (see the
- * design doc). The relay keeps no state in memory, so a fresh relay
- * on the same file picks up unprocessed rows on its first scan —
- * that is how restart pickup works.
+ * design doc). A publish that exceeds `publishTimeoutMs` is recorded
+ * as a failure (attempts + 1 with backoff) so a hung publish is
+ * retried and eventually dead-lettered — but the publish is still
+ * running, and if it later succeeds the row is marked published, so a
+ * merely slow publish is not delivered twice. A retry is only picked
+ * up once its backoff has expired (listPending filters on
+ * next_attempt_at), so a slow publish that settles inside its backoff
+ * window is never republished; past the backoff the original is
+ * treated as abandoned and the retry proceeds, which can duplicate a
+ * publish slower than timeout + backoff. The only in-memory state is
+ * the set of publishes that timed out but are still running (see
+ * publishWithTimeout), so a fresh relay on the same file picks up
+ * unprocessed rows on its first scan — that is how restart pickup
+ * works.
  *
  * Run one relay per database file. Two relays on the same file do
  * not lose events, but they can both publish the same row before
@@ -479,6 +504,18 @@ export function outboxBackoffMs(attempts: number, baseMs = 1000, maxMs = 60000):
 export class OutboxRelay {
   private timer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
+  /*
+   * Publishes that timed out but are still running in the background,
+   * keyed by entry seq. Their settlement records the real outcome: a
+   * late success marks the row published (undoing the timeout failure
+   * recorded below), a late error only refreshes last_error. Without
+   * this, a slow publish was marked failed on timeout and the next
+   * scan republished while the first publish might still complete,
+   * duplicating the delivery. A fresh relay starts with an empty map:
+   * restart pickup still republishes unmarked rows, which is the
+   * documented at-least-once contract across restarts.
+   */
+  private pendingPublishes = new Map<number, Promise<void>>();
   private readonly options: Required<Omit<OutboxRelayOptions, "now" | "publishTimeoutMs">> & {
     now: () => number;
     publishTimeoutMs?: number;
@@ -508,19 +545,88 @@ export class OutboxRelay {
       return;
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const publishPromise = Promise.resolve(this.publish(entry));
     try {
       await Promise.race([
-        Promise.resolve(this.publish(entry)),
+        publishPromise,
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(
-            () => reject(new Error(`Outbox publish timed out after ${timeoutMs}ms.`)),
+            () => reject(new OutboxPublishTimeoutError(timeoutMs)),
             timeoutMs,
           );
         }),
       ]);
+    } catch (err) {
+      if (err instanceof OutboxPublishTimeoutError) {
+        // The publish is still running: track it so its settlement
+        // records the real outcome. A late success marks the row
+        // published (undoing the timeout failure runOnce records
+        // below); a late error only refreshes last_error, so one
+        // publish is never counted as two failures.
+        const pending = publishPromise.then(
+          () => this.markPublished(entry),
+          (publishErr) => this.markLateError(entry, publishErr),
+        );
+        this.pendingPublishes.set(entry.seq, pending);
+        void pending
+          .catch(() => {})
+          .finally(() => {
+            if (this.pendingPublishes.get(entry.seq) === pending) {
+              this.pendingPublishes.delete(entry.seq);
+            }
+          });
+      }
+      throw err;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
+  }
+
+  /** Marks a row published, only if it is still pending. */
+  private markPublished(entry: OutboxEntry): void {
+    this.store.rawRun(
+      `UPDATE "${OUTBOX_TABLE}"
+       SET status = 'published', published_at = ?
+       WHERE seq = ? AND status = 'pending';`,
+      [this.options.now(), entry.seq],
+    );
+  }
+
+  /**
+   * Records a publish failure on the row: attempts + 1 with backoff, or
+   * dead once maxAttempts is reached. Returns whether the row went dead.
+   */
+  private markFailed(entry: OutboxEntry, err: unknown): boolean {
+    const now = this.options.now();
+    const attempts = entry.attempts + 1;
+    const dead = attempts >= this.options.maxAttempts;
+    const message = err instanceof Error ? err.message : String(err);
+    this.store.rawRun(
+      `UPDATE "${OUTBOX_TABLE}"
+       SET status = ?, attempts = ?, next_attempt_at = ?, last_error = ?
+       WHERE seq = ? AND status = 'pending';`,
+      [
+        dead ? "dead" : "pending",
+        attempts,
+        dead ? now : now + outboxBackoffMs(attempts, this.options.retryBaseMs, this.options.retryMaxMs),
+        message.slice(0, 2000),
+        entry.seq,
+      ],
+    );
+    return dead;
+  }
+
+  /**
+   * Refreshes last_error for a publish that already timed out and was
+   * counted as a failure: the real error is worth recording, but the
+   * publish must not be counted twice. Only touches pending rows.
+   */
+  private markLateError(entry: OutboxEntry, err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    this.store.rawRun(
+      `UPDATE "${OUTBOX_TABLE}" SET last_error = ? WHERE seq = ? AND status = 'pending';`,
+      [message.slice(0, 2000), entry.seq],
+    );
   }
 
   /** Whether the interval loop is running. */
@@ -543,6 +649,8 @@ export class OutboxRelay {
       if (this.inFlight) return;
       void this.runOnce().catch(() => {});
     }, this.options.pollIntervalMs);
+    // A relay that is never stop()d must not keep the process alive.
+    this.timer.unref?.();
   }
 
   /** Stops the interval loop. A scan already running finishes. */
@@ -567,37 +675,26 @@ export class OutboxRelay {
       const rows = listPending(this.store, { limit: this.options.batchSize, now: this.options.now() });
       const result: OutboxRelayResult = { published: 0, failed: 0, dead: 0 };
       for (const entry of rows) {
-        const now = this.options.now();
         try {
           await this.publishWithTimeout(entry);
         } catch (err) {
-          const attempts = entry.attempts + 1;
-          const dead = attempts >= this.options.maxAttempts;
-          const message = err instanceof Error ? err.message : String(err);
-          this.store.rawRun(
-            `UPDATE "${OUTBOX_TABLE}"
-             SET status = ?, attempts = ?, next_attempt_at = ?, last_error = ?
-             WHERE seq = ? AND status = 'pending';`,
-            [
-              dead ? "dead" : "pending",
-              attempts,
-              dead ? now : now + outboxBackoffMs(attempts, this.options.retryBaseMs, this.options.retryMaxMs),
-              message.slice(0, 2000),
-              entry.seq,
-            ],
-          );
+          // A timeout is recorded as a failure (attempts + 1 with
+          // backoff, so a hung publish is retried and eventually
+          // dead-lettered). The publish itself is still running, and
+          // its settlement — tracked in publishWithTimeout — marks
+          // the row published if it later succeeds, so a merely slow
+          // publish is not delivered twice. No skip is needed here:
+          // listPending only returns rows whose backoff has expired,
+          // so a row whose publish is still running inside its
+          // backoff window is not listed at all.
+          const dead = this.markFailed(entry, err);
           result.failed += 1;
           if (dead) result.dead += 1;
           continue;
         }
         // Mark done only after publish resolved, and only if the row is
         // still pending: a second relay may have marked it already.
-        this.store.rawRun(
-          `UPDATE "${OUTBOX_TABLE}"
-           SET status = 'published', published_at = ?
-           WHERE seq = ? AND status = 'pending';`,
-          [this.options.now(), entry.seq],
-        );
+        this.markPublished(entry);
         result.published += 1;
       }
       return result;

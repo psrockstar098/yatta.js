@@ -1817,6 +1817,16 @@ function cmdNew(name?: string): number {
         log(`${c.dim}  Scaffold into a subfolder instead: yatta new app${c.reset}`);
         return 1;
       }
+      // `scaffoldInto` writes package.json, tsconfig.json and yatta/*.
+      // Refuse rather than silently overwriting a project's own files:
+      // a directory holding a custom package.json was scaffolded over
+      // with no warning and exit 0.
+      const blockers = scaffoldBlockers(dir);
+      if (blockers.length > 0) {
+        fail(`This directory already has ${blockers.join(", ")} — nothing to scaffold.`);
+        log(`${c.dim}  Scaffold into an empty directory or a subfolder instead: yatta new app${c.reset}`);
+        return 1;
+      }
       warn(`Scaffolding into the current directory (${dir})`);
       scaffoldInto(dir);
       printNextSteps(".");
@@ -1882,8 +1892,29 @@ export function writeYattaFolder(yattaDir: string): void {
   writeFileSync(join(yattaDir, "backend", "routes.ts"), TEMPLATE_BACKEND_ROUTES);
 }
 
+/**
+ * Files `scaffoldInto` would overwrite in `dir`, if any.
+ *
+ * `yatta new .` refuses when one of these exists instead of silently
+ * clobbering a project's own package.json, tsconfig.json, or yatta/main.ts.
+ * Exported for tests; `cmdNew` reports them before calling `scaffoldInto`.
+ */
+export function scaffoldBlockers(dir: string): string[] {
+  const blockers: string[] = [];
+  if (existsSync(join(dir, "package.json"))) blockers.push("package.json");
+  if (existsSync(join(dir, "tsconfig.json"))) blockers.push("tsconfig.json");
+  if (existsSync(join(dir, "yatta", "main.ts"))) blockers.push("yatta/main.ts");
+  return blockers;
+}
+
 /** The two root files `yatta new` writes, alongside the folder itself. */
 export function scaffoldInto(dir: string): void {
+  // Defence in depth for the `cmdNew` guard above: a direct caller that
+  // scaffolds over an existing project gets an error, not silent loss.
+  const blockers = scaffoldBlockers(dir);
+  if (blockers.length > 0) {
+    throw new Error(`Refusing to scaffold over existing ${blockers.join(", ")} in ${dir}`);
+  }
   writeYattaFolder(join(dir, "yatta"));
   writeFileSync(join(dir, "package.json"), TEMPLATE_PKG(basename(dir)));
   writeFileSync(join(dir, "tsconfig.json"), TEMPLATE_TSCONFIG);
@@ -2107,51 +2138,273 @@ function runQuiet(cmd: string, args: string[], cwd?: string): number {
  *
  * @returns `true` if the tsconfig was patched.
  */
-function ensureTsconfigCompatible(root: string): boolean {
+/**
+ * Makes an existing tsconfig compatible with a linked Yatta checkout.
+ *
+ * Two things are required for `bunx tsc --noEmit` to pass in a project that
+ * consumes Yatta via `bun link`:
+ *
+ * 1. `"DOM"` in `lib`. Bun's global types and `undici-types` disagree about
+ *    `FormData`/`HeadersInit` without the DOM lib, producing phantom errors.
+ * 2. `paths` pinning `undici-types` to the project's copy. A symlinked
+ *    checkout resolves its own node_modules, so the type is otherwise
+ *    loaded twice and the two definitions conflict.
+ *
+ * Additive only: existing options are preserved, and the file is rewritten
+ * solely when something actually changes. If it cannot be parsed
+ * confidently, it is left untouched.
+ *
+ * The patch is a splice edit on the original text, not a parse-and-reserialize:
+ * the old rewrite ran the file through JSON.stringify, which silently
+ * stripped every user comment. Comments and formatting elsewhere are
+ * preserved; only the two settings above are inserted.
+ *
+ * @returns `true` if the tsconfig was patched.
+ */
+export function ensureTsconfigCompatible(root: string): boolean {
   const tsPath = join(root, "tsconfig.json");
 
   if (!existsSync(tsPath)) return false;
 
   try {
     // Tolerate JSONC (bun init writes comments and trailing commas).
+    // A scanner, not regexes: the old `^\s*\/\/.*$` strip only removed
+    // full-line comments, so a trailing `//` comment made the whole
+    // patch bail out and leave the file unpatched.
     const raw = readFileSync(tsPath, "utf8");
-    const json = JSON.parse(
-      raw
-        .replace(/^\s*\/\/.*$/gm, "")
-        .replace(/\/\*[\s\S]*?\*\//g, "")
-        .replace(/,(\s*[}\]])/g, "$1"),
-    );
+    const stripJsonc = (text: string): string => {
+      let out = "";
+      let i = 0;
+      while (i < text.length) {
+        const ch = text[i]!;
+        if (ch === '"') {
+          out += ch;
+          i++;
+          while (i < text.length) {
+            out += text[i];
+            if (text[i] === "\\") {
+              i++;
+              if (i < text.length) {
+                out += text[i];
+                i++;
+              }
+              continue;
+            }
+            if (text[i] === '"') {
+              i++;
+              break;
+            }
+            i++;
+          }
+          continue;
+        }
+        if (ch === "/" && text[i + 1] === "/") {
+          while (i < text.length && text[i] !== "\n") i++;
+          continue;
+        }
+        if (ch === "/" && text[i + 1] === "*") {
+          const end = text.indexOf("*/", i + 2);
+          i = end === -1 ? text.length : end + 2;
+          continue;
+        }
+        out += ch;
+        i++;
+      }
+      return out.replace(/,(\s*[}\]])/g, "$1");
+    };
+    const json = JSON.parse(stripJsonc(raw));
 
     const compilerOptions = json.compilerOptions ?? (json.compilerOptions = {});
     let changed = false;
 
     // 1. Ensure DOM is in lib.
-    if (!Array.isArray(compilerOptions.lib)) {
-      compilerOptions.lib = ["ESNext", "DOM"];
-      changed = true;
-    } else if (!compilerOptions.lib.includes("DOM")) {
-      compilerOptions.lib = [...compilerOptions.lib, "DOM"];
-      changed = true;
-    }
+    const needLib = !Array.isArray(compilerOptions.lib)
+      ? "set"
+      : compilerOptions.lib.includes("DOM")
+        ? null
+        : "append";
+    if (needLib) changed = true;
 
     // 2. Pin undici-types to this project's copy.
-    if (compilerOptions.paths?.["undici-types"] !== undefined) {
-      // already configured by the developer
-    } else {
+    const needPaths = compilerOptions.paths?.["undici-types"] === undefined;
+    if (needPaths) changed = true;
+
+    if (!changed) return false;
+
+    const patched = spliceTsconfigEdits(raw, {
+      lib: needLib,
+      paths: needPaths,
+      hasCompilerOptions: json.compilerOptions !== undefined,
+    });
+    if (patched !== null) {
+      // Verify the splice actually landed before trusting it: re-parse
+      // and check both settings are present.
+      const check = JSON.parse(stripJsonc(patched)) as {
+        compilerOptions?: { lib?: unknown; paths?: Record<string, unknown> };
+      };
+      const okLib =
+        needLib === null ||
+        (Array.isArray(check.compilerOptions?.lib) &&
+          (check.compilerOptions.lib as unknown[]).includes("DOM"));
+      const okPaths =
+        !needPaths || check.compilerOptions?.paths?.["undici-types"] !== undefined;
+      if (okLib && okPaths) {
+        writeFileSync(tsPath, patched);
+        return true;
+      }
+      // The splice missed (an unusual layout) — fall back to the old
+      // full rewrite rather than leaving a half-patched file, and say so:
+      // this path drops comments, which is exactly what the splice exists
+      // to avoid, so it must never happen silently.
+      warn("tsconfig.json layout was unusual — rewriting it (comments will be lost).");
+    }
+    if (needLib === "set") compilerOptions.lib = ["ESNext", "DOM"];
+    else if (needLib === "append") compilerOptions.lib = [...compilerOptions.lib, "DOM"];
+    if (needPaths) {
       compilerOptions.paths = {
         ...(compilerOptions.paths ?? {}),
         "undici-types": ["./node_modules/undici-types"],
       };
-      changed = true;
     }
-
-    if (!changed) return false;
-
     writeFileSync(tsPath, `${JSON.stringify(json, null, 2)}\n`);
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Splice the two tsconfig settings into the original text, preserving
+ * comments and formatting everywhere else. Returns null when the layout
+ * is not one the splicer understands (the caller falls back).
+ *
+ * `lib` is "set" (no usable array — replace the value), "append" (add
+ * "DOM" to the existing array), or null (already fine). `paths` adds the
+ * undici-types entry when true.
+ */
+function spliceTsconfigEdits(
+  raw: string,
+  opts: { lib: "set" | "append" | null; paths: boolean; hasCompilerOptions: boolean },
+): string | null {
+  // Find `"key": <value>` starting at `from`, skipping strings and
+  // comments, and return the value's [start, end) span.
+  const findValue = (text: string, key: string, from: number): [number, number] | null => {
+    let i = from;
+    while (i < text.length) {
+      const ch = text[i]!;
+      if (ch === "/" && text[i + 1] === "/") {
+        const nl = text.indexOf("\n", i + 2);
+        i = nl === -1 ? text.length : nl + 1;
+        continue;
+      }
+      if (ch === "/" && text[i + 1] === "*") {
+        const end = text.indexOf("*/", i + 2);
+        i = end === -1 ? text.length : end + 2;
+        continue;
+      }
+      if (ch === '"') {
+        let j = i + 1;
+        let str = "";
+        while (j < text.length && text[j] !== '"') {
+          if (text[j] === "\\") j++;
+          str += text[j];
+          j++;
+        }
+        if (j >= text.length) return null;
+        const afterStr = j + 1;
+        if (str === key) {
+          let k = afterStr;
+          while (k < text.length && /\s/.test(text[k]!)) k++;
+          if (text[k] !== ":") return null;
+          k++;
+          while (k < text.length && /\s/.test(text[k]!)) k++;
+          const start = k;
+          if (text[k] === "{" || text[k] === "[") {
+            const open = text[k]!;
+            const close = open === "{" ? "}" : "]";
+            let depth = 0;
+            let p = k;
+            while (p < text.length) {
+              const c = text[p]!;
+              if (c === '"') {
+                p++;
+                while (p < text.length && text[p] !== '"') {
+                  if (text[p] === "\\") p++;
+                  p++;
+                }
+              } else if (c === open) depth++;
+              else if (c === close) {
+                depth--;
+                if (depth === 0) return [start, p + 1];
+              }
+              p++;
+            }
+            return null;
+          }
+          // Scalar value: read to the next comma/close at this level.
+          let p = k;
+          while (p < text.length && text[p] !== "," && text[p] !== "}" && text[p] !== "]") p++;
+          return [start, p];
+        }
+        i = afterStr;
+        continue;
+      }
+      i++;
+    }
+    return null;
+  };
+
+  let text = raw;
+  // Work from the end of the file backwards so earlier offsets stay valid.
+  const edits: Array<{ at: number; deleteCount: number; insert: string }> = [];
+
+  let coSpan = findValue(text, "compilerOptions", 0);
+  if (!coSpan && !opts.hasCompilerOptions) {
+    // No compilerOptions at all: insert the whole block after the root `{`.
+    const rootOpen = text.indexOf("{");
+    if (rootOpen === -1) return null;
+    const block = `\n  "compilerOptions": {\n    "lib": ["ESNext", "DOM"],\n    "paths": { "undici-types": ["./node_modules/undici-types"] }\n  },`;
+    edits.push({ at: rootOpen + 1, deleteCount: 0, insert: block });
+  } else {
+    if (!coSpan) return null;
+    // `lib`
+    if (opts.lib) {
+      const libSpan = findValue(text, "lib", coSpan[0]);
+      if (!libSpan) {
+        edits.push({ at: coSpan[0] + 1, deleteCount: 0, insert: `\n    "lib": ["ESNext", "DOM"],` });
+      } else if (opts.lib === "set") {
+        edits.push({ at: libSpan[0], deleteCount: libSpan[1] - libSpan[0], insert: `["ESNext", "DOM"]` });
+      } else {
+        // Append "DOM" inside the existing array, before its `]`.
+        const inner = text.slice(libSpan[0], libSpan[1]);
+        if (!inner.trimStart().startsWith("[")) return null;
+        const beforeClose = text.slice(libSpan[0], libSpan[1] - 1).trimEnd();
+        const insert = beforeClose.endsWith("[") ? `"DOM"` : `, "DOM"`;
+        edits.push({ at: libSpan[1] - 1, deleteCount: 0, insert });
+      }
+    }
+    // `paths`
+    if (opts.paths) {
+      const pathsSpan = findValue(text, "paths", coSpan[0]);
+      const entry = `"undici-types": ["./node_modules/undici-types"]`;
+      if (!pathsSpan) {
+        edits.push({ at: coSpan[0] + 1, deleteCount: 0, insert: `\n    "paths": { ${entry} },` });
+      } else {
+        const inner = text.slice(pathsSpan[0] + 1, pathsSpan[1] - 1).trim();
+        if (inner === "") {
+          edits.push({ at: pathsSpan[0] + 1, deleteCount: 0, insert: ` ${entry} ` });
+        } else if (findValue(text, "undici-types", pathsSpan[0]) === null) {
+          edits.push({ at: pathsSpan[0] + 1, deleteCount: 0, insert: ` ${entry},` });
+        }
+      }
+    }
+  }
+
+  edits.sort((a, b) => b.at - a.at);
+  for (const edit of edits) {
+    text = text.slice(0, edit.at) + edit.insert + text.slice(edit.at + edit.deleteCount);
+  }
+  return text;
 }
 
 /**
@@ -2345,7 +2598,7 @@ function cmdUsage(): number {
   log(`  ${c.cyan}yatta check${c.reset}        Typecheck and run tests`);
   log(`  ${c.cyan}yatta info${c.reset}         Show paths and versions`);
   log(`  ${c.cyan}yatta doctor${c.reset}       Diagnose project health and configuration`);
-  log(`  ${c.cyan}yatta deploy${c.reset}       Configure one-command deployment (docker today)`);
+  log(`  ${c.cyan}yatta deploy${c.reset}       Configure one-command deployment (docker, railway, northflank, render)`);
   log(`  ${c.cyan}yatta build${c.reset}        Build a standalone binary (yatta build --standalone)`);
   log(`  ${c.cyan}yatta version${c.reset}      Print the version`);
   log(`  ${c.cyan}yatta help${c.reset}         Show this`);

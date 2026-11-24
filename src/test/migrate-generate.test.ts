@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 
 import { cmdMigrate, cmdMigrateGenerate } from "../cli_migrate";
 import { col, createDatabase, YattaDB } from "../types/db";
-import { diffSchemas, normalizeModelSchema, qIdent, renderMigrationFile, renderStatements } from "../migrate_generate";
+import { diffSchemas, normalizeModelSchema, parseCheckValues, qIdent, renderMigrationFile, renderStatements } from "../migrate_generate";
 
 /*
  * `yatta migrate:generate` — diff a live database against the models and
@@ -411,5 +411,39 @@ describe("migrate:generate edge cases", () => {
     const content = renderMigrationFile("test_migration", { ...diff, changes: [evil] }, rendered);
     const evilLine = content.split("\n").find((l) => l.includes("evil"));
     expect(evilLine?.trimStart().startsWith("//")).toBe(true);
+  });
+});
+
+describe("migration rendering escapes", () => {
+  it("escapes backslashes so a default like 'C:\\new' survives the template literal", () => {
+    const diff = { changes: [], destructive: [], rebuildTables: [] };
+    const rendered = {
+      up: [`ALTER TABLE "t" ADD COLUMN "path" TEXT DEFAULT 'C:\\new'`],
+      down: [],
+      needsRebuild: false,
+      rebuildTables: [],
+    };
+    const content = renderMigrationFile("test_backslash", diff as any, rendered as any);
+    // The generated file must hold a doubled backslash: a single one
+    // would become a real newline when the migration is imported.
+    expect(content).toContain("DEFAULT 'C:\\\\new'");
+    expect(content).not.toContain("DEFAULT 'C:\nnew'");
+    // And the rendered file still evaluates to the original statement.
+    const run = content.match(/db\.run\(`([^`]*)`\)/);
+    expect(run).not.toBeNull();
+    expect(eval("`" + run![1]!.replace(/\\\$/g, "\\$") + "`")).toBe(
+      `ALTER TABLE "t" ADD COLUMN "path" TEXT DEFAULT 'C:\\new'`,
+    );
+  });
+
+  it("parseCheckValues reads a ) inside a quoted CHECK value", () => {
+    const sql = `CREATE TABLE "t" ("status" TEXT CHECK("status" IN ('a)b','c')))`;
+    expect(parseCheckValues(sql, "status")).toEqual(["a)b", "c"]);
+    // Ordinary lists still work, including commas and '' escapes.
+    expect(parseCheckValues(`CREATE TABLE "t" ("s" TEXT CHECK("s" IN ('x,y','it''s')))`, "s")).toEqual([
+      "x,y",
+      "it's",
+    ]);
+    expect(parseCheckValues(`CREATE TABLE "t" ("s" TEXT)`, "s")).toBeNull();
   });
 });

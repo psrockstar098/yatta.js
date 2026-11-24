@@ -36,7 +36,7 @@ import type {
   StorageCapabilities,
   ValidationResult,
 } from "./types";
-import { DEPLOY_TEMPLATE_VERSION } from "./types";
+import { DEPLOY_TEMPLATE_VERSION, yamlQuote } from "./types";
 
 function railwayCliAvailable(): boolean {
   try {
@@ -88,7 +88,7 @@ function railwayTs(project: ProjectInfo): string {
     "",
     "export default defineRailway(() => {",
     `  const data = volume("${volumeName(project)}");`,
-    `  const web = service("${project.name}", {`,
+    `  const web = service(${JSON.stringify(project.name)}, {`,
     sourceLine,
     '    build: { builder: "RAILPACK" },',
     `    start: "bun ${project.entry}",`,
@@ -101,7 +101,7 @@ function railwayTs(project: ProjectInfo): string {
     '    env: { NODE_ENV: "production" },',
     "  });",
     "",
-    `  return project("${project.name}", { resources: [data, web] });`,
+    `  return project(${JSON.stringify(project.name)}, { resources: [data, web] });`,
     "});",
     "",
   ].join("\n");
@@ -122,7 +122,7 @@ function workflow(manifest: DeployManifest): string {
     "",
     "on:",
     "  push:",
-    `    branches: [${manifest.deployment.branch}]`,
+    `    branches: [${yamlQuote(manifest.deployment.branch)}]`,
     "",
     "permissions:",
     "  contents: read",

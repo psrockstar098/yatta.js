@@ -10,7 +10,7 @@
 // no push ever happens here (the developer pushes; CI or the platform
 // deploys from that push); secrets are only ever referenced, never written.
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { detectProject } from "./detect";
@@ -19,7 +19,7 @@ import { northflankAdapter } from "./northflank";
 import { railwayAdapter } from "./railway";
 import { renderAdapter } from "./render";
 import { gitBranch, gitRemote, gitSha, gitTreeState } from "./git";
-import { buildManifest, MANIFEST_PATH, readManifest, writeManifest } from "./manifest";
+import { buildManifest, MANIFEST_PATH, readManifest, readManifestError, writeManifest } from "./manifest";
 import { buildPlan, previewLines } from "./plan";
 import type { DeployAdapter, DeployManifest } from "./types";
 
@@ -98,16 +98,32 @@ function usageLines(): string[] {
   ];
 }
 
+/** Read one line from stdin, byte by byte. Exported for tests. */
+export function readConfirmationLine(fd = 0): string | null {
+  const buf = Buffer.alloc(1);
+  let line = "";
+  try {
+    for (;;) {
+      const read = readSync(fd, buf, 0, 1, null);
+      if (read === 0) break;
+      const char = buf.toString("utf8");
+      if (char === "\n") break;
+      line += char;
+    }
+  } catch {
+    return null;
+  }
+  return line;
+}
+
 /** Interactive confirmation. Non-TTY input cannot confirm: re-run with --yes. */
 function confirmed(): boolean {
   if (!process.stdin.isTTY) return false;
   process.stdout.write("Ready to configure deployment? [y/N] ");
-  try {
-    const answer = readFileSync(0, "utf8").split("\n")[0]!.trim().toLowerCase();
-    return answer === "y" || answer === "yes";
-  } catch {
-    return false;
-  }
+  const answer = readConfirmationLine();
+  if (answer === null) return false;
+  const normalized = answer.trim().toLowerCase();
+  return normalized === "y" || normalized === "yes";
 }
 
 function providersLines(): string[] {
@@ -140,7 +156,13 @@ function doctorLines(root: string): string[] {
   if (!gitRemote(root)) lines.push("  ! No git remote `origin` — push has nowhere to go yet.");
   const manifest = readManifest(root);
   if (!manifest) {
-    lines.push("  ! Not configured yet — run `yatta deploy` to configure.");
+    const problem = readManifestError(root);
+    if (problem) {
+      lines.push(`  ✗ .yatta/deploy.json is incomplete or corrupt: ${problem}.`);
+      lines.push("  ! Re-run `yatta deploy` to reconfigure (delete the file first if it keeps conflicting).");
+    } else {
+      lines.push("  ! Not configured yet — run `yatta deploy` to configure.");
+    }
     lines.push("");
     return lines;
   }
@@ -158,10 +180,17 @@ function doctorLines(root: string): string[] {
   } else {
     lines.push("  ✓ Generated files match the template.");
   }
+  // The workflow may be in writes (new), unchanged (matches), or
+  // conflicts (drifted) — in the last case the tag-pin warning used to
+  // vanish exactly when the file most needed a look.
   const workflow = plan.writes.find((file) => file.path.endsWith("deploy.yml")) ??
     (plan.unchanged.includes(".github/workflows/deploy.yml")
       ? { path: ".github/workflows/deploy.yml", content: readFileSync(join(root, ".github/workflows/deploy.yml"), "utf8") }
-      : null);
+      : null) ??
+    (() => {
+      const conflict = plan.conflicts.find((c) => c.path.endsWith("deploy.yml"));
+      return conflict ? { path: conflict.path, content: conflict.existing } : null;
+    })();
   if (workflow && /uses: [^@\s]+@v?\d/i.test(workflow.content)) {
     lines.push("  ! Workflow actions are tag-pinned, not SHA-pinned — pin them before production use.");
   }
@@ -183,6 +212,10 @@ export function runDeploy(root: string, args: string[]): DeployOutcome {
   if (opts.subcommand === "config") {
     const manifest = readManifest(root);
     if (!manifest) {
+      const problem = readManifestError(root);
+      if (problem) {
+        return { code: 1, lines: ["", `✗ .yatta/deploy.json is incomplete or corrupt: ${problem}.`, "  Re-run `yatta deploy` to reconfigure.", ""] };
+      }
       return { code: 1, lines: ["", "Not configured yet — run `yatta deploy` to configure.", ""] };
     }
     return { code: 0, lines: ["", JSON.stringify(manifest, null, 2), ""] };
@@ -191,6 +224,10 @@ export function runDeploy(root: string, args: string[]): DeployOutcome {
   if (opts.subcommand === "status") {
     const manifest = readManifest(root);
     if (!manifest) {
+      const problem = readManifestError(root);
+      if (problem) {
+        return { code: 1, lines: ["", `✗ .yatta/deploy.json is incomplete or corrupt: ${problem}.`, "  Re-run `yatta deploy` to reconfigure.", ""] };
+      }
       return { code: 0, lines: ["", "Deployment state: not configured", ""] };
     }
     return {
@@ -253,6 +290,12 @@ export function runDeploy(root: string, args: string[]): DeployOutcome {
   }
 
   const warnings = [...validation.warnings];
+  // --registry only means anything to the docker adapter; on any other
+  // platform it used to be silently dropped, so a developer could
+  // believe they had picked a registry when nothing recorded it.
+  if (opts.registry && platform !== "docker") {
+    warnings.push(`--registry ${opts.registry} only applies to --platform docker — ignored for ${platform}.`);
+  }
   const treeState = gitTreeState(root);
   if (treeState === "dirty") {
     warnings.push("Working tree has uncommitted changes — commit them before pushing, or the deploy will run on an older commit.");

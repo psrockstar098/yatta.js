@@ -798,10 +798,12 @@ export function createWebDAVHandler(
     }
 
     if (method === "UNLOCK") {
-      const raw = req.headers.get("lock-token") ?? "";
-      const token = raw.replace(/[<>]/g, "").trim();
+      // Tokens may arrive in the `If` header as well as `Lock-Token`
+      // (some clients only send `If`); `shownTokens` reads both, and a
+      // negated `(Not <token>)` does not count as showing it.
+      const shown = shownTokens(req);
       const lock = liveLock(path);
-      if (!lock || lock.token !== token) {
+      if (!lock || !shown.has(lock.token)) {
         return new Response("Lock token does not match", { status: 409 });
       }
       locks.delete(path);
@@ -990,6 +992,10 @@ export function createStorageDavStore(storage: {
   async function isCollection(path: string): Promise<boolean> {
     if (path === "") return true;
     if (isMarker(path)) return false;
+    // A file wins over a prefix listing: when both `a` (a file) and
+    // `a/b` exist, `a` is a file, not a collection — otherwise PUT to `a`
+    // wrongly 405s.
+    if (await storage.exists(path)) return false;
     if (await storage.exists(markerKey(path))) return true;
     return (await listAll(path)).length > 0;
   }
@@ -1000,8 +1006,18 @@ export function createStorageDavStore(storage: {
     try {
       await storage.head(path);
       return true;
-    } catch {
-      return false;
+    } catch (err) {
+      // Only "missing" is false. Before, any failure (a storage outage,
+      // a permissions error) was swallowed and reported as 404 — the
+      // same bug `get()` was already fixed for. A non-404 error now
+      // propagates to the handler, which answers 500.
+      if (
+        (err as { name?: string })?.name === "FileNotFoundError" ||
+        (err as { status?: number })?.status === 404
+      ) {
+        return false;
+      }
+      throw err;
     }
   }
 

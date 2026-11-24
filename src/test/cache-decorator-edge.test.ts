@@ -378,6 +378,10 @@ describe("edge-aware engine wiring", () => {
       const evicted = await cache.invalidateTags("users");
       expect(evicted).toBe(1);
       expect(await cache.get<string>("k1")).toBeNull();
+      // The edge purge is fire-and-forget now (invalidateTags returns
+      // the local count immediately), so the provider-failure warning
+      // lands asynchronously — wait for the background purge to settle.
+      await new Promise((r) => setTimeout(r, 50));
       expect(warn.seen.join(" ")).toContain("cloudflare");
       expect(warn.seen.join(" ")).not.toContain("tok-abc");
     } finally {

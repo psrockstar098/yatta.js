@@ -2,6 +2,32 @@
 
 let warnedFallback = false;
 
+/*
+ * Host env keys a tenant graph may see. Deliberately small and
+ * secret-free: NODE_ENV/YATTA_ENV (mode), TZ and locale (formatting),
+ * nothing that can carry a credential or a connection string. A tenant
+ * that needs a value (a database URL, an API key) must receive it
+ * through its own subsystem `env`, where the deployer opts in per
+ * tenant — the host's process.env is never the source.
+ */
+const TENANT_SAFE_ENV_KEYS = [
+  "NODE_ENV",
+  "YATTA_ENV",
+  "TZ",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+] as const;
+
+function tenantSafeEnv(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of TENANT_SAFE_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
 function isThenable(v: unknown): v is PromiseLike<unknown> {
   return (
     v !== null &&
@@ -167,10 +193,15 @@ export class ModuleGraphManager {
     entrypoint: string,
     env: Record<string, string>,
   ): Promise<void> {
-    // NOTE: this still hands each tenant the host's full process.env.
+    // Tenants get an allowlisted slice of the host env, never the whole
+    // thing: spreading process.env handed every tenant the host's secrets
+    // (DB URLs, signing/storage secrets, API keys). Only non-secret
+    // locale/mode variables cross the boundary; everything a tenant
+    // needs must come through its own `env` (the subsystem definition),
+    // which the deployer chose explicitly, plus TENANT_ID.
     const tenantProcess = Object.create(process, {
       env: {
-        value: { ...process.env, ...env, TENANT_ID: graphId },
+        value: { ...tenantSafeEnv(), ...env, TENANT_ID: graphId },
         enumerable: true,
       },
     });

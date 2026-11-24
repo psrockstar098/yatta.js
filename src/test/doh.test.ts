@@ -134,4 +134,77 @@ describe("DNS over HTTPS", () => {
       server.stop();
     }
   });
+
+  it("decodes compressed answer names (0xc0 pointers), as real DoH servers send", () => {
+    // A Cloudflare-style reply: the question is example.com, and the
+    // answer name is a pointer (0xc00c) back to the question — the shape
+    // every real DoH server sends, which decodeResponse used to reject
+    // with "Compressed DNS names are not supported".
+    const bytes: number[] = [];
+    const u16 = (v: number) => bytes.push((v >> 8) & 0xff, v & 0xff);
+    u16(42); // id
+    u16(0x8180); // QR + RD + RA, rcode 0
+    u16(1); // QDCOUNT
+    u16(1); // ANCOUNT
+    u16(0);
+    u16(0);
+    // Question: example.com, A, IN
+    for (const label of ["example", "com"]) {
+      bytes.push(label.length, ...new TextEncoder().encode(label));
+    }
+    bytes.push(0);
+    u16(1);
+    u16(1);
+    // Answer: name = pointer to offset 12, A, IN, TTL 60, 93.184.215.14
+    bytes.push(0xc0, 0x0c);
+    u16(1);
+    u16(1);
+    bytes.push(0, 0, 0, 60);
+    u16(4);
+    bytes.push(93, 184, 215, 14);
+    const decoded = decodeResponse(new Uint8Array(bytes));
+    expect(decoded.id).toBe(42);
+    expect(decoded.rcode).toBe(0);
+    expect(decoded.answers).toEqual([
+      { name: "example.com", type: "A", ttl: 60, address: "93.184.215.14" },
+    ]);
+  });
+
+  it("rejects a compression pointer loop instead of spinning", () => {
+    const bytes: number[] = [];
+    const u16 = (v: number) => bytes.push((v >> 8) & 0xff, v & 0xff);
+    u16(1);
+    u16(0x8180);
+    u16(1);
+    u16(1);
+    u16(0);
+    u16(0);
+    for (const label of ["example", "com"]) {
+      bytes.push(label.length, ...new TextEncoder().encode(label));
+    }
+    bytes.push(0);
+    u16(1);
+    u16(1);
+    // Answer name points at itself (the pointer's own offset).
+    const answerAt = bytes.length;
+    bytes.push(0xc0, answerAt);
+    u16(1);
+    u16(1);
+    bytes.push(0, 0, 0, 60);
+    u16(4);
+    bytes.push(1, 2, 3, 4);
+    expect(() => decodeResponse(new Uint8Array(bytes))).toThrow(/pointer loop/);
+  });
+
+  it("emits canonical compressed IPv6 (longest zero run as ::)", () => {
+    const query = { id: 9, name: "example.com", type: 28 as const };
+    const v6 = encodeResponse(query, 0, [
+      { name: "example.com", type: "AAAA", ttl: 60, address: "2001:db8:0:0:0:0:0:1" },
+    ]);
+    expect(decodeResponse(v6).answers[0]!.address).toBe("2001:db8::1");
+    const loopback = encodeResponse(query, 0, [
+      { name: "example.com", type: "AAAA", ttl: 60, address: "0:0:0:0:0:0:0:1" },
+    ]);
+    expect(decodeResponse(loopback).answers[0]!.address).toBe("::1");
+  });
 });

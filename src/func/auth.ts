@@ -167,6 +167,22 @@ export class SQLiteAuthStore implements AuthStore {
     }
   }
 
+  async deleteExpiredTokens(now = new Date()): Promise<number> {
+    let removed = 0;
+    for (const t of db.verificationTokens.findMany({})) {
+      if (new Date(t.expiresAt) <= now && db.verificationTokens.deleteById(t.id)) removed++;
+    }
+    return removed;
+  }
+
+  async deleteExpiredSessions(now = new Date()): Promise<number> {
+    let removed = 0;
+    for (const s of db.sessions.findMany({})) {
+      if (new Date(s.expiresAt) <= now && db.sessions.deleteById(s.id)) removed++;
+    }
+    return removed;
+  }
+
   // Passkeys
   async savePasskey(cred: AuthPasskeyCredential): Promise<void> {
     db.passkeys.upsert({

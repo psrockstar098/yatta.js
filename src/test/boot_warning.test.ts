@@ -46,9 +46,26 @@ function probeWithWorker(
   const probeFile = join(dir, `${name}.ts`);
   writeFileSync(probeFile, body);
 
+  /*
+   * The probe worker inherits its environment, and `bun test` runs test
+   * files in one process with a shared `process.env` — so a concurrently
+   * running file that sets STORAGE_SECRET (env.test.ts sets it in nearly
+   * every test; cli_doctor.test.ts too) would make this probe see a secret
+   * and print no warning, failing the host case only in full-suite runs.
+   * The probe therefore starts from a scrubbed environment: no storage
+   * secret, no fleet-thread flag, NODE_ENV=test — exactly the state this
+   * test is asserting about.
+   */
+  const cleanEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) cleanEnv[key] = value;
+  }
+  delete cleanEnv.STORAGE_SECRET;
+  delete cleanEnv.YATTA_FLEET_THREAD;
+  cleanEnv.NODE_ENV = "test";
   const options: WorkerOptions = fleetThread
-    ? { env: { ...process.env, YATTA_FLEET_THREAD: "1" } }
-    : {};
+    ? { env: { ...cleanEnv, YATTA_FLEET_THREAD: "1" } }
+    : { env: cleanEnv };
 
   // Loaded through a data URL so the probe file itself is not part of this repo.
   const worker = new Worker(

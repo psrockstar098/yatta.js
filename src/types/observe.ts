@@ -2909,8 +2909,21 @@ export class Observer {
 
           const duration = performance.now() - start;
 
-          // Some responses (101 upgrades, already-consumed bodies) cannot be
-          // re-wrapped; in that case annotate what we can and return as-is.
+          // Annotate the response in place where its headers allow it:
+          // re-wrapping with `new Response(res.body, res)` on every
+          // request allocated a second Response for two header sets.
+          // Responses whose headers are immutable still take the
+          // clone path, and un-cloneable bodies return as-is.
+          try {
+            res.headers.set("x-trace-id", span.traceId);
+            res.headers.set(
+              "server-timing",
+              `total;dur=${duration.toFixed(1)}`,
+            );
+            return res;
+          } catch {
+            // Fall through to the clone below.
+          }
           try {
             const cloned = new Response(res.body, res);
             cloned.headers.set("x-trace-id", span.traceId);

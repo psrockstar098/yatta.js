@@ -365,11 +365,31 @@ export class VectorStore {
           `id TEXT PRIMARY KEY, embedding TEXT NOT NULL, norm REAL NOT NULL, metadata TEXT);`,
       );
     }
+    // INSERT OR IGNORE + re-read: two concurrent creates used to both see
+    // no registry row and the loser threw UNIQUE. The loser now reads the
+    // winner's row (and the backend check above still rejects a mismatch).
     this.db.rawRun(
-      `INSERT INTO "${VECTOR_REGISTRY_TABLE}" (name, dimensions, backend) VALUES (?, ?, ?);`,
+      `INSERT OR IGNORE INTO "${VECTOR_REGISTRY_TABLE}" (name, dimensions, backend) VALUES (?, ?, ?);`,
       [collection, width, backend],
     );
-    return { name: collection, dimensions: width, backend };
+    const created = this.db.rawGet<{ name: string; dimensions: number; backend: string }>(
+      `SELECT name, dimensions, backend FROM "${VECTOR_REGISTRY_TABLE}" WHERE name = ?;`,
+      [collection],
+    );
+    if (!created) {
+      throw new YattaError(`Failed to create vector collection "${collection}".`);
+    }
+    // A concurrent create with different dimensions may have won the
+    // registry row while this call created (or skipped) the tables: the
+    // collection exists, but not at this width/backend, so fail loudly
+    // instead of writing vectors at the wrong width.
+    if (created.dimensions !== width || created.backend !== backend) {
+      throw new YattaError(
+        `Vector collection "${collection}" already exists with ${created.dimensions} dimensions (backend "${created.backend}"), ` +
+          `but this call asked for ${width} dimensions (backend "${backend}").`,
+      );
+    }
+    return { name: created.name, dimensions: created.dimensions, backend: created.backend as VectorBackend };
   }
 
   /** All collections in this file, in name order. */
@@ -408,31 +428,37 @@ export class VectorStore {
     if (info.backend === "sqlite-vec") {
       const table = vectorTableName(name);
       const meta = vectorMetaTableName(name);
-      const existing = this.db.rawGet<{ rowid: number }>(
-        `SELECT rowid FROM "${meta}" WHERE id = ? LIMIT 1;`,
-        [id],
-      );
-      const normalizedJson = JSON.stringify(normalize(stored));
-      if (existing) {
-        this.db.rawRun(`UPDATE "${table}" SET embedding = ? WHERE rowid = ?;`, [
-          normalizedJson,
-          existing.rowid,
-        ]);
-        this.db.rawRun(`UPDATE "${meta}" SET embedding = ?, metadata = ? WHERE rowid = ?;`, [
-          rawJson,
-          metadata,
-          existing.rowid,
-        ]);
-      } else {
-        const inserted = this.db.rawRun(
-          `INSERT INTO "${meta}" (id, embedding, metadata) VALUES (?, ?, ?);`,
-          [id, rawJson, metadata],
+      // Meta + vec writes share one transaction: a failure or crash
+      // between them used to leave an orphan meta row that count()/get()
+      // returned but searchVec never found, and the update path's
+      // UPDATE vec ... then silently affected 0 rows forever after.
+      this.db.sqlite.transaction(() => {
+        const existing = this.db.rawGet<{ rowid: number }>(
+          `SELECT rowid FROM "${meta}" WHERE id = ? LIMIT 1;`,
+          [id],
         );
-        this.db.rawRun(`INSERT INTO "${table}" (rowid, embedding) VALUES (?, ?);`, [
-          inserted.lastInsertRowid,
-          normalizedJson,
-        ]);
-      }
+        const normalizedJson = JSON.stringify(normalize(stored));
+        if (existing) {
+          this.db.rawRun(`UPDATE "${table}" SET embedding = ? WHERE rowid = ?;`, [
+            normalizedJson,
+            existing.rowid,
+          ]);
+          this.db.rawRun(`UPDATE "${meta}" SET embedding = ?, metadata = ? WHERE rowid = ?;`, [
+            rawJson,
+            metadata,
+            existing.rowid,
+          ]);
+        } else {
+          const inserted = this.db.rawRun(
+            `INSERT INTO "${meta}" (id, embedding, metadata) VALUES (?, ?, ?);`,
+            [id, rawJson, metadata],
+          );
+          this.db.rawRun(`INSERT INTO "${table}" (rowid, embedding) VALUES (?, ?);`, [
+            inserted.lastInsertRowid,
+            normalizedJson,
+          ]);
+        }
+      })();
     } else {
       const table = vectorTableName(name);
       this.db.rawRun(
@@ -480,8 +506,12 @@ export class VectorStore {
         [key],
       );
       if (!existing) return false;
-      this.db.rawRun(`DELETE FROM "${table}" WHERE rowid = ?;`, [existing.rowid]);
-      this.db.rawRun(`DELETE FROM "${meta}" WHERE rowid = ?;`, [existing.rowid]);
+      // One transaction, like upsert(): a crash between the two deletes
+      // used to leave an orphan in either table.
+      this.db.sqlite.transaction(() => {
+        this.db.rawRun(`DELETE FROM "${table}" WHERE rowid = ?;`, [existing.rowid]);
+        this.db.rawRun(`DELETE FROM "${meta}" WHERE rowid = ?;`, [existing.rowid]);
+      })();
       return true;
     }
     const table = vectorTableName(name);

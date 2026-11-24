@@ -880,7 +880,7 @@ export interface GrpcWebCallOptions {
 function httpToGrpc(status: number): number {
   switch (status) {
     case 400:
-      return GrpcStatus.INTERNAL;
+      return GrpcStatus.INVALID_ARGUMENT;
     case 401:
       return GrpcStatus.UNAUTHENTICATED;
     case 403:

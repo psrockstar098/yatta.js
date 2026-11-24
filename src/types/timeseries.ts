@@ -384,6 +384,22 @@ export function normalizeRollupPolicy(store: TimeSeriesStore, policy: RollupPoli
     };
   });
 
+  // deleteRaw deletes the raw rows a tier just summarised. A finer tier
+  // with deleteRaw would delete the rows a coarser tier still needs, so
+  // the coarser tier would write nothing and its summaries would go
+  // stale. Only the coarsest tier (largest window) may delete raw rows:
+  // it runs last, after every finer tier has read them.
+  const maxWindowMs = Math.max(...tiers.map((t) => t.windowMs));
+  for (const tier of tiers) {
+    if (tier.deleteRaw && tier.windowMs < maxWindowMs) {
+      throw new YattaError(
+        `Rollup tier "${tier.name}" sets deleteRaw: true, but it is not the coarsest tier. ` +
+          `Only the coarsest tier may delete raw rows — a finer tier would delete rows a coarser tier still needs. ` +
+          `Move deleteRaw to the tier with the largest window, or leave it out to keep raw rows.`,
+      );
+    }
+  }
+
   return { source: policy.source, timeColumn, measures, groupBy, tiers };
 }
 
@@ -514,9 +530,11 @@ export function runRollupTier(
 }
 
 /**
- * Runs every tier of a policy, in order. Each tier commits in its own
+ * Runs every tier of a policy, finest window first. Each tier commits in its own
  * transaction, so a failure in a later tier leaves earlier tiers' work
- * in place and the failed tier untouched.
+ * in place and the failed tier untouched. Only the coarsest tier may set
+ * `deleteRaw: true` (enforced when the policy is normalized): it runs
+ * last, so finer tiers still find the raw rows they need.
  */
 export function runRollupPolicy(
   store: TimeSeriesStore,
@@ -532,9 +550,17 @@ function runNormalizedPolicy(
   normalized: NormalizedRollupPolicy,
   opts: { now?: number } = {},
 ): RollupPolicyResult {
+  // Finest tier first: a tier with deleteRaw (only the coarsest may set
+  // it — see normalizeRollupPolicy) deletes the raw rows after every
+  // finer tier has already read them, whatever order the config lists
+  // the tiers in. Results are returned in config order.
+  const ordered = [...normalized.tiers].sort((a, b) => a.windowMs - b.windowMs);
+  const byName = new Map(
+    ordered.map((tier) => [tier.name, runRollupTier(store, normalized, tier, opts)]),
+  );
   return {
     source: normalized.source,
-    tiers: normalized.tiers.map((tier) => runRollupTier(store, normalized, tier, opts)),
+    tiers: normalized.tiers.map((tier) => byName.get(tier.name)!),
   };
 }
 

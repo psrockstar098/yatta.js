@@ -59,18 +59,30 @@ export async function cmdMigrate(projectRoot: string = process.cwd()): Promise<n
   const db = new YattaDB({ path: dbPath(projectRoot) });
 
   const migrations = [];
+  let skipped = 0;
   for (const file of files) {
     const mod = await import(join(dir, file));
     const migration = mod.default ?? mod;
     if (!migration.name || !migration.up) {
       console.log(`  ${c.yellow(`Skipping ${file}: missing name or up() function`)}`);
+      skipped++;
       continue;
     }
     migrations.push(migration);
   }
 
+  // A skipped file used to exit 0, so CI reported a successful migrate
+  // while a migration never ran. Run the valid ones, then fail loudly.
   console.log(`  ${c.bold(`Running ${migrations.length} migration(s)...`)}`);
-  const result = await db.migrate(migrations);
+  let result;
+  try {
+    result = await db.migrate(migrations);
+  } catch (err) {
+    // A throwing migration used to surface as a raw stack trace with no
+    // indication of which file failed. Report the message, not the stack.
+    console.log(`  ${c.red(`Migration failed: ${err instanceof Error ? err.message : String(err)}`)}`);
+    return 1;
+  }
 
   if (result.applied.length === 0) {
     console.log(`  ${c.green("Already up to date — no pending migrations.")}`);
@@ -78,6 +90,11 @@ export async function cmdMigrate(projectRoot: string = process.cwd()): Promise<n
     for (const name of result.applied) {
       console.log(`  ${c.green("✓")} Applied: ${name}`);
     }
+  }
+
+  if (skipped > 0) {
+    console.log(`  ${c.red(`${skipped} migration file(s) skipped (missing name or up()) — fix or remove them.`)}`);
+    return 1;
   }
 
   return 0;
@@ -96,14 +113,24 @@ export function cmdMigrateMake(name: string, projectRoot: string = process.cwd()
 
   const timestamp = new Date().toISOString().replace(/[-:T]/g, "").split(".")[0];
   const safeName = name.toLowerCase().replace(/[^a-z0-9]+/g, "_");
-  const filename = `${timestamp}_${safeName}.ts`;
+  // Two `migrate:make` runs in the same second share a timestamp, and
+  // overwriting the first file would lose it. Same suffix loop as
+  // `migrate:generate`: the filename and the migration name stay
+  // identical, because status matches applied migrations by filename.
+  const baseName = `${timestamp}_${safeName}`;
+  let filename = `${baseName}.ts`;
+  let migrationName = baseName;
+  for (let n = 2; existsSync(join(dir, filename)); n++) {
+    filename = `${baseName}_${n}.ts`;
+    migrationName = `${baseName}_${n}`;
+  }
   const filepath = join(dir, filename);
 
   const template = `// Migration: ${name}
 // Created: ${new Date().toISOString()}
 
 export default {
-  name: "${timestamp}_${safeName}",
+  name: "${migrationName}",
 
   up(db: any) {
     // TODO: Implement forward migration

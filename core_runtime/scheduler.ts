@@ -1,4 +1,5 @@
 // core_runtime/scheduler.ts
+import { randomBytes } from "node:crypto";
 import type {
   HardwareTopology,
   IPCRequest,
@@ -10,6 +11,30 @@ import type {
 
 const CONTROL_TIMEOUT_MS = 15_000;
 const MAX_RESPAWN_ATTEMPTS = 5;
+
+/*
+ * Dev-only ephemeral signing secret shared by the host thread and its
+ * fleet workers. resolveSigningSecret() generates one per module
+ * registry, so each worker thread used to mint its own and a URL signed
+ * in one thread failed verification in another. cluster.ts already sets
+ * STORAGE_SECRET for cluster children; the fleet gets the same
+ * treatment here, set on process.env so the host thread resolves the
+ * same value when it signs. Production is untouched: with no configured
+ * secret, signing still throws there instead of silently inventing one.
+ * (If the host signed something before the first worker spawned, its
+ * memoized secret predates this one — fleet boot happens before serving,
+ * so in practice the secret is set first.)
+ */
+let fleetDevSecret: string | null = null;
+
+function ensureFleetSigningSecret(): void {
+  if (process.env.STORAGE_SECRET?.trim()) return;
+  if (process.env.NODE_ENV === "production") return;
+  if (!fleetDevSecret) {
+    fleetDevSecret = randomBytes(32).toString("hex");
+    process.env.STORAGE_SECRET = fleetDevSecret;
+  }
+}
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const unref = (t: unknown) =>
@@ -314,6 +339,8 @@ export class HardwareAwareScheduler {
     role: WorkerRole,
     spec: WorkerSpawnSpec,
   ): Promise<ManagedWorker> {
+    // Set before the worker starts so host and fleet sign with one secret.
+    ensureFleetSigningSecret();
     const worker = new Worker(spec.scriptUrl.href, {
       smol: spec.smol,
       /*
@@ -603,10 +630,31 @@ export class HardwareAwareScheduler {
      * invisible to the other seven, which is the opposite of what asking for one
      * replica means.
      */
+    // Definitions not built through defineSubsystem get the same
+    // validation here instead of silently running as 1 replica.
+    if (
+      subsystem.replicas !== undefined &&
+      (!Number.isInteger(subsystem.replicas) || subsystem.replicas < 1)
+    ) {
+      throw new RangeError(
+        `Subsystem "${subsystem.name}": replicas must be an integer >= 1, got ${subsystem.replicas}.`,
+      );
+    }
     const wanted = subsystem.replicas ?? pool.length;
     const candidates = pool.slice(0, Math.max(1, wanted));
 
     const graphId = `graph-${subsystem.name}`;
+    // Re-registering used to overwrite graphSpecs while mount() returned
+    // early for the already-mounted graph, so the new entrypoint was
+    // silently ignored and the old code kept running with a success
+    // response. Reject instead: re-registering is a deploy decision, and
+    // the caller must dispose the old subsystem first.
+    if (this.graphSpecs.has(graphId)) {
+      throw new Error(
+        `Subsystem "${subsystem.name}" is already registered (graph "${graphId}"). ` +
+          `Dispose it before re-registering with a different entrypoint.`,
+      );
+    }
     const mount: GraphMount = {
       entrypoint: subsystem.entrypoint,
       env: subsystem.env,
@@ -1057,5 +1105,9 @@ export class HardwareAwareScheduler {
     this.graphWorkers.clear();
     this.graphSpecs.clear();
     this.graphTimeouts.clear();
+    // A paused-then-terminated scheduler that is started again used to
+    // refuse all work with WorkPausedError until someone called
+    // resumeWork, with no error at start time. Shutdown clears the pause.
+    this.isWorkPaused = false;
   }
 }

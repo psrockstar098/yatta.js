@@ -407,3 +407,125 @@ describe("deploy command", () => {
     expect(outcome.lines.join("\n")).toContain("Configured: docker");
   });
 });
+
+describe("corrupt manifest", () => {
+  it("status and config report it cleanly instead of crashing on manifest.deployment", () => {
+    const root = track(fixture(SCAFFOLD));
+    mkdirSync(join(root, ".yatta"), { recursive: true });
+    // Hand-edited manifest missing the `deployment` section entirely.
+    writeFileSync(
+      join(root, ".yatta", "deploy.json"),
+      JSON.stringify({ version: 1, platform: "docker", healthcheck: "/health/z", instances: 1, templateVersion: 1 }),
+      "utf8",
+    );
+    const status = runDeploy(root, ["status"]);
+    expect(status.code).toBe(1);
+    expect(status.lines.join("\n")).toMatch(/incomplete or corrupt.*`deployment`.* is missing/);
+    const config = runDeploy(root, ["config"]);
+    expect(config.code).toBe(1);
+    expect(config.lines.join("\n")).toContain("incomplete or corrupt");
+    const doctor = runDeploy(root, ["doctor"]);
+    expect(doctor.lines.join("\n")).toContain("incomplete or corrupt");
+  });
+
+  it("a manifest that is not valid JSON is reported the same way", () => {
+    const root = track(fixture(SCAFFOLD));
+    mkdirSync(join(root, ".yatta"), { recursive: true });
+    writeFileSync(join(root, ".yatta", "deploy.json"), "{not json", "utf8");
+    const status = runDeploy(root, ["status"]);
+    expect(status.code).toBe(1);
+    expect(status.lines.join("\n")).toMatch(/not valid JSON/);
+  });
+});
+
+describe("generated-file quoting", () => {
+  it("quotes a scoped package name in render.yaml and a branch with YAML-special characters", () => {
+    const root = track(fixture(SCAFFOLD));
+    const detected = detectProject(root);
+    expect("error" in detected).toBe(false);
+    if ("error" in detected) return;
+    const manifest = buildManifest("render", "native", "fix: thing", "/health/z");
+    const files = renderAdapter.generate({ ...detected.project, name: "@psrockstar098/my-app" }, manifest);
+    const blueprint = files.find((f) => f.path === "render.yaml")!;
+    expect(blueprint.content).toContain("name: '@psrockstar098/my-app'");
+    const workflow = files.find((f) => f.path.endsWith("deploy.yml"))!;
+    expect(workflow.content).toContain("branches: ['fix: thing']");
+  });
+
+  it("escapes quotes in the Railway service and project names", () => {
+    const root = track(fixture(SCAFFOLD));
+    const detected = detectProject(root);
+    expect("error" in detected).toBe(false);
+    if ("error" in detected) return;
+    const manifest = buildManifest("railway", "native", "main", "/health/z");
+    const files = railwayAdapter.generate({ ...detected.project, name: 'my"app' }, manifest);
+    const ts = files.find((f) => f.path === ".railway/railway.ts")!;
+    expect(ts.content).toContain('service("my\\"app"');
+    expect(ts.content).toContain('project("my\\"app"');
+    expect(ts.content).not.toContain('service("my"app"');
+  });
+
+  it("quotes branches in the docker and northflank workflows", () => {
+    const root = track(fixture(SCAFFOLD));
+    const detected = detectProject(root);
+    expect("error" in detected).toBe(false);
+    if ("error" in detected) return;
+    const manifest = buildManifest("docker", "github-actions", "release: v2", "/health/z");
+    const docker = dockerAdapter.generate(detected.project, manifest);
+    expect(docker.find((f) => f.path.endsWith("deploy.yml"))!.content).toContain(
+      "branches: ['release: v2']",
+    );
+    const northflank = northflankAdapter.generate(detected.project, manifest);
+    expect(northflank.find((f) => f.path.endsWith("deploy.yml"))!.content).toContain(
+      "branches: ['release: v2']",
+    );
+  });
+});
+
+describe("dockerfile lockfile handling", () => {
+  it("fails on lockfile drift instead of falling back to an unpinned install", () => {
+    const root = track(fixture(SCAFFOLD));
+    const detected = detectProject(root);
+    expect("error" in detected).toBe(false);
+    if ("error" in detected) return;
+    const manifest = buildManifest("docker", "github-actions", "main", "/health/z");
+    const dockerfile = dockerAdapter.generate(detected.project, manifest).find((f) => f.path === "Dockerfile")!;
+    expect(dockerfile.content).not.toContain("|| bun install");
+    expect(dockerfile.content).toContain("bun install --frozen-lockfile");
+    expect(dockerfile.content).toContain("if [ -f bun.lock ]");
+  });
+});
+
+describe("deploy doctor and flags", () => {
+  it("still warns about tag-pinned actions when the workflow has drifted", () => {
+    const root = track(fixture(SCAFFOLD));
+    runDeploy(root, ["--yes", "--platform", "docker"]);
+    // Drift the workflow without removing the tag-pinned action.
+    const workflow = join(root, ".github", "workflows", "deploy.yml");
+    writeFileSync(workflow, readFileSync(workflow, "utf8") + "\n# my note\n", "utf8");
+    const doctor = runDeploy(root, ["doctor"]);
+    expect(doctor.lines.join("\n")).toContain("tag-pinned");
+  });
+
+  it("--registry on a non-docker platform warns instead of being silently ignored", () => {
+    const root = track(fixture(SCAFFOLD));
+    const outcome = runDeploy(root, ["--dry-run", "--platform", "render", "--registry", "ghcr"]);
+    expect(outcome.lines.join("\n")).toContain("--registry ghcr only applies to --platform docker");
+  });
+});
+
+describe("interactive confirmation", () => {
+  it("readConfirmationLine returns after the first line, not at EOF", async () => {
+    const { readConfirmationLine } = await import("../deploy/cli");
+    const { openSync, closeSync } = await import("node:fs");
+    const root = track(fixture(SCAFFOLD));
+    const input = join(root, "input.txt");
+    writeFileSync(input, "y\nrest of stdin that must not be consumed\n", "utf8");
+    const fd = openSync(input, "r");
+    try {
+      expect(readConfirmationLine(fd)).toBe("y");
+    } finally {
+      closeSync(fd);
+    }
+  });
+});

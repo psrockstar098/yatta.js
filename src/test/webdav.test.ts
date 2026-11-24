@@ -1,6 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import {
   createWebDAVHandler,
+  createStorageDavStore,
   type DavStore,
   type DavFile,
   type DavEntry,
@@ -506,5 +507,74 @@ describe("WebDAV", () => {
     expect(prefixTrick.status).toBe(400);
     const kept = await handle(req("http://x/dav/src.txt"));
     expect(kept.status).toBe(200);
+  });
+});
+
+describe("WebDAV storage-backed store", () => {
+  // A fake disk shaped like the storage engine, so the store's
+  // exists()/isCollection() logic is exercised without a real disk.
+  function diskStore(files: Map<string, { size: number }>, opts: { headThrows?: Error } = {}) {
+    const disk = {
+      async upload() {},
+      async download(key: string) {
+        return { arrayBuffer: async () => new ArrayBuffer(0), contentType: "text/plain", lastModified: new Date() };
+      },
+      async head(key: string) {
+        if (opts.headThrows) throw opts.headThrows;
+        const f = files.get(key);
+        if (!f) {
+          const err = new Error(`File not found: "${key}"`);
+          err.name = "FileNotFoundError";
+          (err as any).status = 404;
+          throw err;
+        }
+        return { size: f.size, contentType: "text/plain", lastModified: new Date() };
+      },
+      async delete() {},
+      async copy() {},
+      async move() {},
+      async exists(key: string) {
+        return files.has(key);
+      },
+      async list(options?: { prefix?: string }) {
+        const prefix = options?.prefix ?? "";
+        return [...files.keys()]
+          .filter((k) => k.startsWith(prefix))
+          .map((k) => ({ path: k, size: files.get(k)!.size, contentType: "text/plain", lastModified: new Date() }));
+      },
+    };
+    return createStorageDavStore(disk as any);
+  }
+
+  it("exists() rethrows a storage outage instead of reporting 404", async () => {
+    const store = diskStore(new Map(), { headThrows: new Error("storage is down") });
+    await expect(store.exists("a.txt")).rejects.toThrow(/storage is down/);
+    // ...while a genuinely missing file is still false.
+    const missing = diskStore(new Map());
+    expect(await missing.exists("a.txt")).toBe(false);
+  });
+
+  it("isCollection() treats a file as a file even when a/b also exists", async () => {
+    const files = new Map([
+      ["a", { size: 3 }],
+      ["a/b", { size: 3 }],
+    ]);
+    const store = diskStore(files);
+    expect(await store.isCollection("a")).toBe(false);
+    expect(await store.exists("a")).toBe(true);
+  });
+
+  it("UNLOCK accepts the token in the If header, not only Lock-Token", async () => {
+    const handle = dav(memoryStore());
+    await handle(req("http://x/dav/f.txt", { method: "PUT", body: "v1" }));
+    const lock = await handle(req("http://x/dav/f.txt", { method: "LOCK", body: LOCK_BODY }));
+    expect(lock.status).toBe(200);
+    const token = lock.headers.get("Lock-Token") ?? "";
+    const unlock = await handle(
+      req("http://x/dav/f.txt", { method: "UNLOCK", headers: { If: `(Not <wrong>) (<${token.replace(/[<>]/g, "")}>)` } }),
+    );
+    // The (Not <wrong>) clause must not count, but the real token in
+    // the same If header does.
+    expect(unlock.status).toBe(204);
   });
 });

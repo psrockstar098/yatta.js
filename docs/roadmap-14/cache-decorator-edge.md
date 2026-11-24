@@ -72,6 +72,10 @@ const cache = new EdgeAwareCacheEngine({
 await cache.invalidateTags("users");
 // Local entries tagged "users" are gone, and the same tags are purged
 // at the configured edge provider. No provider, no network call.
+// The edge purge is fire-and-forget: invalidateTags returns the local
+// eviction count immediately, and the purge runs in the background
+// (fail-open with a warning), so a slow or down edge never blocks
+// local invalidation.
 ```
 
 One-time setup, then it is automatic. "Automatic" means

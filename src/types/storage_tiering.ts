@@ -94,6 +94,13 @@ export interface AccessTracker {
  */
 export class InMemoryAccessTracker implements AccessTracker {
   private records = new Map<string, AccessRecord>();
+  /**
+   * @param maxEntries Most keys ever tracked. Records are never expired,
+   * so without a cap every key ever accessed stayed in the map forever.
+   * When the cap is hit the least-recently-recorded key is dropped; its
+   * file simply falls back to its last-modified time.
+   */
+  constructor(private readonly maxEntries = 10_000) {}
 
   record(key: string, atMs: number, windowMs: number): AccessRecord {
     const clean = cleanTierKey(key);
@@ -106,10 +113,19 @@ export class InMemoryAccessTracker implements AccessTracker {
         readsInWindow: 1,
       };
       this.records.set(clean, record);
+      while (this.records.size > this.maxEntries) {
+        const oldest = this.records.keys().next().value;
+        if (oldest === undefined) break;
+        this.records.delete(oldest);
+      }
       return record;
     }
     existing.lastAccessMs = atMs;
     existing.accesses += 1;
+    // Refresh insertion order so cap eviction drops the key recorded
+    // longest ago, not the key first seen longest ago.
+    this.records.delete(clean);
+    this.records.set(clean, existing);
     if (atMs - existing.windowStartMs > windowMs) {
       existing.windowStartMs = atMs;
       existing.readsInWindow = 1;
@@ -345,9 +361,17 @@ export class TieredStorage {
     const clean = cleanTierKey(key);
     const sourceHead = await source.head(clean);
     const sourceFile = await source.download(clean);
+    // Internal tier copy, not a user upload: cap at the source file's own
+    // size (the destination's 100MB default would strand every file over
+    // it in hot storage forever), and skip the destination's content-type
+    // allowlist / magic-byte checks — the file was already validated when
+    // it was first uploaded.
     await dest.upload(clean, sourceFile.stream(), {
       contentType: sourceHead.contentType,
       metadata: sourceHead.metadata,
+      maxSize: sourceHead.size,
+      allowedTypes: [],
+      verifyMagicBytes: false,
     });
     let verified = false;
     try {
@@ -554,24 +578,38 @@ export class TieredStorage {
   async runOnce(nowMs?: number): Promise<TierRunResult> {
     const now = nowMs ?? this.now();
     const result: TierRunResult = { moved: [], promoted: [], skipped: [], failed: [] };
-    const hotFiles = await this.hot.list({ limit: 10_000 });
-    for (const file of hotFiles) {
-      // A listed key with a ".." segment is never moved: normalising it
-      // would move a different file than the listing named.
-      if (file.path.split("/").some((part) => part === "..")) {
-        result.skipped.push(file.path);
-        continue;
+    // Page through the whole hot set with the driver's cursor: the list
+    // used to be capped at 10,000 with no pagination, so files beyond
+    // the cap never aged out. Stale keys are collected first and moved
+    // afterwards, so moves cannot shift the paging offsets mid-scan.
+    const staleKeys: string[] = [];
+    let offset = 0;
+    for (;;) {
+      const page = await this.hot.list({ limit: 10_000, cursor: String(offset) });
+      if (page.length === 0) break;
+      offset += page.length;
+      for (const file of page) {
+        // A listed key with a ".." segment is never moved: normalising it
+        // would move a different file than the listing named.
+        if (file.path.split("/").some((part) => part === "..")) {
+          result.skipped.push(file.path);
+          continue;
+        }
+        const key = sanitizeKey(file.path);
+        if (this.moving.has(key)) {
+          result.skipped.push(key);
+          continue;
+        }
+        const lastActivity = this.lastActivityMs(key, file);
+        if (now - lastActivity < this.staleAfterMs) {
+          result.skipped.push(key);
+          continue;
+        }
+        staleKeys.push(key);
       }
-      const key = sanitizeKey(file.path);
-      if (this.moving.has(key)) {
-        result.skipped.push(key);
-        continue;
-      }
-      const lastActivity = this.lastActivityMs(key, file);
-      if (now - lastActivity < this.staleAfterMs) {
-        result.skipped.push(key);
-        continue;
-      }
+      if (page.length < 10_000) break;
+    }
+    for (const key of staleKeys) {
       const move = await this.moveToCold(key);
       if (move.moved) {
         result.moved.push(key);

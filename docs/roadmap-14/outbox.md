@@ -103,6 +103,12 @@ mean "nothing was ever published there".
   it, so duplicates rise.
 - A publish function with no timeout of its own can stall a scan.
   Pass `publishTimeoutMs` when the publish target has no timeout.
+  A timeout counts as a publish failure (attempts + 1 with backoff,
+  so a hung publish is retried and eventually dead-lettered) — but the
+  publish is still running, and if it later succeeds the row is marked
+  published, so a merely slow publish is not delivered twice. A
+  publish slower than timeout + backoff can still duplicate: past the
+  backoff the original is treated as abandoned and the retry proceeds.
 - Never put secrets in a payload. The log is retained as history.
 - A duplicate event id or dedupe key is rejected at record time.
   That is the write-time dedupe working, not a bug.

@@ -34,7 +34,7 @@ import type {
   StorageCapabilities,
   ValidationResult,
 } from "./types";
-import { DEPLOY_TEMPLATE_VERSION } from "./types";
+import { DEPLOY_TEMPLATE_VERSION, yamlQuote } from "./types";
 
 function workflow(manifest: DeployManifest): string {
   return [
@@ -58,7 +58,7 @@ function workflow(manifest: DeployManifest): string {
     "",
     "on:",
     "  push:",
-    `    branches: [${manifest.deployment.branch}]`,
+    `    branches: [${yamlQuote(manifest.deployment.branch)}]`,
     "",
     "concurrency:",
     "  group: production-deploy",

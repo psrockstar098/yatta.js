@@ -394,6 +394,22 @@ const CONFIG_KEYS = [
  * CLI flags win over config values; --asset appends only when no
  * --asset flag was given.
  */
+
+/** Parse a build config file: JSON5 under Bun, plain JSON anywhere else. Exported for tests. */
+export function parseBuildConfig(text: string): unknown {
+  const json5 = (
+    typeof Bun !== "undefined" ? Bun : undefined
+  ) as unknown as { JSON5?: { parse: (text: string) => unknown } } | undefined;
+  if (json5?.JSON5) return json5.JSON5.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new Error(
+      `Not valid JSON, and JSON5 config files need Bun to parse — run under Bun. (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+}
+
 function applyConfig(
   cwd: string,
   opts: BuildArgs,
@@ -406,7 +422,12 @@ function applyConfig(
   }
   let raw: unknown;
   try {
-    raw = Bun.JSON5.parse(readFileSync(path, "utf8"));
+    // `Bun.JSON5` is feature-detected, not assumed: under Node 22
+    // `Bun` does not exist, and the bare reference used to throw a
+    // ReferenceError that was caught below as a misleading "did not
+    // parse". Plain JSON still parses anywhere; a JSON5 file (comments,
+    // trailing commas) genuinely needs Bun to parse.
+    raw = parseBuildConfig(readFileSync(path, "utf8"));
   } catch (err) {
     return {
       error: `Config file "${opts.config}" did not parse: ${err instanceof Error ? err.message : String(err)}`,

@@ -10,6 +10,7 @@ import {
   decodeFrames,
   createGrpcWebHandler,
   grpcWebCall,
+  GrpcStatus,
   concat,
 } from "../func/grpcweb";
 
@@ -122,6 +123,33 @@ describe("gRPC-Web handler", () => {
         encodeStringField(1, "over http"),
       );
       expect(fieldString(decodeMessage(reply), 1)).toBe("over http");
+    } finally {
+      server.stop();
+    }
+  });
+});
+
+describe("grpcWebCall HTTP mapping", () => {
+  it("maps HTTP 400 to INVALID_ARGUMENT, not INTERNAL", async () => {
+    // A plain HTTP 400 (e.g. a proxy rejecting the request) is a bad
+    // request, not an internal error.
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => new Response("bad request", { status: 400 }),
+    });
+    try {
+      const err = await grpcWebCall(
+        `http://127.0.0.1:${server.port}/grpc-web`,
+        "yatta.Echo",
+        "Echo",
+        encodeStringField(1, "x"),
+      ).then(
+        () => null,
+        (e) => e,
+      );
+      expect(err).not.toBeNull();
+      expect(err.code).toBe(GrpcStatus.INVALID_ARGUMENT);
+      expect(err.code).toBe(3);
     } finally {
       server.stop();
     }

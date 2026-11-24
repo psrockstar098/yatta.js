@@ -87,3 +87,23 @@ describe("WebFinger", () => {
     expect(nonAcct.status).toBe(404);
   });
 });
+
+describe("WebFinger host scoping", () => {
+  it("answers only for hosts in the list, never for any domain", async () => {
+    // The store holds an account under both domains, so the only thing
+    // deciding the answer is the hosts list.
+    const findUserByEmail = async (email: string) => ({ id: "1", email });
+    const scoped = createUserWebFingerLookup({
+      findUserByEmail,
+      appUrl: "https://example.com",
+      hosts: ["example.com"],
+    });
+    expect(await scoped("acct:ada@example.com")).not.toBeNull();
+    // Same local part at another domain must not answer, even though
+    // the store holds the address — without `hosts` this endpoint was
+    // an account-existence oracle for any domain.
+    expect(await scoped("acct:ada@other.com")).toBeNull();
+    const unscoped = createUserWebFingerLookup({ findUserByEmail, appUrl: "https://example.com" });
+    expect(await unscoped("acct:ada@other.com")).not.toBeNull();
+  });
+});

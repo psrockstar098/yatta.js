@@ -1293,3 +1293,15 @@ describe("a fresh scaffold's standalone binary (F3)", () => {
     expect(bytes.includes(Buffer.from(proj))).toBe(false);
   });
 });
+
+describe("parseBuildConfig", () => {
+  it("parses JSON5 (comments, trailing commas) under Bun and plain JSON anywhere", async () => {
+    const { parseBuildConfig } = await import("../build_standalone");
+    expect(parseBuildConfig(`{\n  // a comment\n  entry: "server.ts",\n  out: "dist/x",\n}\n`)).toEqual({
+      entry: "server.ts",
+      out: "dist/x",
+    });
+    expect(parseBuildConfig(`{"entry": "server.ts"}`)).toEqual({ entry: "server.ts" });
+    expect(() => parseBuildConfig(`{ entry: "server.ts", }`)).not.toThrow();
+  });
+});

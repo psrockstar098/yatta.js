@@ -46,20 +46,39 @@ function encodeName(name: string): Uint8Array {
 function decodeName(data: Uint8Array, offset: number): { name: string; next: number } {
   const labels: string[] = [];
   let i = offset;
+  // The offset just past this name in the message — set when the first
+  // compression pointer is followed, because a pointer jumps elsewhere
+  // and the bytes after the pointer belong to the next field.
+  let next: number | null = null;
+  // Compression pointers (RFC 1035 §4.1.4): real servers compress answer
+  // names as a matter of course, so refusing them broke resolveDoH
+  // against every real DoH server. Follow pointers with a jump limit
+  // and a visited set, so a malicious pointer loop cannot spin forever.
+  const visited = new Set<number>();
+  let pointerJumps = 0;
   for (;;) {
     if (i >= data.length) throw new Error("Truncated DNS name");
     const len = data[i];
     if (len === undefined) throw new Error("Truncated DNS name");
     i++;
     if (len === 0) break;
-    // Compressed names (top bits set) never appear in queries we build,
-    // and we refuse them rather than guess.
+    if ((len & 0xc0) === 0xc0) {
+      if (i >= data.length) throw new Error("Truncated DNS name");
+      const pointer = ((len & 0x3f) << 8) | data[i]!;
+      if (next === null) next = i + 1;
+      if (pointer >= data.length) throw new Error("Bad DNS compression pointer");
+      if (visited.has(pointer)) throw new Error("DNS compression pointer loop");
+      if (++pointerJumps > 10) throw new Error("Too many DNS compression pointers");
+      visited.add(pointer);
+      i = pointer;
+      continue;
+    }
     if ((len & 0xc0) !== 0) throw new Error("Compressed DNS names are not supported");
     if (i + len > data.length) throw new Error("Truncated DNS name");
     labels.push(new TextDecoder().decode(data.slice(i, i + len)));
     i += len;
   }
-  return { name: labels.join("."), next: i };
+  return { name: labels.join("."), next: next ?? i };
 }
 
 function u16(data: Uint8Array, offset: number): number {
@@ -135,7 +154,38 @@ function bytesToIp(bytes: Uint8Array): string {
   for (let i = 0; i < 16; i += 2) {
     groups.push(((bytes[i]! << 8) | bytes[i + 1]!).toString(16));
   }
-  return groups.join(":");
+  // Canonical form (RFC 5952): compress the longest run of zero groups
+  // (at least two) with "::". An uncompressed expansion like
+  // "2606:2800:0:0:0:0:0:1" is valid but non-canonical, so the same
+  // address compared unequal as a string.
+  let bestStart = -1;
+  let bestLen = 0;
+  let runStart = -1;
+  let runLen = 0;
+  for (let i = 0; i <= groups.length; i++) {
+    if (i < groups.length && groups[i] === "0") {
+      if (runStart === -1) {
+        runStart = i;
+        runLen = 1;
+      } else {
+        runLen++;
+      }
+    } else {
+      if (runLen > bestLen) {
+        bestStart = runStart;
+        bestLen = runLen;
+      }
+      runStart = -1;
+      runLen = 0;
+    }
+  }
+  if (bestLen < 2) return groups.join(":");
+  const head = groups.slice(0, bestStart).join(":");
+  const tail = groups.slice(bestStart + bestLen).join(":");
+  if (head === "" && tail === "") return "::";
+  if (head === "") return `::${tail}`;
+  if (tail === "") return `${head}::`;
+  return `${head}::${tail}`;
 }
 
 // Builds a DNS reply for one question. rcode: 0 ok, 2 server fail,
@@ -341,12 +391,15 @@ export async function resolveDoH(
   endpoint: string,
   name: string,
   type: DnsRecordType = "A",
+  options: { timeoutMs?: number } = {},
 ): Promise<DnsAnswer[]> {
   const id = Math.floor(Math.random() * 0xffff);
+  // No timeout meant a hung DoH server hung the caller forever.
   const res = await fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/dns-message" },
     body: encodeQuery(id, name, DNS_TYPE_CODES[type]) as BodyInit,
+    signal: AbortSignal.timeout(options.timeoutMs ?? 5000),
   });
   if (!res.ok) throw new Error(`DoH server answered ${res.status}`);
   const decoded = decodeResponse(new Uint8Array(await res.arrayBuffer()));
