@@ -427,19 +427,21 @@ describe("Yatta Auth — MFA enrolment round trip", () => {
       security: { allowUnverifiedSession: true },
     });
 
+    const email = `mfa-${Date.now()}@t.dev`;
     const user = await auth.signUp({
-      email: `mfa-${Date.now()}@t.dev`,
+      email,
       password: "Password123!",
     });
 
     const userId = "user" in user ? user.user.id : (user as any).userId;
-    return { auth, userId };
+    return { auth, userId, email };
   }
 
   it("completes enrolment, which it previously never could", async () => {
-    const { auth, userId } = await enrolledAuth();
+    const { auth, userId, email } = await enrolledAuth();
+    const req = await signedInRequest(auth, email);
 
-    const { secret, uri } = await auth.mfa.beginSetup(userId);
+    const { secret, uri } = await auth.mfa.beginSetup(userId, "Yatta App", req);
 
     expect(secret).toBeString();
     expect(uri).toContain("otpauth://totp/");
@@ -450,7 +452,7 @@ describe("Yatta Auth — MFA enrolment round trip", () => {
      * and every enrolment ended in "MFA setup timed out". A test that only
      * checked beginSetup's return value would never have noticed.
      */
-    const result = await auth.mfa.confirmSetup(userId, currentCode(secret));
+    const result = await auth.mfa.confirmSetup(userId, currentCode(secret), req);
 
     expect(result.recoveryCodes).toHaveLength(10);
 
@@ -462,39 +464,44 @@ describe("Yatta Auth — MFA enrolment round trip", () => {
   });
 
   it("rejects a wrong code and leaves enrolment retryable", async () => {
-    const { auth, userId } = await enrolledAuth();
-    const { secret } = await auth.mfa.beginSetup(userId);
+    const { auth, userId, email } = await enrolledAuth();
+    const req = await signedInRequest(auth, email);
+    const { secret } = await auth.mfa.beginSetup(userId, "Yatta App", req);
 
-    await expect(auth.mfa.confirmSetup(userId, "000000")).rejects.toThrow();
+    await expect(auth.mfa.confirmSetup(userId, "000000", req)).rejects.toThrow();
 
     // The pending entry must survive a wrong code, or one typo forces the user
     // to re-enrol and re-scan.
-    const { secret: again } = await auth.mfa.beginSetup(userId);
+    const { secret: again } = await auth.mfa.beginSetup(userId, "Yatta App", req);
     expect(again).toBeString();
     expect(again).not.toBe(secret);
   });
 
   it("refuses when no enrolment is pending", async () => {
-    const { auth, userId } = await enrolledAuth();
-    await expect(auth.mfa.confirmSetup(userId, "123456")).rejects.toThrow(/timed out/i);
+    const { auth, userId, email } = await enrolledAuth();
+    const req = await signedInRequest(auth, email);
+    await expect(auth.mfa.confirmSetup(userId, "123456", req)).rejects.toThrow(/timed out/i);
   });
 
   it("clears the pending entry once enrolment succeeds", async () => {
-    const { auth, userId } = await enrolledAuth();
-    const { secret } = await auth.mfa.beginSetup(userId);
-    await auth.mfa.confirmSetup(userId, currentCode(secret));
+    const { auth, userId, email } = await enrolledAuth();
+    const req = await signedInRequest(auth, email);
+    const { secret } = await auth.mfa.beginSetup(userId, "Yatta App", req);
+    await auth.mfa.confirmSetup(userId, currentCode(secret), req);
 
     // A second confirm must not succeed: the entry has to be consumed.
-    await expect(auth.mfa.confirmSetup(userId, currentCode(secret))).rejects.toThrow();
+    await expect(
+      auth.mfa.confirmSetup(userId, currentCode(secret), req),
+    ).rejects.toThrow();
   });
 
   /*
    * Enrolment used to take only a user id: any caller that could produce one
    * could turn 2FA on for that account — and a merely-alive session was never
-   * asked how recently it authenticated. Passing the request gates both
-   * steps on a freshly authenticated session for this user, the same gate
-   * `disable` already has. The request stays optional so existing callers
-   * keep working, but an app that omits it is asserting it already checked.
+   * asked how recently it authenticated. The request is now required (both
+   * steps): it gates enrolment on a freshly authenticated session for this
+   * user, the same gate `disable` already has. A call without one is refused
+   * outright, in types and at runtime.
    */
   async function signedInRequest(
     auth: ReturnType<typeof createAuth>,
@@ -513,6 +520,19 @@ describe("Yatta Auth — MFA enrolment round trip", () => {
       headers: { cookie: `yatta_session=${token}` },
     });
   }
+
+  it("refuses enrolment when no request is passed", async () => {
+    const { auth, userId } = await enrolledAuth();
+
+    // A plain-JS caller can still pass undefined despite the type: the
+    // refusal must be explicit, not a TypeError from session lookup.
+    await expect(
+      auth.mfa.beginSetup(userId, "Yatta App", undefined as any),
+    ).rejects.toThrow(/request is required/i);
+    await expect(
+      auth.mfa.confirmSetup(userId, "123456", undefined as any),
+    ).rejects.toThrow(/request is required/i);
+  });
 
   it("requires a recently authenticated session to begin enrolment", async () => {
     const { auth, userId } = await enrolledAuth();
@@ -549,7 +569,11 @@ describe("Yatta Auth — MFA enrolment round trip", () => {
     const { auth, userId } = await enrolledAuth();
     const email = (await auth.store.findUserById(userId))!.email;
 
-    const { secret } = await auth.mfa.beginSetup(userId);
+    const { secret } = await auth.mfa.beginSetup(
+      userId,
+      "Yatta App",
+      await signedInRequest(auth, email),
+    );
     const stale = await signedInRequest(auth, email, 20 * 60_000);
     await expect(
       auth.mfa.confirmSetup(userId, currentCode(secret), stale),

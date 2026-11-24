@@ -1,5 +1,14 @@
 import { createRealtime } from "../types/realtime";
-import { auth } from "./auth";
+
+// The auth engine is imported lazily, inside `authenticate`, not at module
+// scope: importing it here pulled the whole auth chain (~260ms of import
+// time, measured) into every process that touches realtime — including
+// server startup, which imports this module before it serves anything.
+// A realtime connection pays one cached dynamic import (~2µs); a server
+// that never takes a realtime connection never pays the 260ms.
+async function getAuth() {
+  return (await import("./auth")).auth;
+}
 
 export const realtime = createRealtime<{ userId: string }>({
   /*
@@ -16,6 +25,7 @@ export const realtime = createRealtime<{ userId: string }>({
    */
   authenticate: async (req) => {
     try {
+      const auth = await getAuth();
       const session = await auth.getSession(req, { autoRefresh: false });
       return session ? { userId: session.user.id } : null;
     } catch {

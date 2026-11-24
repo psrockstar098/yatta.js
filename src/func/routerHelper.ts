@@ -57,15 +57,20 @@ oauthServer.setIdTokenIssuer(oidc.issueIdToken);
 // The package version, for the MCP server info: read from package.json
 // instead of a hardcoded string that goes stale on every release (the
 // MCP endpoint reported 1.0.5 while the package was 1.0.6).
+// Read once: the old code called this on every /mcp request, and a
+// readFileSync + JSON.parse per request cost ~47µs (measured).
+let cachedPkgVersion: string | undefined;
 function pkgVersion(): string {
+  if (cachedPkgVersion !== undefined) return cachedPkgVersion;
   try {
     const parsed = JSON.parse(readFileSync(path.join(import.meta.dir, "../package.json"), "utf8")) as {
       version?: unknown;
     };
-    return typeof parsed.version === "string" ? parsed.version : "unknown";
+    cachedPkgVersion = typeof parsed.version === "string" ? parsed.version : "unknown";
   } catch {
-    return "unknown";
+    cachedPkgVersion = "unknown";
   }
+  return cachedPkgVersion;
 }
 
 // The OAuth token endpoint has no rate limiting of its own, and the
@@ -98,6 +103,76 @@ function webFingerHosts(): string[] {
   } catch {
     return ["localhost"];
   }
+}
+
+// WebFinger and MCP handlers, built once and shared across requests.
+//
+// Both used to be constructed fresh on every request: two dynamic
+// imports each (~2.25µs apiece, measured) plus a new handler, a new
+// lookup and — for MCP — a package.json read per request. The handlers
+// are stateless — the WebFinger lookup reads the auth store per call
+// and the MCP handler rebuilds its tool surface per request inside
+// loadTools(), so sharing the handler changes no behaviour: a table
+// added by a migration still appears on the next /mcp call, because
+// getSurface runs per request, not at construction.
+//
+// Built lazily on first use, not at import time: importing this router
+// must not pull the auth engine or the MCP module in early (see #12).
+type SharedHandler = (req: Request) => Promise<Response>;
+let webfingerHandlerPromise: Promise<SharedHandler> | null = null;
+function getWebFingerHandler(): Promise<SharedHandler> {
+  if (!webfingerHandlerPromise) {
+    webfingerHandlerPromise = (async () => {
+      const { createWebFingerHandler, createUserWebFingerLookup } = await import(
+        "./webfinger"
+      );
+      const { SQLiteAuthStore } = await import("./auth");
+      return createWebFingerHandler(
+        createUserWebFingerLookup({
+          findUserByEmail: (email) => new SQLiteAuthStore().findUserByEmail(email),
+          appUrl: process.env.APP_URL || "http://localhost:4000",
+          hosts: webFingerHosts(),
+        }),
+      );
+    })();
+  }
+  return webfingerHandlerPromise;
+}
+
+let mcpHandlerPromise: Promise<SharedHandler> | null = null;
+function getMcpHandler(): Promise<SharedHandler> {
+  if (!mcpHandlerPromise) {
+    mcpHandlerPromise = (async () => {
+      const { createMCPHandler, surfaceFromTables } = await import("./mcp");
+      const { db } = await import("./db");
+      return createMCPHandler({
+        serverVersion: pkgVersion(),
+        resolveUser: async (req) => {
+          const { auth } = await import("./auth");
+          const user = await auth.getUser(req);
+          if (user) return user.id;
+          const bearer = (req.headers.get("authorization") ?? "").match(
+            /^Bearer\s+(.+)$/i,
+          );
+          const token = bearer?.[1];
+          if (token) {
+            const info = oauthServer.getAccessToken(token);
+            if (info?.userId) return info.userId;
+          }
+          return null;
+        },
+        getSurface: () => {
+          const tables: Record<string, never> = {};
+          const schema = (db as unknown as { schema?: Record<string, unknown> }).schema ?? {};
+          for (const name of Object.keys(schema)) {
+            tables[name] = (db as unknown as { table: (n: string) => never }).table(name);
+          }
+          return surfaceFromTables(tables);
+        },
+      });
+    })();
+  }
+  return mcpHandlerPromise;
 }
 
 // Always resolve relative to this file to guarantee correct path regardless of current working directory
@@ -218,18 +293,10 @@ export default async function routers(
   }
 
   // 2e. WebFinger discovery (1.0.6), backed by the auth store.
+  // The handler is built once and shared (see getWebFingerHandler):
+  // constructing it per request re-imported two modules every time.
   if (url.pathname === "/.well-known/webfinger") {
-    const { createWebFingerHandler, createUserWebFingerLookup } = await import(
-      "./webfinger"
-    );
-    const { SQLiteAuthStore } = await import("./auth");
-    const handler = createWebFingerHandler(
-      createUserWebFingerLookup({
-        findUserByEmail: (email) => new SQLiteAuthStore().findUserByEmail(email),
-        appUrl: process.env.APP_URL || "http://localhost:4000",
-        hosts: webFingerHosts(),
-      }),
-    );
+    const handler = await getWebFingerHandler();
     return withSecurityHeaders(await handler(req), isHttps);
   }
 
@@ -264,34 +331,11 @@ export default async function routers(
   // own database collections (auth tables are never exposed); the
   // caller must be signed in with a Yatta session or an OAuth token
   // from this same server.
+  // The handler is built once and shared (see getMcpHandler): building
+  // it per request re-imported two modules and re-read package.json
+  // (~47µs) every time.
   if (url.pathname === "/mcp" && process.env.MCP_ENABLED !== "0") {
-    const { createMCPHandler, surfaceFromTables } = await import("./mcp");
-    const { db } = await import("./db");
-    const handler = createMCPHandler({
-      serverVersion: pkgVersion(),
-      resolveUser: async (req) => {
-        const { auth } = await import("./auth");
-        const user = await auth.getUser(req);
-        if (user) return user.id;
-        const bearer = (req.headers.get("authorization") ?? "").match(
-          /^Bearer\s+(.+)$/i,
-        );
-        const token = bearer?.[1];
-        if (token) {
-          const info = oauthServer.getAccessToken(token);
-          if (info?.userId) return info.userId;
-        }
-        return null;
-      },
-      getSurface: () => {
-        const tables: Record<string, never> = {};
-        const schema = (db as unknown as { schema?: Record<string, unknown> }).schema ?? {};
-        for (const name of Object.keys(schema)) {
-          tables[name] = (db as unknown as { table: (n: string) => never }).table(name);
-        }
-        return surfaceFromTables(tables);
-      },
-    });
+    const handler = await getMcpHandler();
     return withSecurityHeaders(await handler(req), isHttps);
   }
 

@@ -407,3 +407,28 @@ describe("the world-readable warning", () => {
     } catch {}
   });
 });
+
+describe("local driver list() missing-prefix early return", () => {
+  it("returns [] for a missing prefix dir, and still lists a real directory", async () => {
+    // Regression: the early return once probed the scan root with
+    // statFile(), which returns null for directories as well as missing
+    // paths — so every directory listed as empty. A missing prefix must
+    // return [], a real directory must still return its files.
+    const dir = fs.mkdtempSync(path.join("/tmp", "yatta-storage-list-"));
+    try {
+      const driver = new LocalStorageDriver({
+        driver: "local",
+        baseDir: dir,
+        secret: "test-storage-secret-that-is-not-real",
+      });
+      await driver.upload("real/file.txt", "hello", { contentType: "text/plain" });
+      expect(await driver.list({ prefix: "missing-dir/" })).toEqual([]);
+      expect(await driver.list({ prefix: "missing-dir", limit: 5 })).toEqual([]);
+      const listed = await driver.list({ prefix: "real/" });
+      expect(listed.map((f: any) => f.path)).toEqual(["real/file.txt"]);
+      expect(await driver.list({})).toHaveLength(1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

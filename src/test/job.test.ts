@@ -139,8 +139,10 @@ describe("Yatta Jobs, Scheduler & Events", () => {
       // Month 0 or 13
       expect(() => new CronExpression("* * * 0 *")).toThrow(/bounds/);
       expect(() => new CronExpression("* * * 13 *")).toThrow(/bounds/);
-      // Day of week 7
-      expect(() => new CronExpression("* * * * 7")).toThrow(/bounds/);
+      // Day of week 8
+      expect(() => new CronExpression("* * * * 8")).toThrow(/bounds/);
+      // Day of week 7 is Sunday in standard cron — accepted, same as 0.
+      expect(() => new CronExpression("* * * * 7")).not.toThrow();
     });
 
     it("should reject invalid cron ranges and non-positive steps", () => {
@@ -383,7 +385,30 @@ describe("Yatta Jobs, Scheduler & Events", () => {
       expect(isFirst || isMonday).toBe(true);
     });
 
-    it("does not skip a day when the day does not match", () => {
+    it("treats day-of-week 7 as Sunday, the same day as 0", () => {
+      // Standard cron accepts 7 for Sunday. From Saturday 2026-11-21 10:00,
+      // "0 9 * * 7" fires Sunday 2026-11-22 09:00 — the same instant as 0 —
+      // and from that Sunday 10:00 it waits a full week, not a day.
+      const sunday7 = new CronExpression("0 9 * * 7");
+      expect(sunday7.getNextDate(new Date("2026-11-21T10:00:00Z")).toISOString()).toBe(
+        "2026-11-22T09:00:00.000Z",
+      );
+      expect(sunday7.getNextDate(new Date("2026-11-22T10:00:00Z")).toISOString()).toBe(
+        "2026-11-29T09:00:00.000Z",
+      );
+      const sunday0 = new CronExpression("0 9 * * 0");
+      expect(
+        sunday7.getNextDate(new Date("2026-11-21T10:00:00Z")).getTime(),
+      ).toBe(sunday0.getNextDate(new Date("2026-11-21T10:00:00Z")).getTime());
+
+      // Ranges normalize too: 5-7 is Fri, Sat and Sunday.
+      const weekend = new CronExpression("0 9 * * 5-7");
+      expect(weekend.getNextDate(new Date("2026-11-21T10:00:00Z")).toISOString()).toBe(
+        "2026-11-22T09:00:00.000Z",
+      );
+    });
+
+  it("does not skip a day when the day does not match", () => {
       // The day-mismatch branch used to skip 48h — to the next midnight, then
       // 24h on — so a weekly Monday job from a Sunday landed a week late and a
       // monthly 15th job skipped two months. A mismatch skips to the next

@@ -1626,8 +1626,23 @@ export class LocalStorageDriver implements IStorageDriver {
     // A prefix like "f.txt/" (WebDAV asking whether f.txt is a collection)
     // points the scan at the file itself, and globbing a file throws
     // ENOTDIR. A file is not a directory, so there is nothing to list.
-    const rootStat = await statFile(scanRoot);
-    if (rootStat && !rootStat.isDirectory()) return results;
+    // A missing scan root has no children either: returning here skips a
+    // glob scan of a directory that does not exist (WebDAV's isCollection
+    // asks this on every miss, so the scan ran on every 404).
+    //
+    // statFile() is the wrong probe here: it returns null for directories
+    // as well as missing paths, so a `!rootStat` check on its result would
+    // return [] for every real directory. A plain fs.stat distinguishes
+    // missing (null) from directory (isDirectory) from file.
+    let rootStat: Awaited<ReturnType<typeof fs.stat>> | null = null;
+    try {
+      rootStat = await fs.stat(scanRoot);
+    } catch (err: any) {
+      if (err?.code === "ENOENT" || err?.code === "ENOTDIR") rootStat = null;
+      else throw err;
+    }
+    if (!rootStat) return results;
+    if (!rootStat.isDirectory()) return results;
 
     // Keys are collected and sorted before paging, so `cursor` (a decimal
     // offset into this order) pages stably: the old scan stopped after

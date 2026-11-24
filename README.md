@@ -118,9 +118,9 @@ persistent stores, and supports TypeScript module augmentation for typed keys.
 |--------|--------------|
 | `yatta/api` | Unified API: router with onion middleware, typed params, schema validation (Zod/Valibot/ArkType), CORS, cookies, streaming, typed client, universal routes (define once, call directly or over HTTP), path utilities, DataLoader batching |
 | `yatta/db` | `bun:sqlite` ORM — column builder, relations, transactions with savepoints, pagination, cursor pagination, schema sync, backup/restore |
-| `yatta/auth` | Argon2id, rotating access/refresh JWTs, AES-256-GCM sessions, TOTP 2FA (one code, one use — replays are refused, including racing requests; enrolment needs a recently authenticated session, so pass the request to `mfa.beginSetup`/`confirmSetup`), WebAuthn passkeys, hashed API keys, RBAC, rate-limit lockouts |
+| `yatta/auth` | Argon2id, rotating access/refresh JWTs, AES-256-GCM sessions, TOTP 2FA (one code, one use — replays are refused, including racing requests; enrolment needs a recently authenticated session, so the request is **required** by `mfa.beginSetup`/`confirmSetup` — no request, no enrolment), WebAuthn passkeys, hashed API keys, RBAC, rate-limit lockouts |
 | `yatta/jwt` | Fast stateless HS256 verification — `Bun.CryptoHasher` HMAC, no caching, reference-compatible error strings |
-| `yatta/jobs` | Job queue, worker pools, cron (Vixie semantics, tz-aware), event bus, atomic leases, DLQ, backoff + jitter |
+| `yatta/jobs` | Job queue, worker pools, cron (Vixie semantics, tz-aware; day-of-week accepts 0–7, where 7 is Sunday, same as 0), event bus, atomic leases, DLQ, backoff + jitter |
 | `yatta/cache` | L1 LRU + SQLite L2, singleflight, stale-while-revalidate, tag invalidation; plus an O(1) priority queue |
 | `yatta/storage` | Local + S3 drivers, RFC 9110 range streaming, magic-byte inspection, HMAC signed URLs |
 | `yatta/mail` | SMTP/Resend/Postmark/SendGrid/SES/Gmail, layouts, pipe templating, md→html, RFC 8058 unsubscribe |
@@ -473,6 +473,23 @@ instead of on every search, and caches the typo-correction vocabulary
 ~1.3 ms to ~0.1 ms, and typo-corrected searches from ~7.9 ms to ~0.13 ms.
 Inserts into searchable tables skip the full-scan FTS delete for the fresh
 row, so insert cost stays flat as the table grows.
+
+The compiled-binary router groups routes at construction — exact patterns
+in a map, only param patterns through the segment matcher — so a static
+hit or a miss no longer walks the whole table (at 281 routes a param match
+went from ~55 µs to ~9 µs, a miss from ~46 µs to ~5 µs, measured on the
+dev VM). The `/mcp` and WebFinger handlers are built once and reused
+instead of re-importing auth/MCP and re-reading `package.json` per request
+(`/mcp` tools/list through the router went from ~38 µs to ~14 µs); the
+MCP surface itself is still computed per request, so a table added by a
+migration appears on the next call. Realtime and the worker registry
+import the auth engine lazily, so importing them no longer pulls ~260 ms
+of auth import time (measured); server boot itself did not measurably
+change, because boot waits on the auth subsystem worker anyway. WebDAV
+no longer stats a file twice per GET, and a missing directory is no
+longer glob-scanned (GET on a missing file went from ~338 µs to ~245 µs
+on the dev VM, where a filesystem stat costs ~35–40 µs — the saving is
+a few microseconds on a real disk).
 
 ## Verifying a change
 

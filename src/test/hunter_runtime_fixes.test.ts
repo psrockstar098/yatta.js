@@ -246,12 +246,20 @@ describe("hunter runtime fixes — jobs", () => {
     cron.stop("dup");
   });
 
-  it("cron day-of-week 7 stays out of bounds (pinned contract)", () => {
-    // The hunter report notes standard cron accepts 7 for Sunday, but
-    // the suite pins 0-6 (job.test.ts "should reject out-of-bounds
-    // numbers in cron fields") — changing it needs Dominic's call.
-    expect(() => new CronExpression("0 9 * * 7")).toThrow(/bounds/);
-    expect(new CronExpression("0 9 * * 0").getNextDate(new Date(2026, 10, 21, 10, 0, 0)).getDay()).toBe(0);
+  it("cron day-of-week 7 is Sunday (Dominic's call, 2026-11-24)", () => {
+    // 7 was pinned out of bounds until Dominic approved it as Sunday.
+    // From Saturday 2026-11-21 10:00, "0 9 * * 7" fires Sunday 2026-11-22
+    // 09:00 — the same instant as 0 — and 8 is still out of bounds.
+    expect(() => new CronExpression("0 9 * * 7")).not.toThrow();
+    expect(() => new CronExpression("0 9 * * 8")).toThrow(/bounds/);
+    expect(
+      new CronExpression("0 9 * * 7")
+        .getNextDate(new Date(2026, 10, 21, 10, 0, 0))
+        .getDay(),
+    ).toBe(0);
+    expect(
+      new CronExpression("0 9 * * 7").getNextDate(new Date(2026, 10, 21, 10, 0, 0)).getDate(),
+    ).toBe(22);
   });
 
   it("#1 (guard) weekly cron does not skip a week", () => {

@@ -46,13 +46,31 @@ function build() {
   return { auth, store };
 }
 
+async function signedInRequest(
+  auth: ReturnType<typeof createAuth>,
+  email: string,
+) {
+  const result = await auth.signIn({ email, password: "Password123!" });
+  const token = (result as { tokens: { accessToken: string } }).tokens.accessToken;
+  return new Request("https://app.test", {
+    headers: { cookie: `yatta_session=${token}` },
+  });
+}
+
 async function userWithTwoFactor(auth: ReturnType<typeof createAuth>) {
   const email = `mfa-${Date.now()}-${Math.random()}@t.dev`;
   const result = await auth.signUp({ email, password: "Password123!" });
   const userId = "user" in result ? result.user.id : "";
 
-  const { secret } = await auth.mfa.beginSetup(userId);
-  const { recoveryCodes } = await auth.mfa.confirmSetup(userId, authenticator.generate(secret));
+  // Enrolment requires the request: it proves a recently authenticated
+  // session for this user (see auth.test.ts "MFA enrolment round trip").
+  const req = await signedInRequest(auth, email);
+  const { secret } = await auth.mfa.beginSetup(userId, "Yatta App", req);
+  const { recoveryCodes } = await auth.mfa.confirmSetup(
+    userId,
+    authenticator.generate(secret),
+    req,
+  );
 
   /*
    * Age the enrolment so the sign-in code is not inside the step it consumed.

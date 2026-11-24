@@ -1023,15 +1023,28 @@ export function createStorageDavStore(storage: {
 
   return {
     async get(path) {
-      if (isMarker(path) || !(await exists(path))) return null;
-      // Only "missing" is null. Before, any failure (storage down, a
-      // permissions error) was swallowed and reported as 404.
-      const file = await storage.download(path);
-      return {
-        body: new Uint8Array(await file.arrayBuffer()),
-        contentType: file.contentType,
-        lastModified: file.lastModified,
-      };
+      if (isMarker(path)) return null;
+      // One attempt, not exists-then-download: download() stats the file
+      // itself, so the exists() check before it paid for a second stat
+      // and sidecar read on every GET. Missing is still null and any
+      // other failure still propagates, exactly as exists() distinguished
+      // them before.
+      try {
+        const file = await storage.download(path);
+        return {
+          body: new Uint8Array(await file.arrayBuffer()),
+          contentType: file.contentType,
+          lastModified: file.lastModified,
+        };
+      } catch (err) {
+        if (
+          (err as { name?: string })?.name === "FileNotFoundError" ||
+          (err as { status?: number })?.status === 404
+        ) {
+          return null;
+        }
+        throw err;
+      }
     },
     async put(path, body, contentType) {
       if (isMarker(path)) throw reserved();

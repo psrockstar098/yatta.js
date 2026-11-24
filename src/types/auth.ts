@@ -2856,13 +2856,19 @@ export class AuthMfa {
     }
   }
 
-  async beginSetup(userId: string, appName = "Yatta App", req?: Request) {
+  async beginSetup(userId: string, appName = "Yatta App", req: Request) {
     /*
-     * The request is what proves recent authentication. Pass it — an app
-     * that calls this with only a user id is asserting it already checked,
-     * and nothing here can verify that claim.
+     * The request is required, not optional: it is what proves recent
+     * authentication, and without it nothing here can verify the caller's
+     * claim that it already checked. An app that used to call this with
+     * only a user id must pass the request — TypeScript now enforces it.
+     * A runtime guard stays as well, so a plain-JS caller gets a clear
+     * refusal instead of a TypeError deep inside session lookup.
      */
-    if (req) await this.requireRecentAuthFor(userId, req);
+    if (!req) {
+      throw new AuthError("A request is required to enrol MFA", 400);
+    }
+    await this.requireRecentAuthFor(userId, req);
 
     const user = await this.auth.store.findUserById(userId);
     if (!user) throw new AuthError("User not found", 404);
@@ -2941,11 +2947,15 @@ export class AuthMfa {
   async confirmSetup(
     userId: string,
     code: string,
-    req?: Request,
+    req: Request,
   ): Promise<{ recoveryCodes: string[] }> {
     // Same gate as beginSetup: turning 2FA on needs a freshly authenticated
-    // session for this user, not just a user id. See beginSetup.
-    if (req) await this.requireRecentAuthFor(userId, req);
+    // session for this user, not just a user id. The request is required —
+    // see beginSetup.
+    if (!req) {
+      throw new AuthError("A request is required to enrol MFA", 400);
+    }
+    await this.requireRecentAuthFor(userId, req);
 
     const user = await this.auth.store.findUserById(userId);
     if (!user) throw new AuthError("User not found", 404);

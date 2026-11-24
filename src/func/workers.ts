@@ -12,7 +12,15 @@
 
 import { jobs } from "./jobs";
 import { mailer } from "./mail";
-import { auth } from "./auth";
+
+// The auth engine is imported lazily inside the cleanup job, not at module
+// scope: it costs ~260ms of import time (measured), and this module is
+// imported during bootstrap — before the server serves anything. The
+// cleanup job runs on a schedule, long after startup, so it pays one
+// cached dynamic import instead.
+async function getAuth() {
+  return (await import("./auth")).auth;
+}
 
 let registered = false;
 
@@ -37,6 +45,7 @@ export function registerWorkers(): void {
   });
 
   jobs.handle("cleanup-stale-tokens", async ({ log }) => {
+    const auth = await getAuth();
     const { tokens, sessions } = await auth.cleanupExpired();
     log(`Cleaned up ${tokens} expired verification tokens and ${sessions} expired sessions.`);
   });

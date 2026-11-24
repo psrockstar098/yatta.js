@@ -62,15 +62,15 @@ function decodeSegment(value: string): string {
 
 /** Matches a pathname against one Next.js-style pattern, or null.
  *
- * `pathSegs` arrive already decoded exactly once (see manifestRouter):
- * decoding here as well turned `%252F` into `/` and let one segment
- * smuggle a path separator into a param.
+ * `patternSegs` arrive pre-split (see manifestRouter) and `pathSegs`
+ * arrive already decoded exactly once: decoding here as well turned
+ * `%252F` into `/` and let one segment smuggle a path separator into
+ * a param.
  */
-function matchStandalonePattern(
-  pattern: string,
+function matchPatternSegs(
+  patternSegs: string[],
   pathSegs: string[],
 ): Record<string, string> | null {
-  const patternSegs = pattern.split("/").filter(Boolean);
   const params: Record<string, string> = {};
   let j = 0;
   for (let i = 0; i < patternSegs.length; i++) {
@@ -97,27 +97,57 @@ function matchStandalonePattern(
  * The file router for a compiled binary: matches against the route
  * table the build baked in. Exact routes win; among dynamic routes
  * the one with the fewest parameters wins, then the longest pattern.
+ *
+ * Grouped at construction, not scanned per request: exact patterns live
+ * in a Map (O(1) lookup), and only patterns with parameters go through
+ * the segment matcher — so a static hit never walks the table and a miss
+ * never tries a static pattern's segments. Pattern segments, the
+ * parameter count and the length used for tie-breaking are precomputed
+ * once for the same reason. The old code re-split every pattern and ran
+ * a `[` regex over it on every request, so match cost grew linearly
+ * with the route count (measured: a param match on 281 routes cost
+ * ~55µs, a miss ~46µs; grouped, the miss scans only param routes).
  */
 function manifestRouter(routes: StandaloneRoute[]): FileRouterLike {
+  const exact = new Map<string, StandaloneRoute>();
+  const dynamic: Array<{
+    route: StandaloneRoute;
+    segs: string[];
+    dyn: number;
+    scoreLen: number;
+  }> = [];
+  for (const route of routes) {
+    if (route.pattern.includes("[")) {
+      dynamic.push({
+        route,
+        segs: route.pattern.split("/").filter(Boolean),
+        dyn: (route.pattern.match(/\[/g) || []).length,
+        scoreLen: route.pattern.split("/").length,
+      });
+    } else if (!exact.has(route.pattern)) {
+      // First exact pattern wins, as the old linear scan returned it.
+      exact.set(route.pattern, route);
+    }
+  }
+
   return {
     match(req: Request | string): StandaloneRouteMatch | null {
       const raw = typeof req === "string" ? req : new URL(req.url).pathname;
       // Decode each segment exactly once. The old code decoded the whole
-      // pathname here and then decoded every param again in
-      // matchStandalonePattern, so `%252F` in a param became `/`.
+      // pathname here and then decoded every param again in the matcher,
+      // so `%252F` in a param became `/`.
       const rawSegs = raw.split("/").filter(Boolean);
       const decodedSegs = rawSegs.map(decodeSegment);
       const clean = decodedSegs.length === 0 ? "/" : `/${decodedSegs.join("/")}`;
-      for (const route of routes) {
-        if (route.pattern === clean) {
-          return {
-            filePath: route.file,
-            params: {},
-            kind: "exact",
-            name: route.pattern,
-            module: route.module,
-          };
-        }
+      const hit = exact.get(clean);
+      if (hit) {
+        return {
+          filePath: hit.file,
+          params: {},
+          kind: "exact",
+          name: hit.pattern,
+          module: hit.module,
+        };
       }
       const pathSegs = decodedSegs;
       let best: {
@@ -125,11 +155,10 @@ function manifestRouter(routes: StandaloneRoute[]): FileRouterLike {
         params: Record<string, string>;
         score: [number, number];
       } | null = null;
-      for (const route of routes) {
-        const params = matchStandalonePattern(route.pattern, pathSegs);
+      for (const { route, segs, dyn, scoreLen } of dynamic) {
+        const params = matchPatternSegs(segs, pathSegs);
         if (params === null) continue;
-        const dyn = (route.pattern.match(/\[/g) || []).length;
-        const score: [number, number] = [dyn, -route.pattern.split("/").length];
+        const score: [number, number] = [dyn, -scoreLen];
         if (
           best === null ||
           score[0] < best.score[0] ||

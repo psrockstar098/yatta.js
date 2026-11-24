@@ -667,11 +667,15 @@ export class CronExpression {
     this.hours = this.parseField(parts[1]!, 0, 23, "hour");
     this.daysOfMonth = this.parseField(parts[2]!, 1, 31, "day-of-month");
     this.months = this.parseField(parts[3]!, 1, 12, "month");
-    // Day of week stays 0-6: the test suite pins 7 as out of bounds
-    // (job.test.ts "should reject out-of-bounds numbers in cron fields").
-    // Standard cron accepts 7 for Sunday, but changing that here would
-    // break the pinned contract — Dominic's call, not a silent fix.
-    this.daysOfWeek = this.parseField(parts[4]!, 0, 6, "day-of-week");
+    // Day of week is 0-7 in standard cron: 7 is Sunday, the same day as 0.
+    // Parsed with max 7 and then normalized (7 -> 0) so matching — which
+    // reads date.getDay(), 0-6 — works, including ranges like 5-7 (Sat+Sun)
+    // and steps like 1-7/2. A bare 7, a wildcard and 0 all end up as Sunday.
+    this.daysOfWeek = this.parseField(parts[4]!, 0, 7, "day-of-week");
+    if (this.daysOfWeek.values.has(7)) {
+      this.daysOfWeek.values.delete(7);
+      this.daysOfWeek.values.add(0);
+    }
   }
 
   private parseField(
