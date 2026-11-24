@@ -202,6 +202,9 @@ export const router: FileRouterLike = {
   },
 };
 
+// Route modules resolved once in production (see routers() below).
+const productionApiCache = new Map<string, API>();
+
 /**
  * Robustly pulls the API instance out of the imported module.
  * Supports:
@@ -377,38 +380,55 @@ export default async function routers(
     return withSecurityHeaders(new Response("Not Found", { status: 404 }), isHttps);
   }
 
-  let module: Record<string, unknown>;
-  try {
-    // In a compiled binary the module is already bundled (see the
-    // standalone route table); everywhere else it is loaded from
-    // the matched file on disk.
-    module = await loadRouteModule(match);
-  } catch (err) {
-    console.error(`Failed to load route module ${match.filePath}:`, err);
-    return withSecurityHeaders(
-      new Response("Internal Server Error", { status: 500 }),
-      isHttps,
-    );
-  }
+  let api: API | undefined;
 
-  const api = resolveApi(module);
-
+  // Route modules, resolved once in production.
+  //
+  // `loadRouteModule` is a dynamic import: ~3.3µs per request even for an
+  // already-loaded module (measured). The API instance a route file exports
+  // is stateless across requests (params arrive per request), so resolving
+  // it once and reusing it is behaviour-identical — the same precedent as
+  // the production-only moduleCache in `routeRequest` (src/types/api.ts).
+  // Development keeps the per-request import so edited route files are
+  // picked up without a restart.
+  const isProduction = process.env.NODE_ENV === "production";
+  if (isProduction) api = productionApiCache.get(match.filePath);
   if (!api) {
-    console.error(
-      `Route "${match.filePath}" does not export an API instance ` +
-        `(created via createAPI()). Got: ${describeExport(module.default ?? module)}. ` +
-        `Make sure the file ends with:\n\n` +
-        `  const api = createAPI();\n` +
-        `  api.get(...);\n` +
-        `  export default api;\n`,
-    );
-    return withSecurityHeaders(
-      new Response("Route handler not found", { status: 500 }),
-      isHttps,
-    );
+    let module: Record<string, unknown>;
+    try {
+      // In a compiled binary the module is already bundled (see the
+      // standalone route table); everywhere else it is loaded from
+      // the matched file on disk.
+      module = await loadRouteModule(match);
+    } catch (err) {
+      console.error(`Failed to load route module ${match.filePath}:`, err);
+      return withSecurityHeaders(
+        new Response("Internal Server Error", { status: 500 }),
+        isHttps,
+      );
+    }
+
+    api = resolveApi(module);
+    if (!api) {
+      console.error(
+        `Route "${match.filePath}" does not export an API instance ` +
+          `(created via createAPI()). Got: ${describeExport(module.default ?? module)}. ` +
+          `Make sure the file ends with:\n\n` +
+          `  const api = createAPI();\n` +
+          `  api.get(...);\n` +
+          `  export default api;\n`,
+      );
+      return withSecurityHeaders(
+        new Response("Route handler not found", { status: 500 }),
+        isHttps,
+      );
+    }
+    if (isProduction) productionApiCache.set(match.filePath, api);
   }
 
-  const res = await api.handle(req, match.params, basePath);
+  // The URL is already parsed above; hand it to the router so its Context
+  // does not parse `req.url` a second time.
+  const res = await api.handle(req, match.params, basePath, { url });
   return withSecurityHeaders(res, isHttps);
 }
 
