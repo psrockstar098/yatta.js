@@ -14,7 +14,7 @@ if (env.isEphemeralSecret) {
 }
 
 const [
-  { default: routers },
+  { default: routers, requestUrlCache },
   { realtime },
   { observer, attachSubsystems },
 ] = await Promise.all([
@@ -400,6 +400,11 @@ async function bootstrap() {
         // with 505 or normalised before fetch() ran, so no try/catch here —
         // it would be dead code.
         const url = new URL(req.url);
+
+        // The router re-parses req.url unless it is handed the parsed
+        // one (see requestUrlCache in routerHelper.ts): this is the one
+        // parse per request, shared with the dispatch below.
+        requestUrlCache.set(req, url);
 
         // ── Orchestrator health probes ───────────────────────────────────────
         // Liveness: the process is up. Never touches the runtime, so a

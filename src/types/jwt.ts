@@ -123,6 +123,9 @@ const INVALID_PAYLOAD = "invalid token payload";
 /** base64url of `{"alg":"HS256","typ":"JWT"}` — the exact header the framework's own minter emits. */
 const CANONICAL_HEADER_B64 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
 
+/** The canonical header plus its dot: a token starting with this has the canonical header. */
+const CANONICAL_HEADER_PREFIX = `${CANONICAL_HEADER_B64}.`;
+
 /**
  * Create a fast HS256 verifier for `secret`.
  *
@@ -137,6 +140,21 @@ export function createJwtVerifier(secret: string): JwtVerifier {
     );
   }
 
+  // Precomputed once per verifier, not per verification: the secret as
+  // bytes (the hasher would UTF-8 encode the string on every call) and
+  // the HMAC key itself — a key longer than the 64-byte SHA-256 block
+  // is hashed once here, the way HMAC specifies, instead of on every
+  // call. The signing input is sliced straight from the token below.
+  const secretBytes = Buffer.from(secret, "utf8");
+  const hmacKey =
+    secretBytes.length > 64
+      ? new Bun.CryptoHasher("sha256").update(secretBytes).digest()
+      : secretBytes;
+  // Scratch digest buffer (64 bytes: digest() needs at least 64, the
+  // HMAC-SHA256 result occupies the first 32). verifyToken is fully
+  // synchronous, so no two verifications can interleave on it.
+  const scratchDigest = new Uint8Array(64);
+
   function verifyToken(token: string): JwtVerifyResult {
     // Exactly two dots, exactly three segments (reference semantics).
     const i1 = token.indexOf(".");
@@ -144,7 +162,6 @@ export function createJwtVerifier(secret: string): JwtVerifier {
     if (i1 < 0 || i2 < 0 || token.indexOf(".", i2 + 1) >= 0) {
       return { ok: false, error: INVALID_OR_EXPIRED };
     }
-    const headerB64 = token.slice(0, i1);
     const payloadB64 = token.slice(i1 + 1, i2);
     const signatureB64 = token.slice(i2 + 1);
 
@@ -154,11 +171,12 @@ export function createJwtVerifier(secret: string): JwtVerifier {
     //
     // Fast path: the framework's own minter emits exactly
     // `{"alg":"HS256","typ":"JWT"}` (see auth.ts), whose base64url form
-    // is constant. Comparing the segment skips a base64url decode and a
-    // JSON.parse per verification. Anything else falls through to the
-    // parse below, so other spellings (different key order, extra
-    // fields) keep working.
-    if (headerB64 !== CANONICAL_HEADER_B64) {
+    // is constant. Comparing the token's prefix skips the header slice,
+    // a base64url decode and a JSON.parse per verification. Anything
+    // else falls through to the parse below, so other spellings
+    // (different key order, extra fields) keep working.
+    if (!token.startsWith(CANONICAL_HEADER_PREFIX)) {
+      const headerB64 = token.slice(0, i1);
       let headerObj: unknown;
       try {
         headerObj = JSON.parse(
@@ -180,9 +198,13 @@ export function createJwtVerifier(secret: string): JwtVerifier {
     // JSON.parse of its payload. The digest is compared over decoded
     // bytes (see the header comment) with a length check first, so
     // `timingSafeEqual` only ever sees equal-length buffers.
-    const digest = new Bun.CryptoHasher("sha256", secret)
-      .update(`${headerB64}.${payloadB64}`)
-      .digest();
+    // The signing input is the token up to the second dot — slicing it
+    // straight from the token instead of rebuilding it from the two
+    // segments with a template string.
+    const digest = scratchDigest.subarray(0, 32);
+    new Bun.CryptoHasher("sha256", hmacKey)
+      .update(token.slice(0, i2))
+      .digest(scratchDigest);
     const givenSig = Buffer.from(signatureB64, "base64url");
     if (
       digest.length !== givenSig.length ||

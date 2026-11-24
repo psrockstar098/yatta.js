@@ -205,6 +205,32 @@ export const router: FileRouterLike = {
 // Route modules resolved once in production (see routers() below).
 const productionApiCache = new Map<string, API>();
 
+// Parsed URL for the request currently being dispatched, set by main.ts
+// next to its requestPathCache: main.ts already parses req.url once for
+// /healthz, /readyz and the observe gate, so routers() re-parsing it
+// was a second full parse (~230ns) on every app request. Anything
+// calling routers() directly (tests, the standalone entry) simply
+// misses the cache and parses, exactly as before.
+export const requestUrlCache = new WeakMap<Request, URL>();
+
+// Production dispatch cache: a static file route resolves to the same
+// API for every request, so repeat hits skip router.match() and both
+// fallbacks entirely. Keyed by the requested pathname; the value holds
+// the resolved API and the mount basePath, and params are always a fresh
+// {} per request (a static match has no params, and a shared object
+// would let one request's mutations leak into the next). Negative results
+// are cached too — a 404 otherwise re-runs two fallback scans — but the
+// map is capped: distinct 404 pathnames are unbounded, and an uncapped
+// negative cache would grow with every scan probe. When full it clears
+// and repopulates; production routes are static, so nothing is lost
+// except a few repeat lookups.
+const PRODUCTION_DISPATCH_CAP = 4096;
+const PRODUCTION_NOT_FOUND = Symbol("not-found");
+const productionDispatchCache = new Map<
+  string,
+  { api: API; basePath: string | undefined } | typeof PRODUCTION_NOT_FOUND
+>();
+
 /**
  * Robustly pulls the API instance out of the imported module.
  * Supports:
@@ -259,13 +285,73 @@ function withSecurityHeaders(res: Response, isHttps: boolean): Response {
   return res;
 }
 
+/**
+ * Exact built-in routes, looked up in one Map.get instead of a chain of
+ * `===` checks on every request. The exact set is disjoint from the
+ * prefix routes below (/storage, /dav, /grpc-web), so checking the map
+ * before them changes no dispatch: no pathname can match both. /mcp
+ * stays out of the map — it is env-gated and must fall through to file
+ * routing when disabled.
+ */
+type BuiltinHandler = (req: Request, isHttps: boolean) => Promise<Response>;
+const EXACT_BUILTINS = new Map<string, BuiltinHandler>([
+  [
+    "/dns-query",
+    async (req, isHttps) =>
+      withSecurityHeaders(await dohHandler(req), isHttps),
+  ],
+  [
+    "/.well-known/webfinger",
+    async (req, isHttps) =>
+      withSecurityHeaders(await (await getWebFingerHandler())(req), isHttps),
+  ],
+  [
+    "/oauth/authorize",
+    async (req, isHttps) =>
+      withSecurityHeaders(await oauthServer.handleAuthorize(req), isHttps),
+  ],
+  [
+    "/oauth/token",
+    async (req, isHttps) =>
+      withSecurityHeaders(
+        await withOAuthTokenLimit(req, () => oauthServer.handleToken(req)),
+        isHttps,
+      ),
+  ],
+  [
+    "/oauth/revoke",
+    async (req, isHttps) =>
+      withSecurityHeaders(
+        await withOAuthTokenLimit(req, () => oauthServer.handleRevoke(req)),
+        isHttps,
+      ),
+  ],
+  [
+    "/oauth/userinfo",
+    async (req, isHttps) =>
+      withSecurityHeaders(await oidc.handleUserinfo(req), isHttps),
+  ],
+  [
+    "/oauth/jwks",
+    async (_req, isHttps) =>
+      withSecurityHeaders(oidc.handleJWKS(), isHttps),
+  ],
+  [
+    "/.well-known/openid-configuration",
+    async (_req, isHttps) =>
+      withSecurityHeaders(oidc.handleDiscovery(), isHttps),
+  ],
+]);
+
 export default async function routers(
   req: Request,
   server: Server<unknown>,
 ): Promise<Response> {
-  const url = new URL(req.url);
+  // main.ts already parsed this URL once; reuse it when available.
+  const url = requestUrlCache.get(req) ?? new URL(req.url);
   const isHttps =
     url.protocol === "https:" || req.headers.get("x-forwarded-proto") === "https";
+  const isProduction = process.env.NODE_ENV === "production";
 
   // 1. Realtime endpoint (handles WebSockets or SSE automatically)
   if (url.pathname === "/realtime") {
@@ -273,6 +359,11 @@ export default async function routers(
     if (res instanceof Response) return withSecurityHeaders(res, isHttps);
     return undefined as any; // WebSocket upgrade handled by Bun
   }
+
+  // 1b. Exact built-in routes (DoH, WebFinger, OAuth/OIDC): one Map
+  // lookup instead of the old chain of `===` checks.
+  const builtin = EXACT_BUILTINS.get(url.pathname);
+  if (builtin) return builtin(req, isHttps);
 
   // 2. Storage explorer UI, download links, and file streaming
   if (url.pathname.startsWith("/storage")) {
@@ -291,43 +382,9 @@ export default async function routers(
   }
 
   // 2d. DNS over HTTPS (1.0.6).
-  if (url.pathname === "/dns-query") {
-    return withSecurityHeaders(await dohHandler(req), isHttps);
-  }
-
-  // 2e. WebFinger discovery (1.0.6), backed by the auth store.
-  // The handler is built once and shared (see getWebFingerHandler):
-  // constructing it per request re-imported two modules every time.
-  if (url.pathname === "/.well-known/webfinger") {
-    const handler = await getWebFingerHandler();
-    return withSecurityHeaders(await handler(req), isHttps);
-  }
-
+  // 2e. WebFinger discovery (1.0.6).
   // 2f. OAuth 2.0 + OpenID Connect (1.0.6).
-  if (url.pathname === "/oauth/authorize") {
-    return withSecurityHeaders(await oauthServer.handleAuthorize(req), isHttps);
-  }
-  if (url.pathname === "/oauth/token") {
-    return withSecurityHeaders(
-      await withOAuthTokenLimit(req, () => oauthServer.handleToken(req)),
-      isHttps,
-    );
-  }
-  if (url.pathname === "/oauth/revoke") {
-    return withSecurityHeaders(
-      await withOAuthTokenLimit(req, () => oauthServer.handleRevoke(req)),
-      isHttps,
-    );
-  }
-  if (url.pathname === "/oauth/userinfo") {
-    return withSecurityHeaders(await oidc.handleUserinfo(req), isHttps);
-  }
-  if (url.pathname === "/oauth/jwks") {
-    return withSecurityHeaders(oidc.handleJWKS(), isHttps);
-  }
-  if (url.pathname === "/.well-known/openid-configuration") {
-    return withSecurityHeaders(oidc.handleDiscovery(), isHttps);
-  }
+  // (All handled by the EXACT_BUILTINS map above.)
 
   // 2g. MCP server (1.0.6): every app serves /mcp, on by default.
   // One line turns it off: MCP_ENABLED=0. Tools come from the app's
@@ -342,15 +399,30 @@ export default async function routers(
     return withSecurityHeaders(await handler(req), isHttps);
   }
 
-  // 3. Hot-reload routes in development mode so new files (e.g. user/index.ts) are instantly detected.
+  // 3. Production dispatch cache: a static route's API is already
+  // resolved, so skip the file-router match and both fallbacks.
+  if (isProduction) {
+    const cached = productionDispatchCache.get(url.pathname);
+    if (cached === PRODUCTION_NOT_FOUND) {
+      return withSecurityHeaders(new Response("Not Found", { status: 404 }), isHttps);
+    }
+    if (cached) {
+      const res = await cached.api.handle(req, {}, cached.basePath, { url });
+      return withSecurityHeaders(res, isHttps);
+    }
+  }
+
+  // 4. Hot-reload routes in development mode so new files (e.g. user/index.ts) are instantly detected.
   // Throttled, not per-request: a full directory scan on every dev request
   // cost ~200µs on top of a ~5µs dispatch.
-  if (process.env.NODE_ENV !== "production") {
+  if (!isProduction) {
     throttledReload(router);
   }
 
-  // 4. Match Next.js style file-based API routes
-  let match = router.match(req);
+  // 5. Match Next.js style file-based API routes.
+  // The string form matches by pathname: the old match(req) re-parsed
+  // req.url inside the router (~120ns) on every request.
+  let match = router.match(url.pathname);
 
   // Fallback A: Try with / without trailing slash
   if (!match) {
@@ -364,6 +436,11 @@ export default async function routers(
   let basePath: string | undefined;
   if (!match) {
     const segments = url.pathname.split("/").filter(Boolean);
+    // The full pathname itself (and, when it ends with "/", its
+    // trailing-slash twin) was already tested by the match and Fallback
+    // A above — pop once so the first iteration tests a real parent
+    // instead of re-running a match that just missed (~380ns).
+    segments.pop();
     while (segments.length > 0) {
       const parentPath = "/" + segments.join("/");
       const candidateMatch = router.match(parentPath);
@@ -377,6 +454,12 @@ export default async function routers(
   }
 
   if (!match) {
+    if (isProduction) {
+      if (productionDispatchCache.size >= PRODUCTION_DISPATCH_CAP) {
+        productionDispatchCache.clear();
+      }
+      productionDispatchCache.set(url.pathname, PRODUCTION_NOT_FOUND);
+    }
     return withSecurityHeaders(new Response("Not Found", { status: 404 }), isHttps);
   }
 
@@ -391,7 +474,6 @@ export default async function routers(
   // the production-only moduleCache in `routeRequest` (src/types/api.ts).
   // Development keeps the per-request import so edited route files are
   // picked up without a restart.
-  const isProduction = process.env.NODE_ENV === "production";
   if (isProduction) api = productionApiCache.get(match.filePath);
   if (!api) {
     let module: Record<string, unknown>;
@@ -424,6 +506,16 @@ export default async function routers(
       );
     }
     if (isProduction) productionApiCache.set(match.filePath, api);
+  }
+
+  // A static match has no params, so its dispatch is the same for every
+  // request with this pathname — cache it (see the map above). Dynamic
+  // matches carry per-request params and are never cached here.
+  if (isProduction && Object.keys(match.params).length === 0) {
+    if (productionDispatchCache.size >= PRODUCTION_DISPATCH_CAP) {
+      productionDispatchCache.clear();
+    }
+    productionDispatchCache.set(url.pathname, { api, basePath });
   }
 
   // The URL is already parsed above; hand it to the router so its Context

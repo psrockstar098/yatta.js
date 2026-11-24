@@ -200,6 +200,10 @@ export function normalizeRoutePath(pathname: string): string {
   return path || "/";
 }
 
+// The 429 body never varies: one pre-serialized constant instead of a
+// JSON.stringify per refused request.
+const RATE_LIMIT_429_BODY = '{"error":"Too many requests"}';
+
 // An IPv4 client seen over an IPv6 socket arrives as "::ffff:1.2.3.4"
 // (that is what `server.requestIP` returns for a loopback client, and
 // for any IPv4 peer on a dual-stack socket). Without normalising, the
@@ -207,6 +211,9 @@ export function normalizeRoutePath(pathname: string): string {
 // twice the budget. Only the mapped form is folded; a genuine IPv6
 // address is left exactly as it arrived.
 function normalizeIp(ip: string): string {
+  // The regex only ever matches an address starting with the mapped
+  // prefix, so skip it outright for every other address.
+  if (!ip.startsWith("::ffff:")) return ip;
   const mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
   return mapped ? mapped[1]! : ip;
 }
@@ -286,32 +293,53 @@ function resolveUserId(ctx: Context, custom?: RateLimitOptions["userId"]): strin
   return typeof userId === "string" && userId ? userId : undefined;
 }
 
-// Penalty level from a violation count, and what it does to a rule.
-// Level 0 is the rule as written; each level halves the limit (floor,
-// never below 1) and doubles the window.
-function penaltyFor(
-  violations: number,
+/**
+ * One rule's penalty levels, computed once at createRateLimit() instead
+ * of per request per bucket: the limit/window for every level, plus the
+ * TTL padding every store write adds (`windowSec * 2 ** maxLevel + 1`).
+ * `level` itself is never read by the middleware (only limit and
+ * windowSec are), so it is not stored.
+ */
+interface CompiledRule {
+  levels: Array<{ limit: number; windowSec: number }>;
+  ttlPad: number;
+}
+
+function compileRule(
+  rule: RateLimitRule,
   violationsPerLevel: number,
   maxLevel: number,
-  rule: RateLimitRule,
-): { level: number; limit: number; windowSec: number } {
-  const level = Math.min(maxLevel, Math.floor(violations / violationsPerLevel));
-  return {
-    level,
-    limit: Math.max(1, Math.floor(rule.limit / 2 ** level)),
-    windowSec: rule.windowSec * 2 ** level,
-  };
+): CompiledRule {
+  const levels: Array<{ limit: number; windowSec: number }> = [];
+  for (let level = 0; level <= maxLevel; level++) {
+    levels.push({
+      limit: Math.max(1, Math.floor(rule.limit / 2 ** level)),
+      windowSec: rule.windowSec * 2 ** level,
+    });
+  }
+  return { levels, ttlPad: rule.windowSec * 2 ** maxLevel + 1 };
 }
 
 function withHeaders(response: Response, headers: Record<string, string>): Response {
-  const next = new Headers(response.headers);
-  for (const [name, value] of Object.entries(headers)) next.set(name, value);
-  const nullBody = response.status === 204 || response.status === 304 || response.status === 205;
-  return new Response(nullBody ? null : response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: next,
-  });
+  // Set in place: the old code copied the headers and re-wrapped the
+  // body into a new Response on every response (~2–3µs). Responses
+  // built by handlers have mutable headers; the re-wrap survives as the
+  // fallback for immutable ones (e.g. a Response from fetch).
+  try {
+    for (const [name, value] of Object.entries(headers)) {
+      response.headers.set(name, value);
+    }
+    return response;
+  } catch {
+    const next = new Headers(response.headers);
+    for (const [name, value] of Object.entries(headers)) next.set(name, value);
+    const nullBody = response.status === 204 || response.status === 304 || response.status === 205;
+    return new Response(nullBody ? null : response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: next,
+    });
+  }
 }
 
 export function createRateLimit(options: RateLimitOptions = {}): Middleware {
@@ -349,16 +377,50 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
   if (!Number.isFinite(maxLevel) || maxLevel < 0) {
     throw new TypeError("rateLimit: escalation.maxLevel must be at least 0.");
   }
+  // Everything below is computed once here, not per request: which
+  // dimensions apply, every rule's penalty levels, and — behind the
+  // bounded route cache — the normalized route, its encoded form, and
+  // its compiled rule for each pathname seen. The old code re-ran
+  // dimensions.includes(), normalizeRoutePath(), encodeURIComponent()
+  // and the penalty arithmetic on every request.
+  const hasIp = dimensions.includes("ip");
+  const hasUser = dimensions.includes("user");
+  const defaultCompiled = compileRule(defaultRule, violationsPerLevel, maxLevel);
+  const compiledOverrides = new Map<string, CompiledRule>();
+  for (const [path, rule] of overrides) {
+    compiledOverrides.set(path, compileRule(rule, violationsPerLevel, maxLevel));
+  }
+  // Bounded cache: raw pathname -> normalized route + encoded route +
+  // compiled rule. Route cardinality is low in practice; the cap keeps
+  // a flood of distinct paths from growing it without bound.
+  const ROUTE_CACHE_CAP = 4096;
+  interface RouteEntry {
+    route: string;
+    encodedRoute: string;
+    compiled: CompiledRule;
+  }
+  const routeCache = new Map<string, RouteEntry>();
+  function routeEntry(pathname: string): RouteEntry {
+    let entry = routeCache.get(pathname);
+    if (entry) return entry;
+    const route = normalizeRoutePath(pathname);
+    const compiled = compiledOverrides.get(route) ?? defaultCompiled;
+    entry = { route, encodedRoute: encodeURIComponent(route), compiled };
+    if (routeCache.size >= ROUTE_CACHE_CAP) routeCache.clear();
+    routeCache.set(pathname, entry);
+    return entry;
+  }
   // Fallback bucket for keys past the cap. One per route and dimension,
   // so a flood of forged keys degrades to sharing a route's budget
   // rather than sharing every route's budget at once.
   const SHARED = "__shared__";
 
   return (async (ctx, next) => {
-    const route = normalizeRoutePath(ctx.url.pathname);
-    const rule = overrides.get(route) ?? defaultRule;
+    const entry = routeEntry(ctx.url.pathname);
+    const route = entry.route;
+    const compiled = entry.compiled;
     const ip = resolveClientIp(ctx.req, options);
-    const user = dimensions.includes("user") ? resolveUserId(ctx, options.userId) : undefined;
+    const user = hasUser ? resolveUserId(ctx, options.userId) : undefined;
 
     // One bucket per dimension, each keyed by route so routes never
     // share a budget. The key parts are encoded, so a user id or IP
@@ -366,17 +428,17 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
     // different (route, dimension, value) triples always encode to two
     // different keys.
     const buckets: Array<{ key: string; dimension: string; value: string }> = [];
-    if (dimensions.includes("ip")) {
-      buckets.push({ key: `rl:${encodeURIComponent(route)}:ip:${encodeURIComponent(ip)}`, dimension: "ip", value: ip });
+    if (hasIp) {
+      buckets.push({ key: `rl:${entry.encodedRoute}:ip:${encodeURIComponent(ip)}`, dimension: "ip", value: ip });
     }
     if (user !== undefined) {
-      buckets.push({ key: `rl:${encodeURIComponent(route)}:user:${encodeURIComponent(user)}`, dimension: "user", value: user });
+      buckets.push({ key: `rl:${entry.encodedRoute}:user:${encodeURIComponent(user)}`, dimension: "user", value: user });
     }
     // No dimension at all (an empty `dimensions` list) still limits
     // per route, so the middleware can never be configured into a
     // no-op by accident.
     if (buckets.length === 0) {
-      buckets.push({ key: `rl:${encodeURIComponent(route)}:route:all`, dimension: "route", value: "all" });
+      buckets.push({ key: `rl:${entry.encodedRoute}:route:all`, dimension: "route", value: "all" });
     }
 
     const now = Date.now();
@@ -385,7 +447,7 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
     type BucketState = {
       key: string;
       record: RateLimitCounter;
-      effective: { level: number; limit: number; windowSec: number };
+      effective: { limit: number; windowSec: number };
     };
     const states: BucketState[] = [];
     for (const bucket of buckets) {
@@ -396,7 +458,7 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
         // minting another one. An existing key keeps its own bucket.
         const size = await store.size!();
         if (size >= maxKeys) {
-          key = `rl:${encodeURIComponent(route)}:${bucket.dimension}:${SHARED}`;
+          key = `rl:${entry.encodedRoute}:${bucket.dimension}:${SHARED}`;
           record = await store.get(key);
         }
       }
@@ -409,7 +471,11 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
             ? record.violations
             : Math.max(0, record.violations - 1)
           : 0;
-        const effective = penaltyFor(violations, violationsPerLevel, maxLevel, rule);
+        // The penalty level is a table lookup into the rule compiled at
+        // createRateLimit() — the old code recomputed the halving and
+        // doubling (and allocated the object) on every bucket.
+        const level = Math.min(maxLevel, Math.floor(violations / violationsPerLevel));
+        const effective = compiled.levels[level]!;
         record = {
           count: 0,
           resetAt: now + effective.windowSec * 1000,
@@ -417,7 +483,11 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
         };
         states.push({ key, record, effective });
       } else {
-        const effective = penaltyFor(record.violations, violationsPerLevel, maxLevel, rule);
+        const level = Math.min(
+          maxLevel,
+          Math.floor(record.violations / violationsPerLevel),
+        );
+        const effective = compiled.levels[level]!;
         states.push({ key, record, effective });
       }
     }
@@ -426,10 +496,11 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
     // by one bucket must not consume the buckets that passed.
     const blocked = states.filter((s) => s.record.count + 1 > s.effective.limit);
     if (blocked.length > 0) {
-      const retryAfterSec = Math.max(
-        1,
-        ...blocked.map((s) => Math.ceil((s.record.resetAt - now) / 1000)),
-      );
+      let retryAfterSec = 1;
+      for (const s of blocked) {
+        const retry = Math.ceil((s.record.resetAt - now) / 1000);
+        if (retry > retryAfterSec) retryAfterSec = retry;
+      }
       for (const state of blocked) {
         // At most one violation per window: a burst that is already over
         // the limit does not keep escalating the key while it is refused.
@@ -442,7 +513,7 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
           Math.ceil((state.record.resetAt - now) / 1000) +
             // Keep the record past its window so the next window can see
             // whether it ended clean and decay a violation.
-            rule.windowSec * 2 ** maxLevel + 1,
+            compiled.ttlPad,
         );
         await store.set(state.key, state.record, ttlSec);
       }
@@ -454,7 +525,7 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
       // The body is deliberately generic: it names no IP, user, route
       // budget or penalty level, so a refused client learns nothing
       // about whose bucket it hit or how close it is to the next level.
-      return new Response(JSON.stringify({ error: "Too many requests" }), {
+      return new Response(RATE_LIMIT_429_BODY, {
         status: 429,
         headers: {
           "content-type": "application/json; charset=utf-8",
@@ -468,16 +539,24 @@ export function createRateLimit(options: RateLimitOptions = {}): Middleware {
       const ttlSec = Math.max(
         1,
         Math.ceil((state.record.resetAt - now) / 1000) +
-          rule.windowSec * 2 ** maxLevel + 1,
+          compiled.ttlPad,
       );
       await store.set(state.key, state.record, ttlSec);
     }
 
     // The strictest bucket decides what the client sees, and the
     // handler can read the same numbers from ctx.state.rateLimit.
-    const limit = Math.min(...states.map((s) => s.effective.limit));
-    const remaining = Math.min(...states.map((s) => s.effective.limit - s.record.count));
-    const resetAt = Math.max(...states.map((s) => s.record.resetAt));
+    // A scalar loop, not three states.map() spreads with temporary
+    // arrays.
+    let limit = Infinity;
+    let remaining = Infinity;
+    let resetAt = 0;
+    for (const s of states) {
+      if (s.effective.limit < limit) limit = s.effective.limit;
+      const rem = s.effective.limit - s.record.count;
+      if (rem < remaining) remaining = rem;
+      if (s.record.resetAt > resetAt) resetAt = s.record.resetAt;
+    }
     (ctx.state as Record<string, unknown>).rateLimit = {
       limit,
       remaining,

@@ -127,15 +127,18 @@ function bridgeSpanToOtel(yattaSpan: Span): void {
     isRemote: false,
   });
 
+  // flattenAttributes returns a fresh object, so the span id is added
+  // to it directly instead of spreading it into a second copy on every
+  // bridged span.
+  const attributes = flattenAttributes(yattaSpan.attributes);
+  attributes["yatta.span_id"] = yattaSpan.spanId;
+
   const otelSpan = otelTracer.startSpan(
     yattaSpan.name,
     {
       kind: toOtelKind(yattaSpan.kind),
       startTime: yattaSpan.startTime,
-      attributes: {
-        ...flattenAttributes(yattaSpan.attributes),
-        "yatta.span_id": yattaSpan.spanId,
-      },
+      attributes,
     },
     parentCtx,
   );

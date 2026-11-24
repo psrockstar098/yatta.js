@@ -1078,11 +1078,27 @@ export interface JwtClaims {
   iat: number;
 }
 
+/** base64url of `{"alg":"HS256","typ":"JWT"}` — the exact header sign() emits, constant on every token. */
+const JWT_HEADER_B64 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+
 export class AuthJwt {
+  private readonly hmacKey: Uint8Array;
+  // Scratch digest buffer (64 bytes: digest() needs at least 64, the
+  // HMAC-SHA256 result occupies the first 32). sign() and verify() are
+  // fully synchronous, so no two calls can interleave on it.
+  private readonly scratchDigest = new Uint8Array(64);
   constructor(
     private readonly signingKey: Buffer,
     private readonly cryptoUtil: AuthCrypto,
-  ) {}
+  ) {
+    // The HMAC key is hashed once here when it exceeds the 64-byte
+    // SHA-256 block (the HMAC spec's rule), instead of on every sign
+    // and verify — and the raw secret is never re-encoded per call.
+    this.hmacKey =
+      signingKey.length > 64
+        ? new Bun.CryptoHasher("sha256").update(signingKey).digest()
+        : signingKey;
+  }
 
   sign(
     payload: Omit<JwtClaims, "iat" | "exp" | "jti"> & {
@@ -1094,9 +1110,9 @@ export class AuthJwt {
     const exp = iat + payload.expInSec;
     const jti = payload.jti ?? crypto.randomUUID();
 
-    const header = Buffer.from(
-      JSON.stringify({ alg: "HS256", typ: "JWT" }),
-    ).toString("base64url");
+    // The header is constant on every token the framework mints — the
+    // old code rebuilt it with JSON.stringify + Buffer.from per sign.
+    const header = JWT_HEADER_B64;
     const bodyClaims: JwtClaims = {
       sub: payload.sub,
       type: payload.type,
@@ -1108,29 +1124,44 @@ export class AuthJwt {
     };
 
     const body = Buffer.from(JSON.stringify(bodyClaims)).toString("base64url");
-    const signature = crypto
-      .createHmac("sha256", this.signingKey)
+    new Bun.CryptoHasher("sha256", this.hmacKey)
       .update(`${header}.${body}`)
-      .digest("base64url");
+      .digest(this.scratchDigest);
+    const signature = Buffer.from(this.scratchDigest.subarray(0, 32)).toString("base64url");
     return `${header}.${body}.${signature}`;
   }
 
   verify(token: string): JwtClaims | null {
-    const parts = token.split(".");
-    if (parts.length !== 3) return null;
-    const [headerB64, bodyB64, signature] = parts as [string, string, string];
+    // Exactly two dots, exactly three segments — the old split(".")
+    // allocated a 3-element array plus three strings per verify.
+    const i1 = token.indexOf(".");
+    const i2 = i1 < 0 ? -1 : token.indexOf(".", i1 + 1);
+    if (i1 < 0 || i2 < 0 || token.indexOf(".", i2 + 1) >= 0) return null;
+    const headerB64 = token.slice(0, i1);
+    const bodyB64 = token.slice(i1 + 1, i2);
+    const signature = token.slice(i2 + 1);
 
-    try {
-      const header = JSON.parse(Buffer.from(headerB64, "base64url").toString());
-      if (header.alg !== "HS256" || header.typ !== "JWT") return null;
-    } catch {
-      return null;
+    // The framework's own minter emits exactly the constant header, so
+    // skip the base64url decode + JSON.parse for it. Any other spelling
+    // still goes through the parse below, so headers with extra fields
+    // (or a different key order) keep working.
+    if (headerB64 !== JWT_HEADER_B64) {
+      try {
+        const header = JSON.parse(Buffer.from(headerB64, "base64url").toString());
+        if (header.alg !== "HS256" || header.typ !== "JWT") return null;
+      } catch {
+        return null;
+      }
     }
 
-    const expectedSig = crypto
-      .createHmac("sha256", this.signingKey)
-      .update(`${headerB64}.${bodyB64}`)
-      .digest("base64url");
+    // Bun.CryptoHasher measured ~2x faster than node:crypto createHmac
+    // on this VM (see jwt.ts). The comparison stays over the base64url
+    // STRINGS, exactly as before — switching it to decoded bytes would
+    // wrongly accept non-canonical spellings this verifier rejects.
+    new Bun.CryptoHasher("sha256", this.hmacKey)
+      .update(token.slice(0, i2))
+      .digest(this.scratchDigest);
+    const expectedSig = Buffer.from(this.scratchDigest.subarray(0, 32)).toString("base64url");
     if (!this.cryptoUtil.timingSafeEqual(signature, expectedSig)) return null;
 
     try {

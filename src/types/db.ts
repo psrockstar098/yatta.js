@@ -1086,10 +1086,30 @@ class FieldBuilder {
   like(p: string) { return this.leaf("like", p); }
 }
 
-function makeFieldsProxy<Row>(): FieldsProxy<Row> {
+// One fields DSL proxy per table, built once at Table construction:
+// a FieldBuilder per declared column, cached in a Map. FieldBuilder is
+// stateless (it holds only the field name; every operator call builds a
+// fresh Condition), so sharing one instance per column across queries
+// is safe. Undeclared columns fall back to a fresh FieldBuilder, so
+// tables with columns added after construction — and dynamic tables
+// with no schema — behave exactly as before. The old code built a new
+// Proxy per QueryBuilder.where() call (its only caller) and a new
+// FieldBuilder per column access.
+function buildFieldsProxy<Row>(
+  columns: Map<string, ColumnDefinition>,
+): FieldsProxy<Row> {
+  const builders = new Map<string, FieldBuilder>();
+  for (const colName of columns.keys()) {
+    builders.set(colName, new FieldBuilder(colName));
+  }
   return new Proxy(
     {},
-    { get: (_t, prop) => (typeof prop === "string" ? new FieldBuilder(prop) : undefined) },
+    {
+      get: (_t, prop) =>
+        typeof prop === "string"
+          ? (builders.get(prop) ?? new FieldBuilder(prop))
+          : undefined,
+    },
   ) as any;
 }
 
@@ -1137,7 +1157,7 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>, T
    * ```
    */
   where(clauseOrFn: WhereClause<T> | ((fields: FieldsProxy<T>) => Condition)): this {
-    const clause = typeof clauseOrFn === "function" ? clauseOrFn(makeFieldsProxy<T>()).toWhere() : clauseOrFn;
+    const clause = typeof clauseOrFn === "function" ? clauseOrFn(this.table.fieldsProxy).toWhere() : clauseOrFn;
     if (!this.opts.where) {
       this.opts.where = clause;
     } else {
@@ -1438,6 +1458,13 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
   readonly primaryKeyColumn: string = "id";
   /** Inferred relational foreign key aliases (e.g. `userId` -> `user`). */
   readonly belongsToAliases: Map<string, { column: string; table: string }> = new Map();
+  /**
+   * Prebuilt fields DSL proxy for `where()` callbacks (see
+   * `buildFieldsProxy`): one Proxy per table, one FieldBuilder per
+   * declared column, built once at construction instead of a new Proxy
+   * per query.
+   */
+  readonly fieldsProxy: FieldsProxy<T>;
 
   /**
    * Initializes a table gateway instance.
@@ -1462,6 +1489,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
         }
       }
     }
+    this.fieldsProxy = buildFieldsProxy<T>(this.columns);
   }
 
   /**
