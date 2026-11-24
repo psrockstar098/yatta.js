@@ -165,7 +165,7 @@ describe("syncSchema adds a timestamp column to a table that already has rows", 
 
     expect(db.users.count()).toBe(0);
 
-    const sql = (db as any)._sqlite
+    const sql = (db as any).sqlite
       .query("SELECT sql FROM sqlite_master WHERE name = 'users';")
       .get() as { sql: string };
 
@@ -237,7 +237,7 @@ describe("a rebuild preserves everything the old table carried", () => {
       schema: { users: { id: col.id(), name: col.text(), createdAt: col.createdAt() } },
     });
 
-    const names = (db as any)._sqlite
+    const names = (db as any).sqlite
       .query("SELECT name FROM sqlite_master WHERE type IN ('index','trigger') AND tbl_name = 'users';")
       .all() as { name: string }[];
 
@@ -284,12 +284,12 @@ describe("a rebuild preserves everything the old table carried", () => {
     // `legacy_alter_table` matters here: renaming with it off makes SQLite rewrite
     // references to the name in every other table, and the reference would point at the
     // temporary name that no longer exists.
-    const child = (db as any)._sqlite
+    const child = (db as any).sqlite
       .query("SELECT sql FROM sqlite_master WHERE name = 'posts';")
       .get() as { sql: string };
 
     expect(child.sql).toMatch(/REFERENCES\s+"?users"?/);
-    expect((db as any)._sqlite.query("PRAGMA foreign_key_check;").all()).toEqual([]);
+    expect((db as any).sqlite.query("PRAGMA foreign_key_check;").all()).toEqual([]);
   });
 
   it("leaves enforcement working after the rebuild", () => {

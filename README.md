@@ -117,7 +117,7 @@ persistent stores, and supports TypeScript module augmentation for typed keys.
 | Module | What it does |
 |--------|--------------|
 | `yatta/api` | Unified API: router with onion middleware, typed params, schema validation (Zod/Valibot/ArkType), CORS, cookies, streaming, typed client, universal routes (define once, call directly or over HTTP), path utilities, DataLoader batching |
-| `yatta/db` | `bun:sqlite` ORM — column builder, relations, transactions with savepoints, pagination, cursor pagination, schema sync, backup/restore |
+| `yatta/db` | Pluggable-driver ORM — column builder, relations, transactions with savepoints, pagination, cursor pagination, schema sync, backup/restore. SQLite today (see `docs/adapters.md`); PGlite lands in Phase 2 |
 | `yatta/auth` | Argon2id, rotating access/refresh JWTs, AES-256-GCM sessions, TOTP 2FA (one code, one use — replays are refused, including racing requests; enrolment needs a recently authenticated session, so the request is **required** by `mfa.beginSetup`/`confirmSetup` — no request, no enrolment), WebAuthn passkeys, hashed API keys, RBAC, rate-limit lockouts |
 | `yatta/jwt` | Fast stateless HS256 verification — `Bun.CryptoHasher` HMAC, no caching, reference-compatible error strings |
 | `yatta/jobs` | Job queue, worker pools, cron (Vixie semantics, tz-aware; day-of-week accepts 0–7, where 7 is Sunday, same as 0), event bus, atomic leases, DLQ, backoff + jitter |

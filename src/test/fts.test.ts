@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "bun:test";
-import { createDatabase, col, YattaError, YattaDB, type TypedDatabase } from "../types/db";
+import { createDatabase, col, YattaError, type TypedDatabase } from "../types/db";
+import { SqliteSession } from "../types/db/adapters/sqlite";
 
 const schema = {
   products: {
@@ -327,11 +328,12 @@ describe("FTS search", () => {
   it("performs zero FTS work on writes to a table with no searchable columns", () => {
     const db = fresh();
     // Count every statement the engine runs that touches an FTS table, by
-    // watching YattaDB.run. The counter starts after open, so schema sync
-    // is excluded and only the write path itself is measured.
-    const originalRun = YattaDB.prototype.run;
+    // watching SqliteSession.run — the session is where SQL executes now
+    // (YattaDB.run only delegates to it). The counter starts after open,
+    // so schema sync is excluded and only the write path itself is measured.
+    const originalRun = SqliteSession.prototype.run;
     let ftsStatements = 0;
-    (YattaDB.prototype as any).run = function (sql: string, params: any[] = [], mode: any) {
+    (SqliteSession.prototype as any).run = function (sql: string, params: any[] = [], mode: any) {
       if (sql.includes("_fts")) ftsStatements++;
       return originalRun.call(this, sql, params, mode);
     };
@@ -347,14 +349,14 @@ describe("FTS search", () => {
       );
       expect(tables).toEqual([]);
     } finally {
-      (YattaDB.prototype as any).run = originalRun;
+      (SqliteSession.prototype as any).run = originalRun;
     }
 
     // Control: the same writes on a searchable table do touch the index,
     // so the counter above is measuring something real, not nothing.
-    const originalRun2 = YattaDB.prototype.run;
+    const originalRun2 = SqliteSession.prototype.run;
     let ftsStatements2 = 0;
-    (YattaDB.prototype as any).run = function (sql: string, params: any[] = [], mode: any) {
+    (SqliteSession.prototype as any).run = function (sql: string, params: any[] = [], mode: any) {
       if (sql.includes("_fts")) ftsStatements2++;
       return originalRun2.call(this, sql, params, mode);
     };
@@ -368,7 +370,7 @@ describe("FTS search", () => {
       db.products.deleteById(row.id);
       expect(ftsStatements2).toBeGreaterThan(0);
     } finally {
-      (YattaDB.prototype as any).run = originalRun2;
+      (SqliteSession.prototype as any).run = originalRun2;
     }
   });
 
