@@ -386,6 +386,9 @@ describe("Rate limiting", () => {
       },
     });
 
+  // 15s timeout: each wrong password runs a real scrypt verify, and under
+  // a parallel suite run on a slow machine that exceeds Bun's 5s default.
+  // The timeout is sized to the crypto work, not to the machine's mood.
   it("throttles repeated wrong passwords", async () => {
     const { auth } = limited();
     const email = uniq("throttle");
@@ -401,8 +404,9 @@ describe("Rate limiting", () => {
     }
 
     expect(locked).toBe(true);
-  });
+  }, 15000);
 
+  // Same scrypt-under-load timing as the test above: 9 verifies, 15s budget.
   it("locks out the correct password too, not just the wrong ones", async () => {
     const { auth } = limited();
     const email = uniq("lockout");
@@ -415,8 +419,9 @@ describe("Rate limiting", () => {
     // A lockout that only blocks wrong answers is a speed bump, not a lockout.
     const correctWorks = await auth.signIn({ email, password: "Password123!" }).then(() => true).catch(() => false);
     expect(correctWorks).toBe(false);
-  });
+  }, 15000);
 
+  // Same scrypt-under-load timing as the tests above: up to 10 verifies, 15s budget.
   it("is not bypassed by a forged X-Forwarded-For", async () => {
     const { auth } = limited();
     const email = uniq("xff");
@@ -439,7 +444,7 @@ describe("Rate limiting", () => {
     }
 
     expect(attempts).toBeLessThan(10);
-  });
+  }, 15000);
 });
 
 describe("API key scopes", () => {

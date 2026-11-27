@@ -75,6 +75,9 @@ describe("package.json is valid JSON", () => {
     let packStatus = 1;
     const packed = new Set<string>();
 
+    // 30s budget: `npm pack --dry-run` walks the whole tree, and under a
+    // parallel suite run on a slow machine that exceeds Bun's 5s hook default
+    // (it timed out at 5058ms and failed the publish prepublish check).
     beforeAll(() => {
       const result = spawnSync("npm", ["pack", "--dry-run"], { cwd: root, encoding: "utf8" });
       packStatus = result.status ?? 1;
@@ -86,7 +89,7 @@ describe("package.json is valid JSON", () => {
         const match = line.match(/^npm notice\s+\d+(?:\.\d+)?[kMG]?B\s+(\S.*)$/);
         if (match) packed.add(match[1]!.trim());
       }
-    });
+    }, 30000);
 
     it("packs without error and lists its contents", () => {
       expect(packStatus).toBe(0);
