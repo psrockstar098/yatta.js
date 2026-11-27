@@ -128,11 +128,15 @@
     "typescript": "^7"
   },
   "dependencies": {
+    "@duckdb/node-api": "^2.0.1-r.1",
     "@electric-sql/pglite": "^0.6.0",
+    "@libsql/client": "^0.18.0",
     "@opentelemetry/api": "^1.9.1",
     "@simplewebauthn/server": "^14.0.2",
+    "@surrealdb/node": "^3.2.0",
     "nodemailer": "^10.0.10",
     "otplib": "12",
+    "surrealdb": "^2.2.2",
     "zod": "^4.6.5"
   }
 }

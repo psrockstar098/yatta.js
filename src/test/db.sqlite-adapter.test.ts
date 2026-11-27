@@ -63,9 +63,7 @@ describe("createAdapter", () => {
     adapter.close();
   });
 
-  it("throws for pglite (Phase 2) and unknown drivers", () => {
-    expect(() => createAdapter("pglite" as any)).toThrow(YattaError);
-    expect(() => createAdapter("pglite" as any)).toThrow(/Phase 2/);
+  it("throws for not-yet-landed drivers (turso, duckdb)", () => {
     expect(() => createAdapter("turso" as any)).toThrow(YattaError);
     expect(() => createAdapter("duckdb" as any)).toThrow(YattaError);
   });

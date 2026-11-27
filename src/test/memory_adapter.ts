@@ -11,6 +11,12 @@
 // Transactions are real: a snapshot is taken on entry and restored on
 // throw, so a rollback undoes the work. Nested transactions are savepoints
 // (one snapshot per level).
+//
+// The SQL-facing members exist only to satisfy the DatabaseSession contract:
+// `dialect`/`compiler` are the real SQLite ones (compiling only — nothing
+// is ever executed), `run()` throws like executeRaw does, and
+// `ensureSearchIndex`/`clearStatementCache` no-op (a LIKE scan needs no
+// index and there are no prepared statements to purge).
 
 import { YattaError } from "../types/db/errors";
 import type {
@@ -27,6 +33,9 @@ import type {
 } from "../types/db/adapter";
 import type { DatabaseSchema, TableSchema } from "../types/db/schema";
 import { FILTER_OPS, type RuntimeFilterOps, type WhereClause } from "../types/db/query";
+import type { SqlDialect } from "../types/db/sql_dialect";
+import { SqlCompiler } from "../types/db/sql_compiler";
+import { SqliteDialect } from "../types/db/adapters/sqlite_dialect";
 
 export const MEMORY_CAPABILITIES: AdapterCapabilities = {
   mode: "sync",
@@ -176,6 +185,15 @@ export class MemoryAdapter implements DatabaseAdapter<"sync"> {
   // keeps the test-only adapter inside the RelationalDriverName type.
   readonly driver = "memory" as unknown as RelationalDriverName;
   readonly capabilities: AdapterCapabilities = MEMORY_CAPABILITIES;
+  /** In-memory only: there is no file, so the path is ":memory:". */
+  readonly path = ":memory:";
+  /** Real SQLite dialect/compiler (compiling only — see the file header). */
+  readonly dialect: SqlDialect = new SqliteDialect();
+  readonly compiler: SqlCompiler = new SqlCompiler(this.dialect);
+  /** True while a transaction snapshot is on the stack. */
+  get inTransaction(): boolean {
+    return this.txStack.length > 0;
+  }
 
   private schemas = new Map<string, TableSchema>();
   private tables = new Map<string, Map<string | number, Record<string, unknown>>>();
@@ -212,6 +230,18 @@ export class MemoryAdapter implements DatabaseAdapter<"sync"> {
 
   ready(): void {
     // No-op: an in-memory store is ready as soon as it exists.
+  }
+
+  run(_sql: string, _params?: unknown[], _mode?: "get" | "all" | "run"): unknown {
+    throw new YattaError("MemoryAdapter has no SQL execution — it holds rows in Maps, not a database engine.");
+  }
+
+  ensureSearchIndex(_table: string, _schema: TableSchema): void {
+    // No-op: the LIKE-style substring scan needs no index.
+  }
+
+  clearStatementCache(): void {
+    // No-op: there are no prepared statements to purge.
   }
 
   syncSchema(schema: DatabaseSchema): void {
