@@ -86,8 +86,10 @@ describe("createAdapter (pglite)", () => {
   }, 30000);
 
   it("throws for unknown drivers and for a dataDir that is a file", () => {
-    expect(() => createAdapter("turso" as any)).toThrow(YattaError);
-    expect(() => createAdapter("duckdb" as any)).toThrow(YattaError);
+    // Turso and DuckDB used to throw here (they were not wired yet); now
+    // they construct, and only a driver with no implementation throws.
+    expect(() => createAdapter("oracle" as any)).toThrow(YattaError);
+    expect(() => createAdapter("scylladb" as any)).toThrow(YattaError);
     const dir = tmpDir();
     const file = path.join(dir, "not-a-dir");
     fs.writeFileSync(file, "x");

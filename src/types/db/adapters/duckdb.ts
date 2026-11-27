@@ -20,6 +20,17 @@
 // waits on the mutex instead of joining a transaction it does not own.
 //
 // Honest limits, all probe-verified:
+//   - The `@duckdb/node-api` package is loaded LAZILY (see `loadDuckdb`
+//     below), never statically imported: its loader
+//     (`@duckdb/node-bindings/duckdb.js`) conditionally requires a native
+//     `.node` binary per platform, and `bun build --compile` resolves
+//     every branch statically — so a static import broke the standalone
+//     build with "Could not resolve" for the seven platforms not
+//     installed here. A computed-specifier dynamic import is invisible
+//     to the bundler: the package stays out of the binary entirely, and
+//     a SQLite-only binary works standalone. A DuckDB database loads the
+//     package from `node_modules` at runtime instead, so a standalone
+//     binary that USES DuckDB needs the package resolvable next to it.
 //   - SAVEPOINT is a parser error in DuckDB 2.0.1, so there are no
 //     savepoints: a nested transaction joins the outer one and an
 //     inner failure rolls back everything (capabilities.savepoints is
@@ -46,11 +57,10 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import {
+import type {
+  DuckDBConnection,
   DuckDBInstance,
-  blobValue,
-  type DuckDBConnection,
-  type DuckDBValue,
+  DuckDBValue,
 } from "@duckdb/node-api";
 import { YattaError } from "../errors";
 import type { ColumnDefinition, DatabaseSchema, TableSchema } from "../schema";
@@ -68,6 +78,29 @@ import type {
   TransactionOptions,
 } from "../adapter";
 import { DuckDBDialect, duckSequenceName } from "./duckdb_dialect";
+
+/**
+ * Lazily loads `@duckdb/node-api`, cached after the first call. The
+ * specifier is computed at runtime on purpose: a static import (or a
+ * literal dynamic import) lets `bun build --compile` trace into the
+ * package's native-binding loader, which requires a `.node` binary per
+ * platform — and the build fails resolving the seven platforms not
+ * installed on the build machine. A computed specifier is invisible to
+ * the bundler, so the package is never bundled; it is resolved from
+ * `node_modules` when a DuckDB database actually opens. Every use goes
+ * through `ensureReady()` first, which awaits `initConnection()`,
+ * which awaits this — so the module is loaded before any statement
+ * runs, and a failure to load it surfaces as a plain error from
+ * `ready()` instead of a crash at import time.
+ */
+type DuckDBNodeApi = typeof import("@duckdb/node-api");
+let duckApi: DuckDBNodeApi | null = null;
+async function loadDuckdb(): Promise<DuckDBNodeApi> {
+  if (duckApi) return duckApi;
+  const specifier = ["@duckdb", "node-api"].join("/");
+  duckApi = (await import(specifier)) as DuckDBNodeApi;
+  return duckApi;
+}
 import type { SqlDialect } from "../sql_dialect";
 import type { WhereClause } from "../query";
 
@@ -192,6 +225,8 @@ export const DUCKDB_CAPABILITIES: AdapterCapabilities = {
   // never generates more than a few hundred params for realistic
   // queries.
   maxBindParams: 999,
+  // The DuckDB dialect compiles runnable SQL.
+  compilerSql: true,
 };
 
 /** Connection options for the DuckDB adapter. */
@@ -276,7 +311,8 @@ export class DuckDBSession implements DatabaseSession<"async"> {
 
   /** Opens the instance + connection. Re-run after restore() closes them. */
   protected async initConnection(): Promise<void> {
-    const instance = await DuckDBInstance.create(this.path);
+    const api = await loadDuckdb();
+    const instance = await api.DuckDBInstance.create(this.path);
     this.instance = instance;
     this.connection = await instance.connect();
   }
@@ -355,8 +391,11 @@ export class DuckDBSession implements DatabaseSession<"async"> {
   ): Promise<unknown> {
     await this.ensureReady();
     const conn = this.connection!;
+    // `ensureReady()` awaited `initConnection()`, which loaded the
+    // package — so this is a cache hit, not a second load.
+    const api = await loadDuckdb();
     const bound = params.map((v) =>
-      v instanceof Uint8Array ? blobValue(v) : v,
+      v instanceof Uint8Array ? api.blobValue(v) : v,
     ) as DuckDBValue[];
     const start = this.debug ? performance.now() : 0;
     try {
@@ -699,6 +738,15 @@ export class DuckDBSession implements DatabaseSession<"async"> {
   }
 
   /**
+   * No standalone FTS table exists on this driver: search is a LIKE
+   * fallback over the live rows, so there is nothing for Table.delete
+   * to clean up. Always false.
+   */
+  async ftsTableExists(_tableName: string): Promise<boolean> {
+    return false;
+  }
+
+  /**
    * Makes sure one table can be searched. With no index to build or
    * repair this only verifies the table exists and has a primary key;
    * the search itself reads the live rows.
@@ -807,6 +855,50 @@ export class DuckDBSession implements DatabaseSession<"async"> {
       });
     });
   }
+  /**
+   * Creates the migration-marker table (`_yatta_migrations`) in DuckDB
+   * DDL. Its id is a sequence default like any col.id(). The transaction
+   * hands callers this same adapter object, so this also serves a
+   * transaction child session (DuckDB transactions hand callers
+   * this same object, so the adapter inherits it unchanged).
+   */
+  async ensureMigrationTable(): Promise<void> {
+    await this.ensureSequence("_yatta_migrations", "id");
+    this.duckDialect.setTableContext("_yatta_migrations");
+    try {
+      const fragments = [
+        this.duckDialect.compileColumnFragment("id", { type: "INTEGER", primaryKey: true, autoIncrement: true, notNull: true }, "create"),
+        this.duckDialect.compileColumnFragment("name", { type: "TEXT", unique: true }, "create"),
+        this.duckDialect.compileColumnFragment("hash", { type: "TEXT" }, "create"),
+        this.duckDialect.compileColumnFragment("applied_at", { type: "TEXT", defaultValue: "CURRENT_TIMESTAMP" }, "create"),
+      ];
+      await this.run(this.duckDialect.compileCreateTableSql("_yatta_migrations", fragments), [], "run");
+    } finally {
+      this.duckDialect.setTableContext(null);
+    }
+  }
+
+  /** Names of migrations already recorded as applied. */
+  async listAppliedMigrations(): Promise<string[]> {
+    return (
+      (await this.run("SELECT name FROM _yatta_migrations", [], "all")) as { name: string }[]
+    ).map((r) => r.name);
+  }
+
+  /** Records one migration as applied (ignored when already present). */
+  async recordMigration(name: string): Promise<void> {
+    await this.run(
+      `INSERT INTO "_yatta_migrations" ("name", "hash") VALUES ($1, $2) ON CONFLICT DO NOTHING;`,
+      [name, "migration"],
+      "run",
+    );
+  }
+
+  protected async ensureSequence(table: string, colName: string): Promise<void> {
+    const seq = duckSequenceName(table, colName).replace(/"/g, '""');
+    await this.run(`CREATE SEQUENCE IF NOT EXISTS "${seq}" START WITH 1;`, [], "run");
+  }
+
 }
 
 /**
@@ -855,19 +947,7 @@ export class DuckDBAdapter extends DuckDBSession implements DatabaseAdapter<"asy
     }
 
     // Migration log. Its id is a sequence default like any col.id().
-    await this.ensureSequence("_yatta_migrations", "id");
-    this.duckDialect.setTableContext("_yatta_migrations");
-    try {
-      const fragments = [
-        this.duckDialect.compileColumnFragment("id", { type: "INTEGER", primaryKey: true, autoIncrement: true, notNull: true }, "create"),
-        this.duckDialect.compileColumnFragment("name", { type: "TEXT", unique: true }, "create"),
-        this.duckDialect.compileColumnFragment("hash", { type: "TEXT" }, "create"),
-        this.duckDialect.compileColumnFragment("applied_at", { type: "TEXT", defaultValue: "CURRENT_TIMESTAMP" }, "create"),
-      ];
-      await this.run(this.duckDialect.compileCreateTableSql("_yatta_migrations", fragments), [], "run");
-    } finally {
-      this.duckDialect.setTableContext(null);
-    }
+    await this.ensureMigrationTable();
 
     for (const tableName of topologicalSortTables(schema)) {
       const tableDef = schema[tableName]!;
@@ -950,11 +1030,6 @@ export class DuckDBAdapter extends DuckDBSession implements DatabaseAdapter<"asy
   }
 
   /** Creates a table's auto-increment sequence if it does not exist yet. Runs before the CREATE TABLE / ADD COLUMN that references it. */
-  protected async ensureSequence(table: string, colName: string): Promise<void> {
-    const seq = duckSequenceName(table, colName).replace(/"/g, '""');
-    await this.run(`CREATE SEQUENCE IF NOT EXISTS "${seq}" START WITH 1;`, [], "run");
-  }
-
   /** Current number of rows in a table, or 0 if it does not exist yet. */
   protected async rowCount(tableName: string): Promise<number> {
     const row = (await this.run(
@@ -1012,6 +1087,7 @@ export class DuckDBAdapter extends DuckDBSession implements DatabaseAdapter<"asy
     return this.transaction(fn);
   }
 
+
   /**
    * Performs a backup snapshot: CHECKPOINT folds the WAL into the main
    * file, then the file is copied (via a temp file + rename, so a
@@ -1061,7 +1137,8 @@ export class DuckDBAdapter extends DuckDBSession implements DatabaseAdapter<"asy
 
     let testInstance: DuckDBInstance | null = null;
     try {
-      testInstance = await DuckDBInstance.create(sourcePath, { access_mode: "READ_ONLY" });
+      const api = await loadDuckdb();
+      testInstance = await api.DuckDBInstance.create(sourcePath, { access_mode: "READ_ONLY" });
       const testConn = await testInstance.connect();
       try {
         const reader = await testConn.runAndReadAll(

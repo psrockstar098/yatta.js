@@ -117,6 +117,8 @@ export const SQLITE_CAPABILITIES: AdapterCapabilities = {
   // SQLite's historical SQLITE_MAX_VARIABLE_NUMBER floor; the compiler never
   // generates more than a few hundred params for realistic queries.
   maxBindParams: 999,
+  // The dialect compiles runnable SQLite SQL.
+  compilerSql: true,
 };
 
 /**
@@ -736,6 +738,36 @@ export class SqliteSession implements DatabaseSession<"sync"> {
       "run",
     );
   }
+  /**
+   * Creates the migration-marker table (`_yatta_migrations`) in this
+   * driver's own dialect. The engine's `migrate()` calls this instead
+   * of emitting `CREATE TABLE` itself.
+   */
+  ensureMigrationTable(): void {
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS "_yatta_migrations" (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        hash TEXT,
+        applied_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+  }
+
+  /** Names of migrations already recorded as applied. */
+  listAppliedMigrations(): string[] {
+    return (
+      this.run("SELECT name FROM _yatta_migrations", [], "all") as { name: string }[]
+    ).map((r) => r.name);
+  }
+
+  /** Records one migration as applied (ignored when already present). */
+  recordMigration(name: string): void {
+    this.db
+      .query(`INSERT OR IGNORE INTO "_yatta_migrations" (name, hash) VALUES (?, ?)`)
+      .run(name, "migration");
+  }
+
 }
 
 /**
@@ -805,14 +837,7 @@ export class SqliteAdapter extends SqliteSession implements DatabaseAdapter<"syn
    * Split out from {@link syncSchema} so the lock handling stays readable.
    */
   private syncSchemaBody(schema: DatabaseSchema, schemaHash: string): void {
-    this.db.run(`
-      CREATE TABLE IF NOT EXISTS "_yatta_migrations" (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE,
-        hash TEXT,
-        applied_at TEXT DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+    this.ensureMigrationTable();
 
     for (const [tableName, tableDef] of Object.entries(schema)) {
       const indexSqls: string[] = [];
@@ -994,6 +1019,7 @@ export class SqliteAdapter extends SqliteSession implements DatabaseAdapter<"syn
     release(true);
     return result;
   }
+
 
   /**
    * Performs an atomic online backup snapshot using SQLite's `VACUUM INTO`.
