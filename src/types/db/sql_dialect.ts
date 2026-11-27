@@ -21,6 +21,9 @@
 //     ("" for SQLite, which emits nothing — byte-identical current SQL;
 //     " NULLS FIRST"/" NULLS LAST" for Postgres, which defaults the
 //     opposite way to SQLite and must match it explicitly).
+//   - compileLimitOffset owns the LIMIT/OFFSET spelling: SQLite's
+//     unbounded read is `LIMIT -1`, Postgres rejects a negative LIMIT
+//     and spells it `LIMIT ALL`.
 //
 // compileUpsert returns null when the dialect has no atomic upsert: the
 // core then falls back to the transactional find-first-then-update/insert
@@ -80,6 +83,13 @@ export interface SqlDialect {
   compileLikePredicate(quotedCol: string, placeholder: string, escape: boolean): string;
   /** NULLS suffix to append after ASC/DESC ("" when the driver's default already matches SQLite's). */
   compileOrderNulls(dir: "ASC" | "DESC"): string;
+  /**
+   * LIMIT/OFFSET clause for a page. SQLite spells an unbounded read
+   * `LIMIT -1`; Postgres rejects a negative LIMIT, so it spells the same
+   * read `LIMIT ALL` (and allows a bare OFFSET). `take: -1` is the
+   * caller's "no upper bound" and is unbounded on both.
+   */
+  compileLimitOffset(take: number | undefined, skip: number | undefined): string;
 
   /** Driver-level encoding of one bound value (boolean -> 1/0 for SQLite, identity for Postgres; JSON stringify; Date -> ISO string). */
   encodeParam(value: unknown, def?: ColumnDefinition): unknown;

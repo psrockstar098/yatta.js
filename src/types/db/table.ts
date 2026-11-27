@@ -21,8 +21,18 @@ import {
   type UpsertOptions,
   type WhereClause,
 } from "./query";
-import { correctTypo, ftsPhrase, normalizeSynonyms, tokenizeText } from "./search";
+import { correctTypo, normalizeSynonyms, tokenizeText } from "./search";
 import type { YattaDB } from "./engine";
+import {
+  allResults,
+  chainResult,
+  collectSequential,
+  modeValue,
+  runSequential,
+  type CompiledSearchQuery,
+  type ExecutionMode,
+  type ModeResult,
+} from "./adapter";
 
 // ──────────────────────────────────────────────────────────────────────────
 // 5. Table Gateway
@@ -53,8 +63,27 @@ function pageCount(value: number | undefined, fallback: number): number {
  * Type-safe CRUD table gateway providing querying, insertions, updates, deletions,
  * aggregations, relational joins, and pagination.
  *
+ * Generic over the execution mode `M`: `"sync"` for SQLite (every method
+ * returns its plain value, exactly as before) and `"async"` for PGlite,
+ * Turso, DuckDB, and SurrealDB (every method returns a Promise). The mode
+ * follows the driver, so sync callers keep sync types and async callers
+ * are forced by TypeScript to await.
+ *
+ * Two execution paths, chosen by the adapter's capabilities:
+ * - `compilerSql` drivers (SQLite, PGlite, Turso, DuckDB): Table compiles
+ *   SQL through the dialect's compiler and executes it via `db.run`, as
+ *   before. Search uses the FTS5 SQL path when `fullTextSearch` is
+ *   `"fts5"`, and the adapter's `search()` otherwise.
+ * - SurrealDB (`compilerSql: false`): its dialect refuses every
+ *   SQL-emitting compiler method, so Table uses the session's
+ *   `insert` / `find` / `count` / `update` / `delete` / `search`
+ *   methods with dialect-neutral `Compiled*` shapes instead. Full-text
+ *   index maintenance is a no-op there (the engine maintains its own
+ *   BM25 indexes), so the FTS sync calls below resolve immediately.
+ *
  * @template T Full row record type.
  * @template TInsert Payload accepted for insertions.
+ * @template M Execution mode (`"sync"` or `"async"`).
  *
  * @example
  * ```ts
@@ -63,7 +92,11 @@ function pageCount(value: number | undefined, fallback: number): number {
  * db.users.updateById(user.id, { name: "Alice Smith" });
  * ```
  */
-export class Table<T extends Record<string, any> = Record<string, any>, TInsert extends Record<string, any> = Partial<T>> {
+export class Table<
+  T extends Record<string, any> = Record<string, any>,
+  TInsert extends Record<string, any> = Partial<T>,
+  M extends ExecutionMode = "sync",
+> {
   /** Map of column definitions belonging to this table. */
   readonly columns: Map<string, ColumnDefinition> = new Map();
   /**
@@ -96,7 +129,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    */
   constructor(
     public readonly name: string,
-    private db: YattaDB,
+    private db: YattaDB<M>,
     private schema?: TableSchema,
   ) {
     if (schema) {
@@ -124,7 +157,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * const admins = db.users.where((f) => f.role.isEqualTo("admin")).all();
    * ```
    */
-  where(clauseOrFn: WhereClause<T> | ((fields: FieldsProxy<T>) => Condition)): QueryBuilder<T> {
+  where(clauseOrFn: WhereClause<T> | ((fields: FieldsProxy<T>) => Condition)): QueryBuilder<T, T, M> {
     return new QueryBuilder(this).where(clauseOrFn);
   }
 
@@ -142,7 +175,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * const user = db.users.insert({ email: "bob@example.com", name: "Bob" });
    * ```
    */
-  insert(data: TInsert): T {
+  insert(data: TInsert): ModeResult<M, T> {
     const payload = this.resolveAliases(data as Record<string, any>);
 
     for (const [colName, def] of this.columns) {
@@ -156,11 +189,21 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     // landed row behind a failed insert — a retry would otherwise create
     // a duplicate or a UNIQUE error. The statement itself comes from the
     // compiler, which also handles the empty-payload DEFAULT VALUES case.
+    if (!this.db.adapter.capabilities.compilerSql) {
+      // SurrealDB: no runnable SQL — the session builds SurrealQL itself.
+      return this.db.transaction(() => {
+        return chainResult(this.db.mode, this.db.session.insert(this.name, this.requireSchema(), payload), (row) => {
+          const decoded = this.deserializeRow(row);
+          return chainResult(this.db.mode, this.syncFtsInsert(decoded), () => decoded);
+        });
+      });
+    }
     const { sql, params } = this.db.compiler.compileInsert(this.name, this.columns, payload);
     return this.db.transaction(() => {
-      const row = this.deserializeRow(this.db.run(sql, params, "get") as any);
-      this.syncFtsInsert(row);
-      return row;
+      return chainResult(this.db.mode, this.db.run(sql, params, "get"), (raw) => {
+        const row = this.deserializeRow(raw as any);
+        return chainResult(this.db.mode, this.syncFtsInsert(row), () => row);
+      });
     });
   }
 
@@ -178,9 +221,17 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * ]);
    * ```
    */
-  insertMany(items: TInsert[]): T[] {
-    if (items.length === 0) return [];
-    return this.db.transaction(() => items.map((item) => this.insert(item)));
+  insertMany(items: TInsert[]): ModeResult<M, T[]> {
+    if (items.length === 0) return modeValue(this.db.mode, []);
+    return this.db.transaction(() => {
+      // Sequential, not Promise.all: each insert opens its own nested
+      // savepoint transaction, and concurrent savepoints corrupt each
+      // other on single-connection drivers (Turso: "no such savepoint").
+      return collectSequential(
+        this.db.mode,
+        items.map((item) => () => this.insert(item)),
+      );
+    });
   }
 
   // ── FIND ─────────────────────────────────────────────────────────────────
@@ -191,19 +242,22 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * @param options Query criteria with `select` array.
    * @returns Picked record columns or `null` if no match.
    */
-  findFirst<K extends keyof T>(options: FindOptions<T, K> & { select: K[] }): Prettify<Pick<T, K>> | null;
+  findFirst<K extends keyof T>(options: FindOptions<T, K> & { select: K[] }): ModeResult<M, Prettify<Pick<T, K>> | null>;
   /**
    * Finds the first row matching the specified criteria.
    *
    * @param options Optional query criteria.
    * @returns Full record or `null` if no match.
    */
-  findFirst(options?: FindOptions<T, keyof T>): T | null;
+  findFirst(options?: FindOptions<T, keyof T>): ModeResult<M, T | null>;
   findFirst<K extends keyof T = keyof T, R = Pick<T, K>>(
     options: FindOptions<T, K> = {},
-  ): R | null {
-    const results = this.findMany({ ...options, take: 1 } as any) as R[];
-    return results[0] ?? null;
+  ): ModeResult<M, R | null> {
+    return chainResult(
+      this.db.mode,
+      this.findMany({ ...options, take: 1 } as any) as ModeResult<M, R[]>,
+      (results) => results[0] ?? null,
+    );
   }
 
   /**
@@ -211,7 +265,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    *
    * @returns First row or `null` if table is empty.
    */
-  first(): T | null {
+  first(): ModeResult<M, T | null> {
     return this.findFirst();
   }
 
@@ -225,7 +279,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
   findById<K extends keyof T>(
     id: string | number,
     options: { select: K[]; include?: Record<string, boolean> },
-  ): Prettify<Pick<T, K>> | null;
+  ): ModeResult<M, Prettify<Pick<T, K>> | null>;
   /**
    * Finds a row by its primary key.
    *
@@ -236,16 +290,16 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
   findById(
     id: string | number,
     options?: { select?: undefined; include?: Record<string, boolean> },
-  ): T | null;
+  ): ModeResult<M, T | null>;
   findById<K extends keyof T = keyof T, R = Pick<T, K>>(
     id: string | number,
     options?: { select?: K[]; include?: Record<string, boolean> },
-  ): R | null {
+  ): ModeResult<M, R | null> {
     return this.findFirst({
       where: { [this.primaryKeyColumn]: id } as any,
       select: options?.select,
       include: options?.include,
-    } as any) as R | null;
+    } as any) as ModeResult<M, R | null>;
   }
 
   /**
@@ -254,17 +308,17 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * @param options Query criteria with `select` array.
    * @returns Array of picked records.
    */
-  findMany<K extends keyof T>(options: FindOptions<T, K> & { select: K[] }): Prettify<Pick<T, K>>[];
+  findMany<K extends keyof T>(options: FindOptions<T, K> & { select: K[] }): ModeResult<M, Prettify<Pick<T, K>>[]>;
   /**
    * Finds all rows matching the specified criteria.
    *
    * @param options Optional query criteria.
    * @returns Array of full records.
    */
-  findMany(options?: FindOptions<T, keyof T>): T[];
+  findMany(options?: FindOptions<T, keyof T>): ModeResult<M, T[]>;
   findMany<K extends keyof T = keyof T, R = Pick<T, K>>(
     options: FindOptions<T, K> = {},
-  ): R[] {
+  ): ModeResult<M, R[]> {
     // The select list is computed here (validation + include expansion need
     // the relations graph); the statement itself comes from the compiler.
     let select: string[] | undefined;
@@ -297,6 +351,31 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
       select = [...cols];
     }
 
+    if (!this.db.adapter.capabilities.compilerSql) {
+      // SurrealDB: the session builds the SurrealQL itself.
+      return chainResult(
+        this.db.mode,
+        this.db.session.find(this.name, this.requireSchema(), {
+          where: options.where,
+          orderBy: options.orderBy
+            ? Array.isArray(options.orderBy)
+              ? options.orderBy
+              : [options.orderBy]
+            : undefined,
+          select,
+          take: options.take !== undefined ? this.rowCount(options.take, "take", true) : undefined,
+          skip: options.skip !== undefined ? this.rowCount(options.skip, "skip", false) : undefined,
+        }),
+        (found) => {
+          const rows = found.map((r) => this.deserializeRow(r));
+          if (options.include && rows.length > 0) {
+            return chainResult(this.db.mode, this.resolveRelations(rows, options.include), () => rows as unknown as R[]);
+          }
+          return rows as unknown as R[];
+        },
+      );
+    }
+
     const { sql, params } = this.db.compiler.compileSelect(this.name, this.columns, {
       where: options.where,
       orderBy: options.orderBy,
@@ -305,9 +384,13 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
       select,
     });
 
-    const rows = (this.db.run(sql, params, "all") as any[]).map((r) => this.deserializeRow(r));
-    if (options.include && rows.length > 0) this.resolveRelations(rows, options.include);
-    return rows as unknown as R[];
+    return chainResult(this.db.mode, this.db.run(sql, params, "all"), (rawRows) => {
+      const rows = (rawRows as any[]).map((r) => this.deserializeRow(r));
+      if (options.include && rows.length > 0) {
+        return chainResult(this.db.mode, this.resolveRelations(rows, options.include), () => rows as unknown as R[]);
+      }
+      return rows as unknown as R[];
+    });
   }
 
   // ── FULL-TEXT SEARCH ─────────────────────────────────────────────────────
@@ -336,7 +419,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * // hits[0].row is the laptop row, hits[0].rank its bm25 value.
    * ```
    */
-  search(query: string, options: SearchOptions<T> = {}): SearchHit<T>[] {
+  search(query: string, options: SearchOptions<T> = {}): ModeResult<M, SearchHit<T>[]> {
     const searchable = this.ftsColumns;
     if (searchable.length === 0) {
       throw new YattaError(
@@ -376,61 +459,60 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     // searches for rows matching both words, and a payload like
     // `" OR 1=1 --` cannot smuggle operators into the MATCH expression.
     const tokens = tokenizeText(query).filter((t) => t !== "and" && t !== "or" && t !== "not");
-    if (tokens.length === 0) return [];
+    if (tokens.length === 0) return modeValue(this.db.mode, []);
 
     // Creates (or repairs) the index on first use, so a table opened with
     // autoMigrate off, or a database file copied in from elsewhere, still
     // searches correctly instead of failing on a missing FTS table.
-    this.db.ensureSearchIndex(this.name);
+    return chainResult(this.db.mode, this.db.ensureSearchIndex(this.name), () => {
+      const useTypo = options.typo !== false;
+      return chainResult(
+        this.db.mode,
+        useTypo ? this.db.ftsVocabulary(this.name) : modeValue(this.db.mode, new Set<string>()),
+        (vocabulary) => {
+          const synonyms = new Map([...this.db.searchSynonyms(), ...normalizeSynonyms(options.synonyms)]);
 
-    const useTypo = options.typo !== false;
-    const vocabulary = useTypo ? this.db.ftsVocabulary(this.name) : new Set<string>();
-    const synonyms = new Map([...this.db.searchSynonyms(), ...normalizeSynonyms(options.synonyms)]);
+          // One group per token: the typo-corrected spelling plus its
+          // synonym phrases. The adapter ANDs groups and ORs alternatives
+          // inside a group, in its own index dialect (FTS5 MATCH for
+          // SQLite/Turso, tsvector for PGlite, LIKE for DuckDB, BM25 for
+          // SurrealDB) — Table never builds index SQL itself.
+          const expandedGroups: string[][][] = [];
+          for (const token of tokens) {
+            const corrected = useTypo && !vocabulary.has(token) ? correctTypo(token, vocabulary) ?? token : token;
+            const alternatives = new Map<string, string[]>();
+            alternatives.set(corrected, [corrected]);
+            for (const key of [corrected, token]) {
+              for (const phrase of synonyms.get(key) ?? []) alternatives.set(phrase.join(" "), phrase);
+            }
+            expandedGroups.push([...alternatives.values()]);
+          }
 
-    const groups: string[] = [];
-    for (const token of tokens) {
-      const corrected = useTypo && !vocabulary.has(token) ? correctTypo(token, vocabulary) ?? token : token;
-      const alternatives = new Map<string, string[]>();
-      alternatives.set(corrected, [corrected]);
-      for (const key of [corrected, token]) {
-        for (const phrase of synonyms.get(key) ?? []) alternatives.set(phrase.join(" "), phrase);
-      }
-      const group = [...alternatives.values()].map(ftsPhrase).join(" OR ");
-      const wrapped = alternatives.size > 1 ? `(${group})` : group;
-      groups.push(restricted ? `{${restricted.join(" ")}} : ${wrapped}` : wrapped);
-    }
-    const matchExpr = groups.join(" AND ");
-
-    const fts = this.db.ftsTableName(this.name);
-    const qfts = `"${fts.replace(/"/g, '""')}"`;
-    // SQLite rejects a bare OFFSET with no LIMIT, so an offset-only page
-    // gets LIMIT -1 (SQLite's "no upper bound"), the same idiom findMany uses.
-    const limitSql = limit !== undefined ? `LIMIT ${limit}` : options.offset !== undefined ? "LIMIT -1" : "";
-    const offsetSql = options.offset !== undefined ? `OFFSET ${offset}` : "";
-    const sql = [
-      `SELECT "__yatta_pk" AS pk, bm25(${qfts}) AS rank FROM ${qfts}`,
-      `WHERE ${qfts} MATCH ? ORDER BY rank ASC`,
-      limitSql,
-      offsetSql,
-    ].filter(Boolean).join(" ").concat(";");
-
-    const hits = this.db.run(sql, [matchExpr], "all") as { pk: unknown; rank: number }[];
-    if (hits.length === 0) return [];
-
-    const pks = hits.map((h) => this.coercePk(h.pk));
-    const pkFilter = { [this.primaryKeyColumn]: { in: pks } } as any;
-    const where = options.where && Object.keys(options.where).length > 0
-      ? ({ AND: [options.where, pkFilter] } as WhereClause<T>)
-      : pkFilter;
-    const rows = this.findMany({ where, include: options.include } as any);
-    const byPk = new Map(rows.map((r) => [String((r as any)[this.primaryKeyColumn]), r]));
-
-    const out: SearchHit<T>[] = [];
-    for (const h of hits) {
-      const row = byPk.get(String(h.pk));
-      if (row) out.push({ row, rank: h.rank });
-    }
-    return out;
+          const compiled: CompiledSearchQuery = {
+            tokens,
+            expandedGroups,
+            columns: restricted ?? [],
+            where: options.where,
+            limit,
+            offset: options.offset !== undefined ? offset : undefined,
+            typoCorrection: useTypo,
+          };
+          return chainResult(
+            this.db.mode,
+            this.db.session.search(this.name, this.requireSchema(), compiled),
+            (hits) => {
+              if (hits.length === 0) return [];
+              const rows = hits.map((h) => this.deserializeRow(h.row));
+              const out = (): SearchHit<T>[] => hits.map((h, i) => ({ row: rows[i]!, rank: h.rank }));
+              if (options.include) {
+                return chainResult(this.db.mode, this.resolveRelations(rows, options.include), out);
+              }
+              return out();
+            },
+          );
+        },
+      );
+    });
   }
 
   /**
@@ -438,25 +520,15 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * The escape hatch for rows changed outside the Table write paths
    * (raw SQL, a copied database file): those writes do not sync the index.
    */
-  rebuildSearchIndex(): void {
-    this.db.rebuildSearchIndex(this.name);
-  }
-
-  /** Converts a stored FTS primary key back to the column's type (numbers stay numbers). */
-  private coercePk(stored: unknown): string | number {
-    const def = this.columns.get(this.primaryKeyColumn);
-    if (def?.type === "INTEGER") {
-      const n = Number(stored);
-      return Number.isFinite(n) ? n : String(stored);
-    }
-    return String(stored);
+  rebuildSearchIndex(): ModeResult<M, void> {
+    return this.db.rebuildSearchIndex(this.name);
   }
 
   /** Writes one row into the FTS index, or does nothing when the table is not searchable. */
-  private syncFtsRow(row: T | null | undefined): void {
-    if (!row) return;
-    if (this.ftsColumns.length === 0) return;
-    this.db.ftsUpsert(this.name, (row as any)[this.primaryKeyColumn], row as any);
+  private syncFtsRow(row: T | null | undefined): ModeResult<M, void> {
+    if (!row) return modeValue(this.db.mode, undefined);
+    if (this.ftsColumns.length === 0) return modeValue(this.db.mode, undefined);
+    return this.db.ftsUpsert(this.name, (row as any)[this.primaryKeyColumn], row as any);
   }
 
   /**
@@ -468,22 +540,32 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * changed outside the Table paths; the next search's count check
    * rebuilds the index in that case.
    */
-  private syncFtsInsert(row: T | null | undefined): void {
-    if (!row) return;
-    if (this.ftsColumns.length === 0) return;
-    this.db.ftsInsert(this.name, (row as any)[this.primaryKeyColumn], row as any);
+  private syncFtsInsert(row: T | null | undefined): ModeResult<M, void> {
+    if (!row) return modeValue(this.db.mode, undefined);
+    if (this.ftsColumns.length === 0) return modeValue(this.db.mode, undefined);
+    return this.db.ftsInsert(this.name, (row as any)[this.primaryKeyColumn], row as any);
   }
 
   /** Removes one primary key from the FTS index, or does nothing when the table is not searchable. */
-  private syncFtsDelete(pk: string | number): void {
-    if (this.ftsColumns.length === 0) return;
-    this.db.ftsDelete(this.name, pk);
+  private syncFtsDelete(pk: string | number): ModeResult<M, void> {
+    if (this.ftsColumns.length === 0) return modeValue(this.db.mode, undefined);
+    return this.db.ftsDelete(this.name, pk);
   }
 
   /** Primary keys of the rows a `where` filter matches, without loading the rows. */
-  private ftsPkValuesForWhere(where: WhereClause<T>): (string | number)[] {
+  private ftsPkValuesForWhere(where: WhereClause<T>): ModeResult<M, (string | number)[]> {
+    if (!this.db.adapter.capabilities.compilerSql) {
+      // SurrealDB: no runnable SQL — read the matching rows' keys
+      // through the session instead (delete() needs them for its
+      // FTS cleanup; the rows themselves are not returned).
+      return chainResult(
+        this.db.mode,
+        this.db.session.find(this.name, this.requireSchema(), { where, select: [this.primaryKeyColumn] }),
+        (rows) => rows.map((r) => r[this.primaryKeyColumn] as string | number),
+      );
+    }
     const { sql, params } = this.db.compiler.compilePkSelect(this.name, this.columns, this.primaryKeyColumn, where);
-    return (this.db.run(sql, params, "all") as any[]).map((r) => r.pk);
+    return chainResult(this.db.mode, this.db.run(sql, params, "all"), (found) => (found as any[]).map((r) => r.pk));
   }
 
   // ── UPDATE ───────────────────────────────────────────────────────────────
@@ -530,18 +612,25 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     data: Partial<TInsert | T>;
     /** Required to update every row. An empty `where` is otherwise refused. */
     allowAll?: boolean;
-  }): { changes: number } {
+  }): ModeResult<M, { changes: number }> {
     const payload = this.resolveSetPayload(options.data as Record<string, any>);
-    if (Object.keys(payload).length === 0) return { changes: 0 };
-
-    const { clause } = this.buildWhere(options.where);
+    if (Object.keys(payload).length === 0) return modeValue(this.db.mode, { changes: 0 });
 
     // Same reasoning as delete(): an unfiltered UPDATE rewrites the whole table,
     // usually because a lookup that was meant to narrow it came back empty.
-    if (!clause && !options.allowAll) {
-      throw new YattaError(
-        `update() on "${this.name}" requires a filter. An empty where would update every row — pass { allowAll: true } if that is what you mean.`,
-      );
+    if (!this.db.adapter.capabilities.compilerSql) {
+      if (this.isEmptyWhereClause(options.where) && !options.allowAll) {
+        throw new YattaError(
+          `update() on "${this.name}" requires a filter. An empty where would update every row — pass { allowAll: true } if that is what you mean.`,
+        );
+      }
+    } else {
+      const { clause } = this.buildWhere(options.where);
+      if (!clause && !options.allowAll) {
+        throw new YattaError(
+          `update() on "${this.name}" requires a filter. An empty where would update every row — pass { allowAll: true } if that is what you mean.`,
+        );
+      }
     }
 
     // The update may change what a row matches (or its searchable text), so
@@ -549,37 +638,70 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     // filter may no longer match the updated rows, and their keys would be
     // unrecoverable. Keys only, not full rows.
     const searchable = this.ftsColumns.length > 0;
-    const affectedPks = searchable ? this.ftsPkValuesForWhere(options.where) : [];
-
-    // The where is compiled twice — once for the allowAll guard above and
-    // once inside compileUpdate. Both are the same pure compilation of the
-    // same input; the guard needs the clause before the statement exists.
-    const { sql, params } = this.db.compiler.compileUpdate(this.name, this.columns, payload, options.where);
-
-    // Row write and index sync share one transaction, like insert(): an
-    // FTS error must not leave updated rows behind a failed update.
-    return this.db.transaction(() => {
-      const res = this.db.run(sql, params, "run") as { changes: number };
-
-      if (searchable) {
-        // A primary-key change moves the row's index entry: reindex under the
-        // new key and drop the old one, or the old entry would point at a row
-        // that no longer exists under that key.
-        const resolved = this.resolveAliases(options.data as Record<string, any>);
-        const pkChanged = resolved[this.primaryKeyColumn] !== undefined;
-        for (const oldPk of affectedPks) {
-          const newPk = pkChanged ? resolved[this.primaryKeyColumn] : oldPk;
-          const row = this.findById(newPk);
-          if (row) {
-            this.syncFtsRow(row);
-            if (String(newPk) !== String(oldPk)) this.syncFtsDelete(oldPk);
-          } else {
-            this.syncFtsDelete(oldPk);
-          }
+    return chainResult(
+      this.db.mode,
+      searchable ? this.ftsPkValuesForWhere(options.where) : modeValue(this.db.mode, [] as (string | number)[]),
+      (affectedPks) => {
+        if (!this.db.adapter.capabilities.compilerSql) {
+          // SurrealDB: the session returns the updated rows, so the index
+          // sync reindexes each new row and drops entries for keys that
+          // moved (a primary-key change) or vanished.
+          return this.db.transaction(() => {
+            return chainResult(
+              this.db.mode,
+              this.db.session.update(this.name, this.requireSchema(), options.where, payload),
+              (updatedRows) => {
+                const newPks = new Set(updatedRows.map((r) => String(r[this.primaryKeyColumn])));
+                const tasks = updatedRows.map((raw) => () => this.syncFtsRow(this.deserializeRow(raw)));
+                for (const oldPk of affectedPks) {
+                  if (!newPks.has(String(oldPk))) tasks.push(() => this.syncFtsDelete(oldPk));
+                }
+                return chainResult(this.db.mode, runSequential(this.db.mode, tasks), () => ({
+                  changes: updatedRows.length,
+                }));
+              },
+            );
+          });
         }
-      }
-      return { changes: res.changes };
-    });
+
+        // The where is compiled twice — once for the allowAll guard above and
+        // once inside compileUpdate. Both are the same pure compilation of the
+        // same input; the guard needs the clause before the statement exists.
+        const { sql, params } = this.db.compiler.compileUpdate(this.name, this.columns, payload, options.where);
+
+        // Row write and index sync share one transaction, like insert(): an
+        // FTS error must not leave updated rows behind a failed update.
+        return this.db.transaction(() => {
+          return chainResult(this.db.mode, this.db.run(sql, params, "run"), (res) => {
+            if (!searchable) return { changes: (res as { changes: number }).changes };
+            // A primary-key change moves the row's index entry: reindex under the
+            // new key and drop the old one, or the old entry would point at a row
+            // that no longer exists under that key.
+            const resolved = this.resolveAliases(options.data as Record<string, any>);
+            const pkChanged = resolved[this.primaryKeyColumn] !== undefined;
+            return chainResult(
+              this.db.mode,
+              runSequential(
+                this.db.mode,
+                affectedPks.map((oldPk) => () => {
+                  const newPk = pkChanged ? resolved[this.primaryKeyColumn] : oldPk;
+                  return chainResult(this.db.mode, this.findById(newPk), (row) => {
+                    if (row) {
+                      return chainResult(this.db.mode, this.syncFtsRow(row), () => {
+                        if (String(newPk) !== String(oldPk)) return this.syncFtsDelete(oldPk);
+                        return modeValue(this.db.mode, undefined);
+                      });
+                    }
+                    return this.syncFtsDelete(oldPk);
+                  });
+                }),
+              ),
+              () => ({ changes: (res as { changes: number }).changes }),
+            );
+          });
+        });
+      },
+    );
   }
 
   /**
@@ -594,9 +716,31 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * const updated = db.users.updateById(1, { name: "New Name" });
    * ```
    */
-  updateById(id: string | number, data: Partial<TInsert | T>): T | null {
+  updateById(id: string | number, data: Partial<TInsert | T>): ModeResult<M, T | null> {
     const payload = this.resolveSetPayload(data as Record<string, any>);
     if (Object.keys(payload).length === 0) return this.findById(id);
+
+    if (!this.db.adapter.capabilities.compilerSql) {
+      // SurrealDB: the session returns the updated rows directly.
+      return this.db.transaction(() => {
+        return chainResult(
+          this.db.mode,
+          this.db.session.update(this.name, this.requireSchema(), { [this.primaryKeyColumn]: id } as any, payload),
+          (updatedRows) => {
+            const row = updatedRows.length > 0 ? this.deserializeRow(updatedRows[0]!) : null;
+            if (row) {
+              return chainResult(this.db.mode, this.syncFtsRow(row), () => {
+                if (String((row as any)[this.primaryKeyColumn]) !== String(id)) {
+                  return chainResult(this.db.mode, this.syncFtsDelete(id), () => row);
+                }
+                return row;
+              });
+            }
+            return chainResult(this.db.mode, this.syncFtsDelete(id), () => null);
+          },
+        );
+      });
+    }
 
     const { sql, params } = this.db.compiler.compileUpdate(
       this.name,
@@ -607,15 +751,18 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     );
     // Row write and index sync share one transaction, like insert().
     return this.db.transaction(() => {
-      const raw = this.db.run(sql, params, "get") as any;
-      const row = raw ? this.deserializeRow(raw) : null;
-      if (row) {
-        this.syncFtsRow(row);
-        if (String((row as any)[this.primaryKeyColumn]) !== String(id)) this.syncFtsDelete(id);
-      } else {
-        this.syncFtsDelete(id);
-      }
-      return row;
+      return chainResult(this.db.mode, this.db.run(sql, params, "get"), (raw) => {
+        const row = raw ? this.deserializeRow(raw as any) : null;
+        if (row) {
+          return chainResult(this.db.mode, this.syncFtsRow(row), () => {
+            if (String((row as any)[this.primaryKeyColumn]) !== String(id)) {
+              return chainResult(this.db.mode, this.syncFtsDelete(id), () => row);
+            }
+            return row;
+          });
+        }
+        return chainResult(this.db.mode, this.syncFtsDelete(id), () => null);
+      });
     });
   }
 
@@ -634,20 +781,21 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * });
    * ```
    */
-  upsert({ where, create, update }: UpsertOptions<T, TInsert>): T {
+  upsert({ where, create, update }: UpsertOptions<T, TInsert>): ModeResult<M, T> {
     return this.db.transaction(() => {
-      const existing = this.findFirst({ where });
-      if (existing) {
-        const id = (existing as any)[this.primaryKeyColumn];
-        return this.updateById(id, update) as T;
-      }
-      const baseCreate: Record<string, any> = { ...create };
-      for (const [k, v] of Object.entries(where)) {
-        if (baseCreate[k] === undefined && (typeof v !== "object" || v === null || v instanceof Date)) {
-          baseCreate[k] = v;
+      return chainResult(this.db.mode, this.findFirst({ where }), (existing) => {
+        if (existing) {
+          const id = (existing as any)[this.primaryKeyColumn];
+          return this.updateById(id, update) as ModeResult<M, T>;
         }
-      }
-      return this.insert(baseCreate as TInsert);
+        const baseCreate: Record<string, any> = { ...create };
+        for (const [k, v] of Object.entries(where)) {
+          if (baseCreate[k] === undefined && (typeof v !== "object" || v === null || v instanceof Date)) {
+            baseCreate[k] = v;
+          }
+        }
+        return this.insert(baseCreate as TInsert);
+      });
     });
   }
 
@@ -668,22 +816,30 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     where: WhereClause<T>;
     /** Required to delete every row. An empty `where` is otherwise refused. */
     allowAll?: boolean;
-  }): { changes: number } {
-    const { clause } = this.buildWhere(options.where);
+  }): ModeResult<M, { changes: number }> {
+    if (!this.db.adapter.capabilities.compilerSql) {
+      if (this.isEmptyWhereClause(options.where) && !options.allowAll) {
+        throw new YattaError(
+          `delete() on "${this.name}" requires a filter. An empty where would delete every row — pass { allowAll: true } if that is what you mean.`,
+        );
+      }
+    } else {
+      const { clause } = this.buildWhere(options.where);
 
-    /*
-     * Refuse an unscoped DELETE.
-     *
-     * `delete({ where: {} })` compiled to `DELETE FROM "users"` and emptied the
-     * table. It is an easy call to make by accident — an empty filter is what a
-     * failed lookup leaves behind — and the result was silent and total. Making
-     * the caller opt in with `allowAll` costs one word and turns a data-loss
-     * bug into an explicit decision.
-     */
-    if (!clause && !options.allowAll) {
-      throw new YattaError(
-        `delete() on "${this.name}" requires a filter. An empty where would delete every row — pass { allowAll: true } if that is what you mean.`,
-      );
+      /*
+       * Refuse an unscoped DELETE.
+       *
+       * `delete({ where: {} })` compiled to `DELETE FROM "users"` and emptied the
+       * table. It is an easy call to make by accident — an empty filter is what a
+       * failed lookup leaves behind — and the result was silent and total. Making
+       * the caller opt in with `allowAll` costs one word and turns a data-loss
+       * bug into an explicit decision.
+       */
+      if (!clause && !options.allowAll) {
+        throw new YattaError(
+          `delete() on "${this.name}" requires a filter. An empty where would delete every row — pass { allowAll: true } if that is what you mean.`,
+        );
+      }
     }
 
     // Rows first, index second, inside one transaction. The old code
@@ -692,22 +848,53 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     // The affected keys are captured before the write (afterwards the
     // filter may no longer match), and the transaction rolls the row
     // delete back if the index sync fails.
-    const searchable =
-      this.ftsColumns.length > 0 && this.db.ftsTableExists(this.name);
-    const affectedPks = searchable
-      ? this.ftsPkValuesForWhere(options.where)
-      : [];
+    return chainResult(
+      this.db.mode,
+      this.ftsColumns.length > 0 ? this.db.ftsTableExists(this.name) : modeValue(this.db.mode, false),
+      (indexExists) => {
+        const searchable = this.ftsColumns.length > 0 && indexExists;
+        return chainResult(
+          this.db.mode,
+          searchable ? this.ftsPkValuesForWhere(options.where) : modeValue(this.db.mode, [] as (string | number)[]),
+          (affectedPks) => {
+            if (!this.db.adapter.capabilities.compilerSql) {
+              // SurrealDB: the session deletes and returns the count; the
+              // engine-managed index needs no per-row cleanup, so the
+              // affected keys are only captured (and deleted) when an
+              // index table exists — which it never does here.
+              return this.db.transaction(() => {
+                return chainResult(
+                  this.db.mode,
+                  this.db.session.delete(this.name, this.requireSchema(), options.where),
+                  (deleted) => {
+                    return chainResult(
+                      this.db.mode,
+                      runSequential(this.db.mode, affectedPks.map((pk) => () => this.syncFtsDelete(pk))),
+                      () => ({ changes: deleted }),
+                    );
+                  },
+                );
+              });
+            }
 
-    // The where is compiled twice — once for the allowAll guard above and
-    // once here. Both are the same pure compilation of the same input; the
-    // guard needs the clause before the statement exists.
-    const { sql, params } = this.db.compiler.compileDelete(this.name, this.columns, options.where);
+            // The where is compiled twice — once for the allowAll guard above and
+            // once here. Both are the same pure compilation of the same input; the
+            // guard needs the clause before the statement exists.
+            const { sql, params } = this.db.compiler.compileDelete(this.name, this.columns, options.where);
 
-    return this.db.transaction(() => {
-      const res = this.db.run(sql, params, "run") as { changes: number };
-      for (const pk of affectedPks) this.syncFtsDelete(pk);
-      return { changes: res.changes };
-    });
+            return this.db.transaction(() => {
+              return chainResult(this.db.mode, this.db.run(sql, params, "run"), (res) => {
+                return chainResult(
+                  this.db.mode,
+                  runSequential(this.db.mode, affectedPks.map((pk) => () => this.syncFtsDelete(pk))),
+                  () => ({ changes: (res as { changes: number }).changes }),
+                );
+              });
+            });
+          },
+        );
+      },
+    );
   }
 
   /**
@@ -721,8 +908,8 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * const wasDeleted = db.users.deleteById(1);
    * ```
    */
-  deleteById(id: string | number): boolean {
-    return this.delete({ where: { [this.primaryKeyColumn]: id } as any }).changes > 0;
+  deleteById(id: string | number): ModeResult<M, boolean> {
+    return chainResult(this.db.mode, this.delete({ where: { [this.primaryKeyColumn]: id } as any }), (res) => res.changes > 0);
   }
 
   // ── COUNT, EXISTS & PAGINATION ───────────────────────────────────────────
@@ -733,9 +920,17 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * @param where Optional filter condition.
    * @returns Total row count.
    */
-  count(where?: WhereClause<T>): number {
+  count(where?: WhereClause<T>): ModeResult<M, number> {
+    if (!this.db.adapter.capabilities.compilerSql) {
+      return this.db.session.count(this.name, this.requireSchema(), where);
+    }
     const { sql, params } = this.db.compiler.compileCount(this.name, this.columns, where);
-    return (this.db.run(sql, params, "get") as { count: number }).count;
+    return chainResult(this.db.mode, this.db.run(sql, params, "get"), (res) => {
+      // COUNT(*) is BIGINT on DuckDB, so a raw run returns a BigInt; the
+      // declared return type is number, and a row count can never exceed 2^53.
+      const raw = (res as { count: unknown }).count;
+      return typeof raw === "bigint" ? Number(raw) : (raw as number);
+    });
   }
 
   /**
@@ -744,10 +939,13 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * @param where Optional filter condition.
    * @returns `true` if matching row exists, `false` otherwise.
    */
-  exists(where?: WhereClause<T>): boolean {
+  exists(where?: WhereClause<T>): ModeResult<M, boolean> {
+    if (!this.db.adapter.capabilities.compilerSql) {
+      // No session exists() — a count of 1 answers the same question.
+      return chainResult(this.db.mode, this.db.session.count(this.name, this.requireSchema(), where), (n) => n > 0);
+    }
     const { sql, params } = this.db.compiler.compileExists(this.name, this.columns, where);
-    const res = this.db.run(sql, params, "get");
-    return res !== null && res !== undefined;
+    return chainResult(this.db.mode, this.db.run(sql, params, "get"), (res) => res !== null && res !== undefined);
   }
 
   /**
@@ -763,22 +961,25 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * console.log(page.data, page.total, page.totalPages);
    * ```
    */
-  paginate<R = T>(options: PaginateOptions<T> = {}): PaginatedResult<R> {
+  paginate<R = T>(options: PaginateOptions<T> = {}): ModeResult<M, PaginatedResult<R>> {
     const page = pageCount(options.page, 1);
     const limit = pageCount(options.limit, 10);
     const skip = (page - 1) * limit;
 
-    const total = this.count(options.where);
-    const data = this.findMany({
-      where: options.where,
-      orderBy: options.orderBy,
-      take: limit,
-      skip,
-      include: options.include,
-      select: options.select,
-    }) as unknown as R[];
-
-    return { data, total, page, limit, totalPages: Math.ceil(total / limit) };
+    return chainResult(this.db.mode, this.count(options.where), (total) => {
+      return chainResult(
+        this.db.mode,
+        this.findMany({
+          where: options.where,
+          orderBy: options.orderBy,
+          take: limit,
+          skip,
+          include: options.include,
+          select: options.select,
+        }) as unknown as ModeResult<M, R[]>,
+        (data) => ({ data, total, page, limit, totalPages: Math.ceil(total / limit) }),
+      );
+    });
   }
 
   /**
@@ -793,7 +994,7 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
    * const { data, nextCursor, hasMore } = db.posts.cursorPaginate({ limit: 15, cursor });
    * ```
    */
-  cursorPaginate<R = T>(options: CursorPaginateOptions<T> = {}): CursorPaginatedResult<R> {
+  cursorPaginate<R = T>(options: CursorPaginateOptions<T> = {}): ModeResult<M, CursorPaginatedResult<R>> {
     const limit = Math.max(1, options.limit ?? 10);
     const cursorCol = (options.cursorColumn ?? this.primaryKeyColumn) as string;
     const tieBreaker = (options.tieBreaker ?? this.primaryKeyColumn) as string;
@@ -876,22 +1077,41 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
       orderBy,
       take: limit + 1,
       include: options.include,
-    }) as any[];
+    }) as ModeResult<M, any[]>;
 
-    const hasMore = items.length > limit;
-    const data = (hasMore ? items.slice(0, limit) : items) as R[];
+    return chainResult(this.db.mode, items, (found) => {
+      const hasMore = found.length > limit;
+      const data = (hasMore ? found.slice(0, limit) : found) as R[];
 
-    let nextCursor: string | null = null;
-    if (hasMore && data.length > 0) {
-      const lastRow = data[data.length - 1] as any;
-      const cursorTuple = [lastRow[cursorCol], lastRow[tieBreaker]];
-      nextCursor = Buffer.from(JSON.stringify(cursorTuple)).toString("base64url");
-    }
+      let nextCursor: string | null = null;
+      if (hasMore && data.length > 0) {
+        const lastRow = data[data.length - 1] as any;
+        const cursorTuple = [lastRow[cursorCol], lastRow[tieBreaker]];
+        nextCursor = Buffer.from(JSON.stringify(cursorTuple)).toString("base64url");
+      }
 
-    return { data, nextCursor, hasMore };
+      return { data, nextCursor, hasMore };
+    });
   }
 
   // ── RELATION ALIASES ─────────────────────────────────────────────────────
+
+  /**
+   * The table's schema, required by the session path: the session's
+   * `insert` / `find` / `update` / `delete` / `count` methods need column
+   * definitions (primary key, types, searchability). A schemaless table
+   * can only run on a `compilerSql` driver, where the compiler builds
+   * SQL from the payload itself.
+   */
+  private requireSchema(): TableSchema {
+    if (!this.schema) {
+      throw new YattaError(
+        `Table "${this.name}" has no schema, so it cannot run on "${this.db.adapter.driver}": ` +
+          `the session methods need column definitions. Define the table in the schema, or use a SQL driver.`,
+      );
+    }
+    return this.schema;
+  }
 
   private resolveAliases(data: Record<string, any>): Record<string, any> {
     const out: Record<string, any> = {};
@@ -915,6 +1135,28 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     // allowAll guards before the statement itself exists.
     const { clause, params } = this.db.compiler.compileWhere(this.name, this.columns, where);
     return { clause, params };
+  }
+
+  /**
+   * Whether a where clause matches everything: the allowAll guard for the
+   * session path, which has no compiler to ask. An empty object, or an
+   * AND/OR of nothing, or a NOT of nothing, matches all rows.
+   */
+  private isEmptyWhereClause(where: WhereClause<any> | undefined): boolean {
+    if (!where || typeof where !== "object") return true;
+    const keys = Object.keys(where);
+    if (keys.length === 0) return true;
+    return keys.every((k) => {
+      if (k === "AND" || k === "OR") {
+        const v = (where as any)[k];
+        return Array.isArray(v) && v.length === 0;
+      }
+      if (k === "NOT") {
+        const v = (where as any)[k];
+        return !v || (typeof v === "object" && Object.keys(v).length === 0);
+      }
+      return false;
+    });
   }
 
   /**
@@ -949,95 +1191,121 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
     return n;
   }
 
-  private resolveRelations(rows: any[], include: Record<string, boolean>) {
+  private resolveRelations(rows: any[], include: Record<string, boolean>): ModeResult<M, void> {
     const tableRelations = this.db.relations[this.name];
 
+    // One task per relation, run in order: each relation's findMany is a
+    // ModeResult, so the grouping work after it chains onto the fetch.
+    const tasks: (() => ModeResult<M, void>)[] = [];
     for (const [relName, enabled] of Object.entries(include)) {
       if (!enabled) continue;
       const configured = tableRelations?.[relName];
 
       if (configured) {
         if ("hasMany" in configured) {
-          const ids = rows.map((r) => r[this.primaryKeyColumn]).filter((v) => v != null);
-          if (ids.length === 0) {
-            for (const row of rows) row[relName] = [];
-            continue;
-          }
-          const children = this.db.table(configured.hasMany).findMany({ where: { [configured.foreignKey]: { in: ids } } as any });
-          const grouped = new Map<any, any[]>();
-          for (const child of children) {
-            const parentId = (child as any)[configured.foreignKey];
-            if (!grouped.has(parentId)) grouped.set(parentId, []);
-            grouped.get(parentId)!.push(child);
-          }
-          for (const row of rows) row[relName] = grouped.get(row[this.primaryKeyColumn]) ?? [];
-        } else if ("belongsTo" in configured) {
-          // The parent holds the foreign key, so look up the referenced row.
-          const targetTable = this.db.table(configured.belongsTo);
-          const targetPk = targetTable.primaryKeyColumn;
-          const foreignIds = rows.map((r) => r[configured.foreignKey]).filter((v) => v != null);
-          if (foreignIds.length === 0) {
-            for (const row of rows) row[relName] = null;
-            continue;
-          }
-          const parents = targetTable.findMany({ where: { [targetPk]: { in: foreignIds } } as any });
-          const map = new Map(parents.map((p) => [(p as any)[targetPk], p]));
-          for (const row of rows) row[relName] = map.get(row[configured.foreignKey]) ?? null;
-        } else {
-          /*
-           * hasOne, not belongsTo.
-           *
-           * Both branches used to read the foreign key off the *parent* row,
-           * but a hasOne child holds the key, not the parent — so the lookup was
-           * always undefined and the relation permanently resolved to null. The
-           * direction is inverted: query the target table for rows whose
-           * foreign key points back at each parent.
-           */
-          const childTable = this.db.table(configured.hasOne);
-          const ids = rows.map((r) => r[this.primaryKeyColumn]).filter((v) => v != null);
-          if (ids.length === 0) {
-            for (const row of rows) row[relName] = null;
-            continue;
-          }
-
-          const children = childTable.findMany({
-            where: { [configured.foreignKey]: { in: ids } } as any,
-          });
-
-          // One row per parent. Several children means the schema does not
-          // actually express a hasOne, so keep the first rather than silently
-          // picking an arbitrary one per query.
-          const firstByParent = new Map<any, any>();
-          for (const child of children) {
-            const parentId = (child as any)[configured.foreignKey];
-            if (!firstByParent.has(parentId)) firstByParent.set(parentId, child);
-          }
-
-          const strays = children.length - firstByParent.size;
-          for (const row of rows) {
-            row[relName] = firstByParent.get(row[this.primaryKeyColumn]) ?? null;
-          }
-          if (strays > 0) {
-            console.warn(
-              `[yatta/db] hasOne "${this.name}.${relName}" matched ${strays} extra row(s) — a hasOne should resolve to at most one.`,
+          tasks.push(() => {
+            const ids = rows.map((r) => r[this.primaryKeyColumn]).filter((v) => v != null);
+            if (ids.length === 0) {
+              for (const row of rows) row[relName] = [];
+              return modeValue(this.db.mode, undefined);
+            }
+            return chainResult(
+              this.db.mode,
+              this.db.table(configured.hasMany).findMany({ where: { [configured.foreignKey]: { in: ids } } as any }),
+              (children) => {
+                const grouped = new Map<any, any[]>();
+                for (const child of children) {
+                  const parentId = (child as any)[configured.foreignKey];
+                  if (!grouped.has(parentId)) grouped.set(parentId, []);
+                  grouped.get(parentId)!.push(child);
+                }
+                for (const row of rows) row[relName] = grouped.get(row[this.primaryKeyColumn]) ?? [];
+              },
             );
-          }
+          });
+        } else if ("belongsTo" in configured) {
+          tasks.push(() => {
+            // The parent holds the foreign key, so look up the referenced row.
+            const targetTable = this.db.table(configured.belongsTo);
+            const targetPk = targetTable.primaryKeyColumn;
+            const foreignIds = rows.map((r) => r[configured.foreignKey]).filter((v) => v != null);
+            if (foreignIds.length === 0) {
+              for (const row of rows) row[relName] = null;
+              return modeValue(this.db.mode, undefined);
+            }
+            return chainResult(
+              this.db.mode,
+              targetTable.findMany({ where: { [targetPk]: { in: foreignIds } } as any }),
+              (parents) => {
+                const map = new Map(parents.map((p) => [(p as any)[targetPk], p]));
+                for (const row of rows) row[relName] = map.get(row[configured.foreignKey]) ?? null;
+              },
+            );
+          });
+        } else {
+          tasks.push(() => {
+            /*
+             * hasOne, not belongsTo.
+             *
+             * Both branches used to read the foreign key off the *parent* row,
+             * but a hasOne child holds the key, not the parent — so the lookup was
+             * always undefined and the relation permanently resolved to null. The
+             * direction is inverted: query the target table for rows whose
+             * foreign key points back at each parent.
+             */
+            const childTable = this.db.table(configured.hasOne);
+            const ids = rows.map((r) => r[this.primaryKeyColumn]).filter((v) => v != null);
+            if (ids.length === 0) {
+              for (const row of rows) row[relName] = null;
+              return modeValue(this.db.mode, undefined);
+            }
+            return chainResult(
+              this.db.mode,
+              childTable.findMany({ where: { [configured.foreignKey]: { in: ids } } as any }),
+              (children) => {
+                // One row per parent. Several children means the schema does not
+                // actually express a hasOne, so keep the first rather than silently
+                // picking an arbitrary one per query.
+                const firstByParent = new Map<any, any>();
+                for (const child of children) {
+                  const parentId = (child as any)[configured.foreignKey];
+                  if (!firstByParent.has(parentId)) firstByParent.set(parentId, child);
+                }
+                const strays = children.length - firstByParent.size;
+                for (const row of rows) {
+                  row[relName] = firstByParent.get(row[this.primaryKeyColumn]) ?? null;
+                }
+                if (strays > 0) {
+                  console.warn(
+                    `[yatta/db] hasOne "${this.name}.${relName}" matched ${strays} extra row(s) — a hasOne should resolve to at most one.`,
+                  );
+                }
+              },
+            );
+          });
         }
         continue;
       }
 
       const auto = this.belongsToAliases.get(relName);
       if (auto) {
-        const targetTable = this.db.table(auto.table);
-        const targetPk = targetTable.primaryKeyColumn;
-        const foreignIds = rows.map((r) => r[auto.column]).filter((v) => v != null);
-        if (foreignIds.length === 0) {
-          for (const row of rows) row[relName] = null;
-          continue;
-        }
-        const parents = targetTable.findMany({ where: { [targetPk]: { in: foreignIds } } as any });
-        const map = new Map(parents.map((p) => [(p as any)[targetPk], p]));
-        for (const row of rows) row[relName] = map.get(row[auto.column]) ?? null;
+        tasks.push(() => {
+          const targetTable = this.db.table(auto.table);
+          const targetPk = targetTable.primaryKeyColumn;
+          const foreignIds = rows.map((r) => r[auto.column]).filter((v) => v != null);
+          if (foreignIds.length === 0) {
+            for (const row of rows) row[relName] = null;
+            return modeValue(this.db.mode, undefined);
+          }
+          return chainResult(
+            this.db.mode,
+            targetTable.findMany({ where: { [targetPk]: { in: foreignIds } } as any }),
+            (parents) => {
+              const map = new Map(parents.map((p) => [(p as any)[targetPk], p]));
+              for (const row of rows) row[relName] = map.get(row[auto.column]) ?? null;
+            },
+          );
+        });
         continue;
       }
 
@@ -1045,24 +1313,32 @@ export class Table<T extends Record<string, any> = Record<string, any>, TInsert 
         const otherTable = this.db.table(relName);
         for (const [colName, def] of otherTable.columns) {
           if (def.references?.table === this.name) {
-            const ids = rows.map((r) => r[this.primaryKeyColumn]).filter((v) => v != null);
-            if (ids.length === 0) {
-              for (const row of rows) row[relName] = [];
-              break;
-            }
-            const children = otherTable.findMany({ where: { [colName]: { in: ids } } as any });
-            const grouped = new Map<any, any[]>();
-            for (const child of children) {
-              const parentId = (child as any)[colName];
-              if (!grouped.has(parentId)) grouped.set(parentId, []);
-              grouped.get(parentId)!.push(child);
-            }
-            for (const row of rows) row[relName] = grouped.get(row[this.primaryKeyColumn]) ?? [];
+            tasks.push(() => {
+              const ids = rows.map((r) => r[this.primaryKeyColumn]).filter((v) => v != null);
+              if (ids.length === 0) {
+                for (const row of rows) row[relName] = [];
+                return modeValue(this.db.mode, undefined);
+              }
+              return chainResult(
+                this.db.mode,
+                otherTable.findMany({ where: { [colName]: { in: ids } } as any }),
+                (children) => {
+                  const grouped = new Map<any, any[]>();
+                  for (const child of children) {
+                    const parentId = (child as any)[colName];
+                    if (!grouped.has(parentId)) grouped.set(parentId, []);
+                    grouped.get(parentId)!.push(child);
+                  }
+                  for (const row of rows) row[relName] = grouped.get(row[this.primaryKeyColumn]) ?? [];
+                },
+              );
+            });
             break;
           }
         }
       }
     }
+    return runSequential(this.db.mode, tasks);
   }
 
   private deserializeRow(row: any): T {

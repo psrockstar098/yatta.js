@@ -6,6 +6,7 @@
 import { YattaError } from "./errors";
 import type { ColumnDefinition, Prettify } from "./schema";
 import type { Table } from "./table";
+import type { ExecutionMode, ModeResult } from "./adapter";
 
 // ──────────────────────────────────────────────────────────────────────────
 // 2. Query Filters & Operators
@@ -460,8 +461,14 @@ export function buildFieldsProxy<Row>(
 /**
  * Fluent query builder for constructing, filtering, sorting, selecting, and executing queries.
  *
+ * Generic over the execution mode `M`: `"sync"` for SQLite (terminals
+ * return plain values, exactly as before) and `"async"` for PGlite, Turso,
+ * DuckDB, and SurrealDB (terminals return Promises — the builder itself
+ * stays synchronous; only the terminal call awaits).
+ *
  * @template T Source entity row type.
  * @template TResult The projected return record type.
+ * @template M Execution mode (`"sync"` or `"async"`).
  *
  * @example
  * ```ts
@@ -472,7 +479,11 @@ export function buildFieldsProxy<Row>(
  *   .all();
  * ```
  */
-export class QueryBuilder<T extends Record<string, any> = Record<string, any>, TResult = T> {
+export class QueryBuilder<
+  T extends Record<string, any> = Record<string, any>,
+  TResult = T,
+  M extends ExecutionMode = "sync",
+> {
   private opts: FindOptions<T> = {};
 
   /**
@@ -480,7 +491,7 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>, T
    *
    * @param table The {@link Table} instance being queried.
    */
-  constructor(private readonly table: Table<T, any>) {}
+  constructor(private readonly table: Table<T, any, M>) {}
 
   /**
    * Adds filter criteria to the query using either a declarative {@link WhereClause}
@@ -562,7 +573,7 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>, T
    * // users: { id: string; email: string }[]
    * ```
    */
-  select<K extends keyof T>(fields: K[]): QueryBuilder<T, Prettify<Pick<T, K>>> {
+  select<K extends keyof T>(fields: K[]): QueryBuilder<T, Prettify<Pick<T, K>>, M> {
     this.opts.select = fields as any;
     return this as any;
   }
@@ -581,7 +592,7 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>, T
    */
   include<Inc extends Record<string, any> = Record<string, any>>(
     relations: Record<string, boolean>,
-  ): QueryBuilder<T, Prettify<TResult & Inc>> {
+  ): QueryBuilder<T, Prettify<TResult & Inc>, M> {
     this.opts.include = relations;
     return this as any;
   }
@@ -591,8 +602,8 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>, T
    *
    * @returns Array of resulting records.
    */
-  all(): TResult[] {
-    return this.table.findMany(this.opts) as unknown as TResult[];
+  all(): ModeResult<M, TResult[]> {
+    return this.table.findMany(this.opts) as unknown as ModeResult<M, TResult[]>;
   }
 
   /**
@@ -600,8 +611,8 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>, T
    *
    * @returns The first matching record or `null`.
    */
-  first(): TResult | null {
-    return this.table.findFirst(this.opts) as unknown as TResult | null;
+  first(): ModeResult<M, TResult | null> {
+    return this.table.findFirst(this.opts) as unknown as ModeResult<M, TResult | null>;
   }
 
   /**
@@ -609,7 +620,7 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>, T
    *
    * @returns Count of matching records.
    */
-  count(): number {
+  count(): ModeResult<M, number> {
     return this.table.count(this.opts.where);
   }
 
@@ -618,7 +629,7 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>, T
    *
    * @returns `true` if at least one matching row exists, `false` otherwise.
    */
-  exists(): boolean {
+  exists(): ModeResult<M, boolean> {
     return this.table.exists(this.opts.where);
   }
 
@@ -629,7 +640,7 @@ export class QueryBuilder<T extends Record<string, any> = Record<string, any>, T
    * @param limit Records per page (default: 10).
    * @returns {@link PaginatedResult} containing the data and page stats.
    */
-  paginate(page = 1, limit = 10): PaginatedResult<TResult> {
+  paginate(page = 1, limit = 10): ModeResult<M, PaginatedResult<TResult>> {
     return this.table.paginate({ ...this.opts, page, limit }) as any;
   }
 }

@@ -18,9 +18,16 @@
 import { YattaError } from "./errors";
 import type { DatabaseSchema, TableSchema } from "./schema";
 import type { OrderBy, WhereClause } from "./query";
+import type { SqlCompiler } from "./sql_compiler";
+import type { SqlDialect } from "./sql_dialect";
 import { SqliteAdapter, SqliteSession } from "./adapters/sqlite";
+import { PGliteAdapter, PGliteSession } from "./adapters/pglite";
+import { TursoAdapter, TursoSession, type TursoAdapterOptions } from "./adapters/turso";
+import { DuckDBAdapter, DuckDBSession, type DuckDBAdapterOptions } from "./adapters/duckdb";
+import { SurrealDBAdapter, SurrealDBSession, type SurrealDBAdapterOptions } from "./adapters/surrealdb";
 
-export { SqliteAdapter, SqliteSession };
+export { SqliteAdapter, SqliteSession, PGliteAdapter, PGliteSession, TursoAdapter, TursoSession, DuckDBAdapter, DuckDBSession, SurrealDBAdapter, SurrealDBSession };
+export type { TursoAdapterOptions, DuckDBAdapterOptions, SurrealDBAdapterOptions };
 
 /** Relational drivers the ORM can target. ScyllaDB is deliberately absent: it is not relational. */
 export type RelationalDriverName = "sqlite" | "pglite" | "turso" | "duckdb" | "surrealdb";
@@ -31,6 +38,89 @@ export type ExecutionMode = "sync" | "async";
 
 /** A value in sync mode, a Promise of it in async mode. Sync callers never see a Promise. */
 export type ModeResult<M extends ExecutionMode, T> = M extends "sync" ? T : Promise<T>;
+
+/**
+ * Chains a value through a function that may itself return a mode result.
+ * Sync: calls `fn` directly — no Promise is ever created, so a sync call
+ * stays sync end to end. Async: `.then(fn)`, which flattens automatically
+ * (a `fn` returning a Promise is awaited, not wrapped).
+ */
+export function chainResult<M extends ExecutionMode, T, R>(
+  mode: M,
+  value: ModeResult<M, T>,
+  fn: (value: T) => R | ModeResult<M, R>,
+): ModeResult<M, R> {
+  if (mode === "sync") {
+    return fn(value as T) as ModeResult<M, R>;
+  }
+  return (value as Promise<T>).then(fn) as ModeResult<M, R>;
+}
+
+/**
+ * Collects mode results into a list: the values themselves in sync mode,
+ * `Promise.all` in async mode. Used where Table fans one call out to many
+ * (insertMany, relation resolution) without branching on the mode twice.
+ */
+export function allResults<M extends ExecutionMode, T>(
+  mode: M,
+  values: ModeResult<M, T>[],
+): ModeResult<M, T[]> {
+  if (mode === "sync") return values as unknown as ModeResult<M, T[]>;
+  return Promise.all(values as Promise<T>[]) as ModeResult<M, T[]>;
+}
+
+/**
+ * Runs value-returning tasks strictly in order and collects their results.
+ * Same correctness rule as runSequential: per-row work inside a
+ * transaction must not run concurrently, because each row's insert opens
+ * its own nested savepoint transaction and concurrent savepoints corrupt
+ * each other — on libSQL, RELEASE of the earlier savepoint also releases
+ * the later one, so the later RELEASE fails with "no such savepoint".
+ * (insertMany used allResults here and broke Turso exactly that way.)
+ */
+export function collectSequential<M extends ExecutionMode, T>(
+  mode: M,
+  tasks: Array<() => ModeResult<M, T>>,
+): ModeResult<M, T[]> {
+  if (mode === "sync") return tasks.map((task) => task()) as unknown as ModeResult<M, T[]>;
+  return tasks.reduce<Promise<T[]>>(
+    (prev, task) =>
+      prev.then(async (acc) => {
+        // `await` cannot unwrap the generic ModeResult, so cast: in async
+        // mode the task returns a Promise<T> and this is the row.
+        const row = (await task()) as T;
+        acc.push(row);
+        return acc;
+      }),
+    Promise.resolve([] as T[]),
+  ) as ModeResult<M, T[]>;
+}
+
+/** Lifts a plain value into the mode: the value itself in sync, a resolved Promise in async. */
+export function modeValue<M extends ExecutionMode, T>(mode: M, value: T): ModeResult<M, T> {
+  return (mode === "sync" ? value : Promise.resolve(value)) as ModeResult<M, T>;
+}
+
+/**
+ * Runs tasks strictly in order and discards their results. Sync: a plain
+ * loop. Async: a promise chain. A single-connection driver cannot run
+ * concurrent work on one transaction handle, so parallel helpers
+ * (Promise.all) are never used for per-row work inside a transaction —
+ * sequential here is the correctness rule, not a performance choice.
+ */
+export function runSequential<M extends ExecutionMode>(
+  mode: M,
+  tasks: Array<() => ModeResult<M, void>>,
+): ModeResult<M, void> {
+  if (mode === "sync") {
+    for (const task of tasks) task();
+    return undefined as ModeResult<M, void>;
+  }
+  return tasks.reduce<Promise<void>>(
+    (prev, task) => prev.then(task as () => Promise<void>),
+    Promise.resolve(),
+  ) as ModeResult<M, void>;
+}
 
 /** What a driver can and cannot do, declared honestly so the core can enforce it. */
 export interface AdapterCapabilities {
@@ -47,6 +137,14 @@ export interface AdapterCapabilities {
   readonly multiProcessSafe: boolean;
   /** Maximum bound parameters in one statement. */
   readonly maxBindParams: number;
+  /**
+   * Whether the dialect can compile runnable SQL for this driver. False
+   * for SurrealDB: its session builds SurrealQL directly and its dialect
+   * refuses every SQL-emitting compiler method, so Table must use the
+   * session's `insert` / `find` / `update` / `delete` / `count` methods
+   * instead of compiling SQL itself.
+   */
+  readonly compilerSql: boolean;
 }
 
 /** A find query compiled to dialect-neutral shape (no SQL strings). */
@@ -104,6 +202,63 @@ export interface IntrospectedColumn {
  */
 export interface DatabaseSession<M extends ExecutionMode = ExecutionMode> {
   readonly capabilities: AdapterCapabilities;
+
+  /**
+   * SQL dialect for this session. Owns every driver-specific SQL string:
+   * identifiers, placeholders, types, defaults, DDL, LIKE, and value
+   * conversion. Table reaches it (and the compiler below) through its db.
+   */
+  readonly dialect: SqlDialect;
+  /** Driver-neutral SQL compiler over this session's dialect. */
+  readonly compiler: SqlCompiler;
+  /** Whether this session is currently inside a transaction. */
+  readonly inTransaction: boolean;
+
+  /**
+   * Prepares (or retrieves from cache) and executes an SQL statement with
+   * parameters. The honest execution seam: Table compiles via the compiler
+   * and hands the strings here. `"get"` returns one row or null, `"all"`
+   * returns all rows, `"run"` returns the write result
+   * (`{ lastInsertRowid, changes }` — `lastInsertRowid` is 0 on drivers
+   * with no rowid, such as Postgres; use RETURNING to read an id back).
+   */
+  run(sql: string, params?: unknown[], mode?: "get" | "all" | "run"): ModeResult<M, unknown>;
+
+  /**
+   * Whether this table has a standalone full-text index table (the FTS5
+   * `_fts_<table>` shape). False when the driver's search needs no
+   * per-row index maintenance — a self-maintaining generated column
+   * (PGlite), a LIKE fallback (DuckDB), or an engine-managed index
+   * (SurrealDB). Table.delete uses it to decide whether to capture the
+   * affected keys for index cleanup.
+   */
+  ftsTableExists(table: string): ModeResult<M, boolean>;
+
+  /**
+   * Creates the migration-marker table (`_yatta_migrations`) in the
+   * adapter's own dialect. Runs on this session, so it works on a
+   * transaction child session as well as the root adapter.
+   */
+  ensureMigrationTable(): ModeResult<M, void>;
+
+  /** Names of migrations already recorded as applied. */
+  listAppliedMigrations(): ModeResult<M, string[]>;
+
+  /** Records one migration as applied (ignored when already present). */
+  recordMigration(name: string): ModeResult<M, void>;
+
+  /**
+   * Makes sure one table's full-text index exists and matches its
+   * searchable columns, creating or repairing it when it does not. A
+   * driver whose index maintains itself (a Postgres generated column)
+   * repairs the missing column/index instead; a driver with no index
+   * no-ops. Called by `search()` so a first search never fails on a
+   * missing index.
+   */
+  ensureSearchIndex(table: string, schema: TableSchema): ModeResult<M, void>;
+
+  /** Finalizes and purges cached prepared statements. A no-op when the driver keeps none. */
+  clearStatementCache(): void;
 
   insert(
     table: string,
@@ -192,6 +347,9 @@ export interface DatabaseAdapter<M extends ExecutionMode = ExecutionMode>
   extends DatabaseSession<M> {
   readonly driver: RelationalDriverName;
 
+  /** Resolved location of the database: file path, data directory, or `":memory:"`. */
+  readonly path: string;
+
   /** Eagerly wait for initialization (no-op on sync SQLite). */
   ready(): ModeResult<M, void>;
 
@@ -202,10 +360,34 @@ export interface DatabaseAdapter<M extends ExecutionMode = ExecutionMode>
   listTables(): ModeResult<M, string[]>;
   listColumns(table: string): ModeResult<M, IntrospectedColumn[]>;
 
-  /** Exclusive lock across migrations (BEGIN IMMEDIATE on SQLite, advisory/tx lock on PGlite). */
+  /**
+   * Exclusive lock across migrations (BEGIN IMMEDIATE on SQLite, advisory/tx lock on PGlite).
+   *
+   * Two shapes, because `migrate()` is always async (an async `up` must
+   * be awaited on every driver, SQLite included) while other callers
+   * pass a plain sync function: the second overload is the Promise
+   * callback, and every driver holds the lock across its await — SQLite
+   * defers the COMMIT until the thenable settles, PGlite runs it inside
+   * `pg.transaction()`, and the rest await it the same way.
+   */
   withMigrationLock<R>(
     fn: (session: DatabaseSession<M>) => ModeResult<M, R>,
   ): ModeResult<M, R>;
+  withMigrationLock<R>(
+    fn: (session: DatabaseSession<M>) => Promise<R>,
+  ): Promise<R>;
+
+  /**
+   * Creates the migration-marker table (`_yatta_migrations`) if it does
+   * not exist, in the driver's own dialect. The engine's `migrate()`
+   * calls this instead of emitting `CREATE TABLE` itself — the SQLite
+   * `AUTOINCREMENT` form is not valid on Postgres, DuckDB, or SurrealDB.
+   */
+  ensureMigrationTable(): ModeResult<M, void>;
+  /** Names of migrations already recorded as applied. */
+  listAppliedMigrations(): ModeResult<M, string[]>;
+  /** Records one migration as applied (idempotent when the driver can express it). */
+  recordMigration(name: string): ModeResult<M, void>;
 
   backup(destPath: string): ModeResult<M, void>;
   restore(sourcePath: string): ModeResult<M, void>;
@@ -239,21 +421,28 @@ export interface PgliteAdapterOptions {
  */
 export function createAdapter(driver: "sqlite", options?: SqliteAdapterOptions): SqliteAdapter;
 export function createAdapter(driver: "pglite", options?: PgliteAdapterOptions): DatabaseAdapter<"async">;
+export function createAdapter(driver: "turso", options?: TursoAdapterOptions): DatabaseAdapter<"async">;
+export function createAdapter(driver: "duckdb", options?: DuckDBAdapterOptions): DatabaseAdapter<"async">;
+export function createAdapter(driver: "surrealdb", options?: SurrealDBAdapterOptions): DatabaseAdapter<"async">;
 export function createAdapter(
   driver: RelationalDriverName,
-  options?: SqliteAdapterOptions | PgliteAdapterOptions,
+  options?: SqliteAdapterOptions | PgliteAdapterOptions | TursoAdapterOptions | DuckDBAdapterOptions | SurrealDBAdapterOptions,
 ): DatabaseAdapter<ExecutionMode>;
 export function createAdapter(
   driver: RelationalDriverName,
-  options?: SqliteAdapterOptions | PgliteAdapterOptions,
+  options?: SqliteAdapterOptions | PgliteAdapterOptions | TursoAdapterOptions | DuckDBAdapterOptions | SurrealDBAdapterOptions,
 ): DatabaseAdapter<ExecutionMode> {
   switch (driver) {
     case "sqlite":
       return new SqliteAdapter((options ?? {}) as SqliteAdapterOptions);
     case "pglite":
-      throw new YattaError(
-        `Driver "pglite" is not available yet — PGlite support lands in Phase 2 of the multi-database build.`,
-      );
+      return new PGliteAdapter((options ?? {}) as PgliteAdapterOptions);
+    case "turso":
+      return new TursoAdapter((options ?? {}) as TursoAdapterOptions);
+    case "duckdb":
+      return new DuckDBAdapter((options ?? {}) as DuckDBAdapterOptions);
+    case "surrealdb":
+      return new SurrealDBAdapter((options ?? {}) as SurrealDBAdapterOptions);
     default:
       throw new YattaError(`Driver "${driver}" is not implemented.`);
   }

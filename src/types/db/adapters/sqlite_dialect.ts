@@ -183,6 +183,23 @@ export class SqliteDialect implements SqlDialect {
     return "";
   }
 
+  compileLimitOffset(take: number | undefined, skip: number | undefined): string {
+    /*
+     * SQLite only accepts OFFSET as part of a `LIMIT … OFFSET …` clause, so a
+     * bare `OFFSET n` is a syntax error. `skip` on its own is a documented,
+     * reasonable thing to write, so it gets `LIMIT -1` — SQLite's "no upper
+     * bound" — rather than failing. `take: -1` is the same idiom.
+     */
+    const limitSql =
+      take !== undefined
+        ? `LIMIT ${take}`
+        : skip !== undefined
+          ? "LIMIT -1"
+          : "";
+    const offsetSql = skip !== undefined ? `OFFSET ${skip}` : "";
+    return [limitSql, offsetSql].filter(Boolean).join(" ");
+  }
+
   encodeParam(value: unknown, def?: ColumnDefinition): unknown {
     // Driver half of the old Table.serializeValue: the undefined/null
     // handling and the NOT NULL guard live in SqlCompiler.serializeValue,
