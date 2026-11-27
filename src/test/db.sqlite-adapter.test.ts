@@ -63,9 +63,10 @@ describe("createAdapter", () => {
     adapter.close();
   });
 
-  it("throws for not-yet-landed drivers (turso, duckdb)", () => {
-    expect(() => createAdapter("turso" as any)).toThrow(YattaError);
-    expect(() => createAdapter("duckdb" as any)).toThrow(YattaError);
+  it("throws for unknown drivers and for scylladb (outside the portable API)", () => {
+    expect(() => createAdapter("scylladb" as any)).toThrow(YattaError);
+    expect(() => createAdapter("scylladb" as any)).toThrow(/not implemented/);
+    expect(() => createAdapter("oracle" as any)).toThrow(YattaError);
   });
 
   it("ready() is a no-op and listTables/listColumns describe the schema", () => {

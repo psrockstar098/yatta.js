@@ -91,9 +91,87 @@ export interface PgliteDatabaseOptions {
 }
 
 /**
+ * Configuration options for a Turso (libSQL) backed database (Phase 2).
+ * Embedded local file by default; a remote URL needs an auth token.
+ */
+export interface TursoDatabaseOptions {
+  /** Which driver to use. */
+  driver: "turso";
+  /** Full database URL. `file:` (or `":memory:"`) for an embedded database, `libsql:`/`http:`/`https:`/`ws:`/`wss:` for a remote one. Defaults to an embedded file. */
+  url?: string;
+  /** File system path to the embedded database, or `":memory:"`. Defaults to `Database/app.db`. Ignored when `url` is set. */
+  path?: string;
+  /** Auth token for a remote database. */
+  authToken?: string;
+  /** Full database table schema definition dictionary. */
+  schema?: DatabaseSchema;
+  /** Relational associations configuration for eager loading. */
+  relations?: RelationsConfig;
+  /** Whether to automatically create tables and alter missing columns on startup. Defaults to `true`. */
+  autoMigrate?: boolean;
+  /** Whether to log executed SQL queries with millisecond execution durations to stdout. */
+  debug?: boolean;
+  searchSynonyms?: Record<string, string | string[]>;
+  /** If `true`, creates a new instance even if a database at this path is already cached in registry. */
+  forceNew?: boolean;
+}
+
+/**
+ * Configuration options for a DuckDB-backed database (Phase 2).
+ */
+export interface DuckDBDatabaseOptions {
+  /** Which driver to use. */
+  driver: "duckdb";
+  /** File system path to the database, or `":memory:"`. Defaults to `":memory:"`. */
+  path?: string;
+  /** Full database table schema definition dictionary. */
+  schema?: DatabaseSchema;
+  /** Relational associations configuration for eager loading. */
+  relations?: RelationsConfig;
+  /** Whether to automatically create tables and alter missing columns on startup. Defaults to `true`. */
+  autoMigrate?: boolean;
+  /** Whether to log executed SQL queries with millisecond execution durations to stdout. */
+  debug?: boolean;
+  searchSynonyms?: Record<string, string | string[]>;
+  /** If `true`, creates a new instance even if a database at this path is already cached in registry. */
+  forceNew?: boolean;
+}
+
+/**
+ * Configuration options for a SurrealDB-backed database (Phase 2).
+ * Embedded in-memory engine by default; a remote server needs a ws(s) URL.
+ */
+export interface SurrealDBDatabaseOptions {
+  /** Which driver to use. */
+  driver: "surrealdb";
+  /** Endpoint to connect to. Defaults to `"mem://"` (embedded, in-memory). */
+  url?: string;
+  /** Namespace to select. Defaults to `"yatta"`. */
+  namespace?: string;
+  /** Database to select. Defaults to `"yatta"`. */
+  database?: string;
+  /** Full database table schema definition dictionary. */
+  schema?: DatabaseSchema;
+  /** Relational associations configuration for eager loading. */
+  relations?: RelationsConfig;
+  /** Whether to automatically create tables and alter missing columns on startup. Defaults to `true`. */
+  autoMigrate?: boolean;
+  /** Whether to log executed SurrealQL with millisecond execution durations to stdout. */
+  debug?: boolean;
+  searchSynonyms?: Record<string, string | string[]>;
+  /** If `true`, creates a new instance even if a database at this path is already cached in registry. */
+  forceNew?: boolean;
+}
+
+/**
  * Configuration options for initializing a {@link YattaDB} instance.
  */
-export type DatabaseOptions = SqliteDatabaseOptions | PgliteDatabaseOptions;
+export type DatabaseOptions =
+  | SqliteDatabaseOptions
+  | PgliteDatabaseOptions
+  | TursoDatabaseOptions
+  | DuckDBDatabaseOptions
+  | SurrealDBDatabaseOptions;
 
 /**
  * Core SQLite database engine powered by `bun:sqlite`.
@@ -159,7 +237,7 @@ export class YattaDB {
         `Driver "pglite" is not available yet — PGlite support lands in Phase 2 of the multi-database build.`,
       );
     }
-    this.adapter = createAdapter("sqlite", { path: options.path, debug: options.debug });
+    this.adapter = createAdapter("sqlite", { path: "path" in options ? options.path : undefined, debug: options.debug });
     this.path = this.adapter.path;
     this.schema = options.schema ?? {};
     this.relations = options.relations ?? {};

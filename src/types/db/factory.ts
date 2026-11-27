@@ -142,7 +142,7 @@ export function createDatabase<S extends DatabaseSchema = DatabaseSchema>(
       `Driver "pglite" is not available yet — PGlite support lands in Phase 2 of the multi-database build.`,
     );
   }
-  const resolvedPath = resolveDatabasePath(options.path);
+  const resolvedPath = resolveDatabasePath("path" in options ? options.path : undefined);
 
   if (!options.forceNew && dbRegistry.has(resolvedPath)) {
     const cached = dbRegistry.get(resolvedPath) as TypedDatabase<S>;

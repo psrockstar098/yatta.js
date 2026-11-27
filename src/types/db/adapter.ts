@@ -22,8 +22,12 @@ import type { SqlCompiler } from "./sql_compiler";
 import type { SqlDialect } from "./sql_dialect";
 import { SqliteAdapter, SqliteSession } from "./adapters/sqlite";
 import { PGliteAdapter, PGliteSession } from "./adapters/pglite";
+import { TursoAdapter, TursoSession, type TursoAdapterOptions } from "./adapters/turso";
+import { DuckDBAdapter, DuckDBSession, type DuckDBAdapterOptions } from "./adapters/duckdb";
+import { SurrealDBAdapter, SurrealDBSession, type SurrealDBAdapterOptions } from "./adapters/surrealdb";
 
-export { SqliteAdapter, SqliteSession, PGliteAdapter, PGliteSession };
+export { SqliteAdapter, SqliteSession, PGliteAdapter, PGliteSession, TursoAdapter, TursoSession, DuckDBAdapter, DuckDBSession, SurrealDBAdapter, SurrealDBSession };
+export type { TursoAdapterOptions, DuckDBAdapterOptions, SurrealDBAdapterOptions };
 
 /** Relational drivers the ORM can target. ScyllaDB is deliberately absent: it is not relational. */
 export type RelationalDriverName = "sqlite" | "pglite" | "turso" | "duckdb" | "surrealdb";
@@ -322,19 +326,28 @@ export interface PgliteAdapterOptions {
  */
 export function createAdapter(driver: "sqlite", options?: SqliteAdapterOptions): SqliteAdapter;
 export function createAdapter(driver: "pglite", options?: PgliteAdapterOptions): DatabaseAdapter<"async">;
+export function createAdapter(driver: "turso", options?: TursoAdapterOptions): DatabaseAdapter<"async">;
+export function createAdapter(driver: "duckdb", options?: DuckDBAdapterOptions): DatabaseAdapter<"async">;
+export function createAdapter(driver: "surrealdb", options?: SurrealDBAdapterOptions): DatabaseAdapter<"async">;
 export function createAdapter(
   driver: RelationalDriverName,
-  options?: SqliteAdapterOptions | PgliteAdapterOptions,
+  options?: SqliteAdapterOptions | PgliteAdapterOptions | TursoAdapterOptions | DuckDBAdapterOptions | SurrealDBAdapterOptions,
 ): DatabaseAdapter<ExecutionMode>;
 export function createAdapter(
   driver: RelationalDriverName,
-  options?: SqliteAdapterOptions | PgliteAdapterOptions,
+  options?: SqliteAdapterOptions | PgliteAdapterOptions | TursoAdapterOptions | DuckDBAdapterOptions | SurrealDBAdapterOptions,
 ): DatabaseAdapter<ExecutionMode> {
   switch (driver) {
     case "sqlite":
       return new SqliteAdapter((options ?? {}) as SqliteAdapterOptions);
     case "pglite":
       return new PGliteAdapter((options ?? {}) as PgliteAdapterOptions);
+    case "turso":
+      return new TursoAdapter((options ?? {}) as TursoAdapterOptions);
+    case "duckdb":
+      return new DuckDBAdapter((options ?? {}) as DuckDBAdapterOptions);
+    case "surrealdb":
+      return new SurrealDBAdapter((options ?? {}) as SurrealDBAdapterOptions);
     default:
       throw new YattaError(`Driver "${driver}" is not implemented.`);
   }

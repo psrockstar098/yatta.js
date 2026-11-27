@@ -132,8 +132,16 @@ export {
   type TypedDatabase,
 } from "./db/factory";
 export {
+  DuckDBAdapter,
+  DuckDBSession,
+  PGliteAdapter,
+  PGliteSession,
   SqliteAdapter,
   SqliteSession,
+  SurrealDBAdapter,
+  SurrealDBSession,
+  TursoAdapter,
+  TursoSession,
   createAdapter,
   type AdapterCapabilities,
   type CompiledFindQuery,
@@ -142,6 +150,7 @@ export {
   type DatabaseAdapter,
   type DatabaseSession,
   type DriverName,
+  type DuckDBAdapterOptions,
   type ExecutionMode,
   type IntrospectedColumn,
   type ModeResult,
@@ -149,5 +158,7 @@ export {
   type QueryResult,
   type RelationalDriverName,
   type SqliteAdapterOptions,
+  type SurrealDBAdapterOptions,
   type TransactionOptions,
+  type TursoAdapterOptions,
 } from "./db/adapter";
