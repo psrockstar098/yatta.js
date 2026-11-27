@@ -26,6 +26,7 @@ import type { YattaDB } from "./engine";
 import {
   allResults,
   chainResult,
+  collectSequential,
   modeValue,
   runSequential,
   type CompiledSearchQuery,
@@ -223,9 +224,12 @@ export class Table<
   insertMany(items: TInsert[]): ModeResult<M, T[]> {
     if (items.length === 0) return modeValue(this.db.mode, []);
     return this.db.transaction(() => {
-      return allResults(
+      // Sequential, not Promise.all: each insert opens its own nested
+      // savepoint transaction, and concurrent savepoints corrupt each
+      // other on single-connection drivers (Turso: "no such savepoint").
+      return collectSequential(
         this.db.mode,
-        items.map((item) => this.insert(item)),
+        items.map((item) => () => this.insert(item)),
       );
     });
   }
@@ -921,7 +925,12 @@ export class Table<
       return this.db.session.count(this.name, this.requireSchema(), where);
     }
     const { sql, params } = this.db.compiler.compileCount(this.name, this.columns, where);
-    return chainResult(this.db.mode, this.db.run(sql, params, "get"), (res) => (res as { count: number }).count);
+    return chainResult(this.db.mode, this.db.run(sql, params, "get"), (res) => {
+      // COUNT(*) is BIGINT on DuckDB, so a raw run returns a BigInt; the
+      // declared return type is number, and a row count can never exceed 2^53.
+      const raw = (res as { count: unknown }).count;
+      return typeof raw === "bigint" ? Number(raw) : (raw as number);
+    });
   }
 
   /**

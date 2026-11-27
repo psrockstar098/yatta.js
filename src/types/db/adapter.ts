@@ -69,6 +69,33 @@ export function allResults<M extends ExecutionMode, T>(
   return Promise.all(values as Promise<T>[]) as ModeResult<M, T[]>;
 }
 
+/**
+ * Runs value-returning tasks strictly in order and collects their results.
+ * Same correctness rule as runSequential: per-row work inside a
+ * transaction must not run concurrently, because each row's insert opens
+ * its own nested savepoint transaction and concurrent savepoints corrupt
+ * each other — on libSQL, RELEASE of the earlier savepoint also releases
+ * the later one, so the later RELEASE fails with "no such savepoint".
+ * (insertMany used allResults here and broke Turso exactly that way.)
+ */
+export function collectSequential<M extends ExecutionMode, T>(
+  mode: M,
+  tasks: Array<() => ModeResult<M, T>>,
+): ModeResult<M, T[]> {
+  if (mode === "sync") return tasks.map((task) => task()) as unknown as ModeResult<M, T[]>;
+  return tasks.reduce<Promise<T[]>>(
+    (prev, task) =>
+      prev.then(async (acc) => {
+        // `await` cannot unwrap the generic ModeResult, so cast: in async
+        // mode the task returns a Promise<T> and this is the row.
+        const row = (await task()) as T;
+        acc.push(row);
+        return acc;
+      }),
+    Promise.resolve([] as T[]),
+  ) as ModeResult<M, T[]>;
+}
+
 /** Lifts a plain value into the mode: the value itself in sync, a resolved Promise in async. */
 export function modeValue<M extends ExecutionMode, T>(mode: M, value: T): ModeResult<M, T> {
   return (mode === "sync" ? value : Promise.resolve(value)) as ModeResult<M, T>;

@@ -475,6 +475,16 @@ export class YattaDB<M extends ExecutionMode = "sync"> {
    * inside `fn` runs on the transaction, never on the root adapter.
    */
   transaction<R>(fn: (tx: this) => ModeResult<M, R>): ModeResult<M, R> {
+    // Already inside a transaction and the adapter has no savepoints
+    // (DuckDB, SurrealDB): the adapter cannot open a nested transaction,
+    // so run fn directly on the ambient transaction session instead of
+    // asking the adapter for a nested one. Table wraps every write in
+    // transaction(), so without this join no Table write could run inside
+    // a user transaction() callback on these drivers. Savepoint drivers
+    // keep the adapter call below, preserving inner-failure containment.
+    if (this.sessionOverride !== null && !this.adapter.capabilities.savepoints) {
+      return fn(this);
+    }
     return this.adapter.transaction((txSession) => {
       const prev = this.sessionOverride;
       this.sessionOverride = txSession;

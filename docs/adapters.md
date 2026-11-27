@@ -154,8 +154,12 @@ reaching for a handle that does not exist: `db.sqlite`, `db.exec()`,
   restored into.
 - **SurrealDB.** No enforced foreign keys and no `compilerSql` — `Table`
   runs on the session methods (see above). `search()` is engine-managed
-  BM25, so `syncSearchRow` is a no-op there. Nested `transaction()` throws;
-  restructure the work into one transaction.
+  BM25, so `syncSearchRow` is a no-op there. A direct nested
+  `transaction()` call on a session still throws (no savepoints); but at
+  ORM level, `Table` writes inside a `db.transaction()` callback join the
+  ambient transaction — the engine joins instead of opening a nested one
+  when the adapter has no savepoints — so the ordinary round trip (insert
+  inside a transaction, then commit or roll back) works.
 
 ## ScyllaDB — outside the portable API
 
