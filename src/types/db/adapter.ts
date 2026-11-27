@@ -56,6 +56,19 @@ export function chainResult<M extends ExecutionMode, T, R>(
   return (value as Promise<T>).then(fn) as ModeResult<M, R>;
 }
 
+/**
+ * Collects mode results into a list: the values themselves in sync mode,
+ * `Promise.all` in async mode. Used where Table fans one call out to many
+ * (insertMany, relation resolution) without branching on the mode twice.
+ */
+export function allResults<M extends ExecutionMode, T>(
+  mode: M,
+  values: ModeResult<M, T>[],
+): ModeResult<M, T[]> {
+  if (mode === "sync") return values as unknown as ModeResult<M, T[]>;
+  return Promise.all(values as Promise<T>[]) as ModeResult<M, T[]>;
+}
+
 /** Lifts a plain value into the mode: the value itself in sync, a resolved Promise in async. */
 export function modeValue<M extends ExecutionMode, T>(mode: M, value: T): ModeResult<M, T> {
   return (mode === "sync" ? value : Promise.resolve(value)) as ModeResult<M, T>;
@@ -97,6 +110,14 @@ export interface AdapterCapabilities {
   readonly multiProcessSafe: boolean;
   /** Maximum bound parameters in one statement. */
   readonly maxBindParams: number;
+  /**
+   * Whether the dialect can compile runnable SQL for this driver. False
+   * for SurrealDB: its session builds SurrealQL directly and its dialect
+   * refuses every SQL-emitting compiler method, so Table must use the
+   * session's `insert` / `find` / `update` / `delete` / `count` methods
+   * instead of compiling SQL itself.
+   */
+  readonly compilerSql: boolean;
 }
 
 /** A find query compiled to dialect-neutral shape (no SQL strings). */
@@ -175,6 +196,29 @@ export interface DatabaseSession<M extends ExecutionMode = ExecutionMode> {
    * with no rowid, such as Postgres; use RETURNING to read an id back).
    */
   run(sql: string, params?: unknown[], mode?: "get" | "all" | "run"): ModeResult<M, unknown>;
+
+  /**
+   * Whether this table has a standalone full-text index table (the FTS5
+   * `_fts_<table>` shape). False when the driver's search needs no
+   * per-row index maintenance — a self-maintaining generated column
+   * (PGlite), a LIKE fallback (DuckDB), or an engine-managed index
+   * (SurrealDB). Table.delete uses it to decide whether to capture the
+   * affected keys for index cleanup.
+   */
+  ftsTableExists(table: string): ModeResult<M, boolean>;
+
+  /**
+   * Creates the migration-marker table (`_yatta_migrations`) in the
+   * adapter's own dialect. Runs on this session, so it works on a
+   * transaction child session as well as the root adapter.
+   */
+  ensureMigrationTable(): ModeResult<M, void>;
+
+  /** Names of migrations already recorded as applied. */
+  listAppliedMigrations(): ModeResult<M, string[]>;
+
+  /** Records one migration as applied (ignored when already present). */
+  recordMigration(name: string): ModeResult<M, void>;
 
   /**
    * Makes sure one table's full-text index exists and matches its
@@ -289,10 +333,34 @@ export interface DatabaseAdapter<M extends ExecutionMode = ExecutionMode>
   listTables(): ModeResult<M, string[]>;
   listColumns(table: string): ModeResult<M, IntrospectedColumn[]>;
 
-  /** Exclusive lock across migrations (BEGIN IMMEDIATE on SQLite, advisory/tx lock on PGlite). */
+  /**
+   * Exclusive lock across migrations (BEGIN IMMEDIATE on SQLite, advisory/tx lock on PGlite).
+   *
+   * Two shapes, because `migrate()` is always async (an async `up` must
+   * be awaited on every driver, SQLite included) while other callers
+   * pass a plain sync function: the second overload is the Promise
+   * callback, and every driver holds the lock across its await — SQLite
+   * defers the COMMIT until the thenable settles, PGlite runs it inside
+   * `pg.transaction()`, and the rest await it the same way.
+   */
   withMigrationLock<R>(
     fn: (session: DatabaseSession<M>) => ModeResult<M, R>,
   ): ModeResult<M, R>;
+  withMigrationLock<R>(
+    fn: (session: DatabaseSession<M>) => Promise<R>,
+  ): Promise<R>;
+
+  /**
+   * Creates the migration-marker table (`_yatta_migrations`) if it does
+   * not exist, in the driver's own dialect. The engine's `migrate()`
+   * calls this instead of emitting `CREATE TABLE` itself — the SQLite
+   * `AUTOINCREMENT` form is not valid on Postgres, DuckDB, or SurrealDB.
+   */
+  ensureMigrationTable(): ModeResult<M, void>;
+  /** Names of migrations already recorded as applied. */
+  listAppliedMigrations(): ModeResult<M, string[]>;
+  /** Records one migration as applied (idempotent when the driver can express it). */
+  recordMigration(name: string): ModeResult<M, void>;
 
   backup(destPath: string): ModeResult<M, void>;
   restore(sourcePath: string): ModeResult<M, void>;

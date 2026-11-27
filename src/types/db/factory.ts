@@ -2,13 +2,18 @@
 // global DB accessor, and the connect() helper.
 //
 // Split from src/types/db.ts (Phase 1 of the multi-database ORM refactor).
+// Phase 2: createDatabase is overloaded — a SQLite database returns its
+// typed proxy synchronously (exactly as before); PGlite, Turso, DuckDB,
+// and SurrealDB return a Promise of the async proxy, resolved after the
+// driver connects and the schema syncs.
 
 import fs from "node:fs";
 import path from "node:path";
+import type { ExecutionMode } from "./adapter";
 import { YattaError } from "./errors";
-import { YattaDB } from "./engine";
+import { YattaDB, registryKeyForOptions } from "./engine";
 import type { DatabaseOptions } from "./engine";
-import { dbRegistry, getDefaultDatabase, setDefaultDatabase } from "./registry";
+import { dbRegistry, getDefaultDatabase, resolveDatabasePath, setDefaultDatabase } from "./registry";
 import type { DatabaseSchema, InferInsert, InferRow, RegisteredSchema } from "./schema";
 import type { Table } from "./table";
 
@@ -25,7 +30,9 @@ import type { Table } from "./table";
  * ```
  */
 export function connect<T>(row: T): T;
-export function connect<S extends DatabaseSchema>(options?: DatabaseOptions & { schema?: S }): TypedDatabase<S>;
+export function connect<S extends DatabaseSchema>(
+  options?: DatabaseOptions & { schema?: S },
+): TypedDatabase<S, "sync"> | Promise<AsyncTypedDatabase<S>>;
 export function connect(input: any): any {
   if (
     input !== null &&
@@ -45,30 +52,28 @@ export function connect(input: any): any {
  * Type-safe database interface offering table properties (`db.users`),
  * callable table lookup (`db("users")`), and raw SQL / administration methods.
  *
+ * Generic over the execution mode `M`: `"sync"` for SQLite (every method
+ * returns its plain value, exactly as before) and `"async"` for PGlite,
+ * Turso, DuckDB, and SurrealDB (every method returns a Promise).
+ *
  * @template S Database schema type.
+ * @template M Execution mode (`"sync"` or `"async"`).
  */
-export type TypedDatabase<S extends DatabaseSchema = DatabaseSchema> = YattaDB & {
-  readonly [K in keyof S]: Table<InferRow<S[K]>, InferInsert<S[K]>>;
+export type TypedDatabase<S extends DatabaseSchema = DatabaseSchema, M extends ExecutionMode = "sync"> = YattaDB<M> & {
+  readonly [K in keyof S]: Table<InferRow<S[K]>, InferInsert<S[K]>, M>;
 } & {
-  <K extends keyof S>(tableName: K): Table<InferRow<S[K]>, InferInsert<S[K]>>;
-  (): TypedDatabase<S>;
-  (tableName: string): Table<any, any>;
+  <K extends keyof S>(tableName: K): Table<InferRow<S[K]>, InferInsert<S[K]>, M>;
+  (): TypedDatabase<S, M>;
+  (tableName: string): Table<any, any, M>;
 };
+
+/** A typed database over an async driver (PGlite, Turso, DuckDB, SurrealDB). */
+export type AsyncTypedDatabase<S extends DatabaseSchema = DatabaseSchema> = TypedDatabase<S, "async">;
 /**
  * Resolves and normalizes an input database path to an absolute filesystem path.
- *
- * @param targetPath Relative or absolute path, or `":memory:"`.
- * @returns Absolute filesystem path or `":memory:"`.
+ * Lives in `./registry` (re-exported here so existing imports keep working).
  */
-export function resolveDatabasePath(targetPath?: string): string {
-  const p = targetPath ?? "Database/app.db";
-  if (p === ":memory:") return ":memory:";
-  const hasExtension = path.extname(p) !== "";
-  const normalized = (!hasExtension || p.endsWith("/") || p.endsWith("\\"))
-    ? path.join(p, "app.db")
-    : p;
-  return path.resolve(process.cwd(), normalized);
-}
+export { resolveDatabasePath } from "./registry";
 
 /** Automatically discovers and loads a database file if not yet imported */
 function tryAutoLoadDatabase(): void {
@@ -107,9 +112,16 @@ function tryAutoLoadDatabase(): void {
  * - Returns a typed proxy allowing direct `db.users` table access
  * - Registers the database globally for zero-import `DB` usage
  *
+ * SQLite (the default, or `driver: "sqlite"`) returns the proxy
+ * synchronously, exactly as before. PGlite, Turso, DuckDB, and SurrealDB
+ * return a Promise of the async proxy: the driver connects and the schema
+ * syncs before it resolves, so `await createDatabase(...)` is ready to use.
+ * The registry key is per-driver (`registryKeyForOptions`), so a PGlite
+ * database is never cached under a SQLite path key.
+ *
  * @template S Database schema type.
  * @param options Database configuration options.
- * @returns Configured {@link TypedDatabase} instance.
+ * @returns Configured {@link TypedDatabase} instance (or a Promise of it for async drivers).
  *
  * @example
  * ```ts
@@ -131,23 +143,38 @@ function tryAutoLoadDatabase(): void {
  *
  * const user = db.users.insert({ name: "Bob", email: "bob@example.com" });
  * ```
+ *
+ * @example
+ * ```ts
+ * // PGlite (async — await it):
+ * export const db = await createDatabase({
+ *   driver: "pglite",
+ *   dataDir: "./pgdata",
+ *   schema,
+ * });
+ * const user = await db.users.insert({ name: "Bob", email: "bob@example.com" });
+ * ```
  */
 export function createDatabase<S extends DatabaseSchema = DatabaseSchema>(
+  options: (DatabaseOptions & { driver?: "sqlite" }) & { schema?: S },
+): TypedDatabase<S, "sync">;
+export function createDatabase<S extends DatabaseSchema = DatabaseSchema>(
+  options: (DatabaseOptions & { driver: "pglite" | "turso" | "duckdb" | "surrealdb" }) & { schema?: S },
+): Promise<AsyncTypedDatabase<S>>;
+export function createDatabase<S extends DatabaseSchema = DatabaseSchema>(
   options: DatabaseOptions & { schema?: S } = {},
-): TypedDatabase<S> {
-  if (options.driver === "pglite") {
-    // A pglite database must never be cached under a sqlite path key, so
-    // this throws before the registry lookup below. Phase 2 implements it.
-    throw new YattaError(
-      `Driver "pglite" is not available yet — PGlite support lands in Phase 2 of the multi-database build.`,
-    );
-  }
-  const resolvedPath = resolveDatabasePath("path" in options ? options.path : undefined);
+): TypedDatabase<S, "sync"> | Promise<AsyncTypedDatabase<S>> {
+  const driver = options.driver ?? "sqlite";
+  const registryKey = registryKeyForOptions(options);
 
-  if (!options.forceNew && dbRegistry.has(resolvedPath)) {
-    const cached = dbRegistry.get(resolvedPath) as TypedDatabase<S>;
+  if (!options.forceNew && dbRegistry.has(registryKey)) {
+    const cached = dbRegistry.get(registryKey) as TypedDatabase<S, any>;
     setDefaultDatabase(cached as unknown as TypedDatabase<any>);
-    return cached;
+    // An async database was already initialized when it was first created,
+    // so the cached proxy resolves immediately.
+    return driver === "sqlite"
+      ? (cached as TypedDatabase<S, "sync">)
+      : Promise.resolve(cached as unknown as AsyncTypedDatabase<S>);
   }
 
   const db = new YattaDB(options);
@@ -199,12 +226,17 @@ export function createDatabase<S extends DatabaseSchema = DatabaseSchema>(
     getPrototypeOf() {
       return Object.getPrototypeOf(db);
     },
-  }) as unknown as TypedDatabase<S>;
+  }) as unknown as TypedDatabase<S, any>;
 
-  dbRegistry.set(resolvedPath, proxy as unknown as TypedDatabase<any>);
+  dbRegistry.set(registryKey, proxy as unknown as TypedDatabase<any>);
   setDefaultDatabase(proxy as unknown as TypedDatabase<any>);
 
-  return proxy;
+  if (driver === "sqlite") return proxy as TypedDatabase<S, "sync">;
+  // Async drivers connect + sync schema before the proxy is handed out.
+  return (async () => {
+    await db.initialize();
+    return proxy as AsyncTypedDatabase<S>;
+  })();
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -232,6 +264,30 @@ export interface DBFunction<S extends DatabaseSchema = RegisteredSchema> {
 export type DBProxy<S extends DatabaseSchema = RegisteredSchema> = DBFunction<S> & {
   readonly [K in keyof S]: Table<InferRow<S[K]>, InferInsert<S[K]>>;
 } & YattaDB;
+
+/**
+ * Callable signature of the global `DB` accessor over an async driver
+ * (PGlite, Turso, DuckDB, SurrealDB).
+ *
+ * @template S Registered database schema.
+ */
+export interface AsyncDBFunction<S extends DatabaseSchema = RegisteredSchema> {
+  <CustomSchema extends DatabaseSchema = S>(): AsyncTypedDatabase<CustomSchema>;
+  <K extends keyof S>(tableName: K): Table<InferRow<S[K]>, InferInsert<S[K]>, "async">;
+  <T extends Record<string, any> = Record<string, any>, TInsert extends Record<string, any> = Partial<T>>(
+    tableName: string,
+  ): Table<T, TInsert, "async">;
+}
+
+/**
+ * Combined type of the global `DB` accessor over an async driver: function
+ * call, table property accessors, and YattaDB engine methods (all async).
+ *
+ * @template S Registered database schema.
+ */
+export type AsyncDBProxy<S extends DatabaseSchema = RegisteredSchema> = AsyncDBFunction<S> & {
+  readonly [K in keyof S]: Table<InferRow<S[K]>, InferInsert<S[K]>, "async">;
+} & YattaDB<"async">;
 
 const dbCaller = function (tableOrPath?: string) {
   let activeDb = getDefaultDatabase();

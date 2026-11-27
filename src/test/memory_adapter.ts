@@ -49,6 +49,9 @@ export const MEMORY_CAPABILITIES: AdapterCapabilities = {
   backupRestore: "none",
   multiProcessSafe: false,
   maxBindParams: 999,
+  // The test double carries the real SQLite dialect; Table never runs
+  // against it through YattaDB, but the compiler path is its shape.
+  compilerSql: true,
 };
 
 const CLOSED_MESSAGE = "Cannot use a closed database.";
@@ -198,6 +201,7 @@ export class MemoryAdapter implements DatabaseAdapter<"sync"> {
   private schemas = new Map<string, TableSchema>();
   private tables = new Map<string, Map<string | number, Record<string, unknown>>>();
   private nextId = new Map<string, number>();
+  private appliedMigrations = new Set<string>();
   private txStack: Snapshot[] = [];
   private closed = false;
 
@@ -238,6 +242,23 @@ export class MemoryAdapter implements DatabaseAdapter<"sync"> {
 
   ensureSearchIndex(_table: string, _schema: TableSchema): void {
     // No-op: the LIKE-style substring scan needs no index.
+  }
+
+  ftsTableExists(_table: string): boolean {
+    // No standalone index table: the LIKE scan reads the live rows.
+    return false;
+  }
+
+  ensureMigrationTable(): void {
+    // No-op: the applied-migration set below is the table.
+  }
+
+  listAppliedMigrations(): string[] {
+    return [...this.appliedMigrations];
+  }
+
+  recordMigration(name: string): void {
+    this.appliedMigrations.add(name);
   }
 
   clearStatementCache(): void {
@@ -503,6 +524,7 @@ export class MemoryAdapter implements DatabaseAdapter<"sync"> {
     this.tables.clear();
     this.schemas.clear();
     this.nextId.clear();
+    this.appliedMigrations.clear();
     this.txStack = [];
     this.closed = true;
   }

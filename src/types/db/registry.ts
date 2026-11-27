@@ -7,6 +7,7 @@
 // an engine <-> factory import cycle. The factory import below is type-only
 // and erased at compile time, so there is no runtime cycle.
 
+import path from "node:path";
 import type { TypedDatabase } from "./factory";
 
 const REGISTRY_KEY = Symbol.for("yatta.db.registry");
@@ -28,4 +29,24 @@ export function getDefaultDatabase(): TypedDatabase<any> | null {
 
 export function setDefaultDatabase(db: TypedDatabase<any> | null): void {
   g[DEFAULT_DB_KEY] = db;
+}
+
+/**
+ * Resolves and normalizes an input database path to an absolute filesystem path.
+ *
+ * Lives here (not in factory.ts) so the engine can build driver-aware
+ * registry keys without importing the factory — the factory imports the
+ * engine, so the reverse import would be a cycle.
+ *
+ * @param targetPath Relative or absolute path, or `":memory:"`.
+ * @returns Absolute filesystem path or `":memory:"`.
+ */
+export function resolveDatabasePath(targetPath?: string): string {
+  const p = targetPath ?? "Database/app.db";
+  if (p === ":memory:") return ":memory:";
+  const hasExtension = path.extname(p) !== "";
+  const normalized = (!hasExtension || p.endsWith("/") || p.endsWith("\\"))
+    ? path.join(p, "app.db")
+    : p;
+  return path.resolve(process.cwd(), normalized);
 }
