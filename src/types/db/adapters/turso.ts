@@ -16,6 +16,16 @@
 //   `concurrency: 1` — one connection, which keeps PRAGMA state (foreign_keys,
 //   journal_mode) stable across statements and makes every statement run on
 //   the connection the open transaction holds.
+// - `@libsql/client` is loaded through `loadLibsql()` (a computed-specifier
+//   `require`), never statically imported: the client loads a native
+//   binding (`@libsql/linux-x64-gnu`) at import time, and a static import
+//   makes `bun build --compile` bundle the client but leave the binding
+//   unresolvable — a standalone binary then crashes at startup with
+//   "Cannot find module '@libsql/linux-x64-gnu'", even for apps that only
+//   use SQLite. The computed require is invisible to the bundler, so the
+//   package stays out of the binary entirely; a Turso database loads it
+//   from `node_modules` at runtime instead, so a standalone binary that
+//   USES Turso needs the package resolvable next to it.
 // - `client.execute(sql, args)` returns a ResultSet whose rows carry both
 //   numeric and named access; rows are converted to plain objects from
 //   `columns`, with BLOB ArrayBuffers converted to Uint8Array (bun:sqlite
@@ -30,7 +40,7 @@
 // - COUNT(*) comes back as a number (intMode "number", the default);
 //   lastInsertRowid is a bigint (converted to Number for "run" mode).
 
-import { createClient, type Client, type InValue, type ResultSet, type Transaction } from "@libsql/client";
+import type { Client, InValue, ResultSet, Transaction } from "@libsql/client";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -49,6 +59,20 @@ import type {
   TransactionOptions,
 } from "../adapter";
 import { TursoDialect } from "./turso_dialect";
+
+/**
+ * Loads `@libsql/client` through a computed-specifier `require` (see the
+ * header note): the client is created in the adapter's synchronous
+ * constructor, so a dynamic `import()` cannot be used here, and a static
+ * import would bundle the native binding loader into standalone binaries
+ * that never use Turso. `require` with a computed specifier is invisible
+ * to `bun build`, so the package is resolved from `node_modules` only
+ * when a Turso database is actually created.
+ */
+function loadLibsql(): typeof import("@libsql/client") {
+  const specifier = ["@libsql", "client"].join("/");
+  return require(specifier) as typeof import("@libsql/client");
+}
 import { SqlCompiler } from "../sql_compiler";
 import type { SqlDialect } from "../sql_dialect";
 import type { WhereClause } from "../query";
@@ -233,6 +257,8 @@ export const TURSO_CAPABILITIES: AdapterCapabilities = {
   multiProcessSafe: false,
   // SQLite's historical SQLITE_MAX_VARIABLE_NUMBER floor, as for SQLite.
   maxBindParams: 999,
+  // The Postgres dialect compiles runnable SQL.
+  compilerSql: true,
 };
 
 /**
@@ -944,14 +970,7 @@ export class TursoSession implements DatabaseSession<"async"> {
    * the Transaction object.
    */
   protected async syncSchemaBody(schema: DatabaseSchema, schemaHash: string): Promise<void> {
-    await this.run(`
-      CREATE TABLE IF NOT EXISTS "_yatta_migrations" (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE,
-        hash TEXT,
-        applied_at TEXT DEFAULT CURRENT_TIMESTAMP
-      );
-    `, [], "run");
+    await this.ensureMigrationTable();
 
     for (const [tableName, tableDef] of Object.entries(schema)) {
       const indexSqls: string[] = [];
@@ -1224,6 +1243,42 @@ export class TursoSession implements DatabaseSession<"async"> {
       `Cannot add a column: the stored CREATE TABLE text has an unbalanced column list.`,
     );
   }
+
+  /**
+   * Creates the migration-marker table (`_yatta_migrations`) in SQLite
+   * DDL (libSQL speaks SQLite). Runs on this session, so it works on a
+   * transaction child session as well as the root adapter.
+   */
+  async ensureMigrationTable(): Promise<void> {
+    await this.run(
+      `
+      CREATE TABLE IF NOT EXISTS "_yatta_migrations" (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        hash TEXT,
+        applied_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+    `,
+      [],
+      "run",
+    );
+  }
+
+  /** Names of migrations already recorded as applied. */
+  async listAppliedMigrations(): Promise<string[]> {
+    return (
+      (await this.run("SELECT name FROM _yatta_migrations", [], "all")) as { name: string }[]
+    ).map((r) => r.name);
+  }
+
+  /** Records one migration as applied (ignored when already present). */
+  async recordMigration(name: string): Promise<void> {
+    await this.run(
+      `INSERT OR IGNORE INTO "_yatta_migrations" (name, hash) VALUES (?, ?)`,
+      [name, "migration"],
+      "run",
+    );
+  }
 }
 
 /**
@@ -1242,7 +1297,7 @@ export class TursoAdapter extends TursoSession implements DatabaseAdapter<"async
         fs.mkdirSync(dir, { recursive: true });
       }
     }
-    const client = createClient({
+    const client = loadLibsql().createClient({
       url: resolved.url,
       ...(options.authToken !== undefined ? { authToken: options.authToken } : {}),
       ...(options.syncUrl !== undefined ? { syncUrl: options.syncUrl } : {}),
@@ -1405,7 +1460,7 @@ export class TursoAdapter extends TursoSession implements DatabaseAdapter<"async
     let validationClient: Client | null = null;
     try {
       fs.copyFileSync(sourcePath, tempPath);
-      validationClient = createClient({ url: `file:${tempPath}`, intMode: "number" });
+      validationClient = loadLibsql().createClient({ url: `file:${tempPath}`, intMode: "number" });
       const check = await validationClient.execute("PRAGMA quick_check;");
       const ok = check.rows[0] as unknown as { quick_check: string } | undefined;
       if (ok?.quick_check !== "ok") {
@@ -1490,7 +1545,7 @@ export class TursoAdapter extends TursoSession implements DatabaseAdapter<"async
       }
       throw new YattaError(`Restore failed and was rolled back: ${err.message}`);
     } finally {
-      this.client = createClient({
+      this.client = loadLibsql().createClient({
         url: `file:${localPath}`,
         concurrency: 1,
         intMode: "number",

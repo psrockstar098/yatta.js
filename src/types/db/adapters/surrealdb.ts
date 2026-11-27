@@ -15,6 +15,11 @@
 // no server exists in this environment — and no auth is wired: only
 // servers that accept unauthenticated connections work).
 //
+// `@surrealdb/node` is loaded through `loadSurrealNode()` (a
+// computed-specifier `require`), never statically imported: it loads a
+// native binding at import time, and a static import breaks standalone
+// binaries that never use SurrealDB (see the loader's comment).
+//
 // ── ID mapping (the decision) ─────────────────────────────────────────────
 // The ORM's primary-key column IS the SurrealDB record id. There is no
 // separate `id` field stored in the record:
@@ -97,12 +102,31 @@ import {
   type SurrealQueryable,
   type SurrealTransaction,
 } from "surrealdb";
-import { createNodeEngines } from "@surrealdb/node";
 import { YattaError } from "../errors";
 import type { ColumnDefinition, DatabaseSchema, TableSchema } from "../schema";
 import { tokenizeText } from "../search";
 import { SqlCompiler } from "../sql_compiler";
 import type { CompiledSql, SqlDialect, UpsertPlan } from "../sql_dialect";
+
+/**
+ * Loads `@surrealdb/node` through a computed-specifier dynamic `import()`.
+ * The package has NO `require` condition in its exports map (import-only),
+ * so a sync `require` cannot load it, and a static import makes
+ * `bun build --compile` bundle it but leave its native binding
+ * (`@surrealdb/node-native`) unresolvable — a standalone binary then
+ * crashes at startup with "Cannot find native binding", even for apps
+ * that only use SQLite. The computed import is invisible to the bundler,
+ * so the package stays out of the binary entirely; a SurrealDB database
+ * loads it from `node_modules` at runtime instead, so a standalone binary
+ * that USES SurrealDB needs the package resolvable next to it. The
+ * `surrealdb` package itself is pure JS and stays statically imported.
+ * Because the import is async, the `Surreal` client is created lazily in
+ * `ensureReady()` (below), not in the adapter's synchronous constructor.
+ */
+async function loadSurrealNode(): Promise<typeof import("@surrealdb/node")> {
+  const specifier = ["@surrealdb", "node"].join("/");
+  return (await import(specifier)) as typeof import("@surrealdb/node");
+}
 import type {
   AdapterCapabilities,
   CompiledFindQuery,
@@ -144,6 +168,10 @@ export const SURREALDB_CAPABILITIES: AdapterCapabilities = {
   // server would be multi-process safe, but the default is not.
   multiProcessSafe: false,
   maxBindParams: 999,
+  // No runnable SQL: the dialect refuses every SQL-emitting method and
+  // the session builds SurrealQL directly, so Table must use the
+  // session methods instead of the compiler.
+  compilerSql: false,
 };
 
 /** Connection options for the SurrealDB adapter (Phase 2). */
@@ -437,7 +465,8 @@ const surrealCompiler = new SqlCompiler(surrealDialect);
 
 /** Mutable state shared by the adapter and every session it spawns. */
 interface SurrealHolder {
-  db: Surreal;
+  /** The shared client, created lazily in ensureReady() (see loadSurrealNode). */
+  db: Surreal | null;
   url: string;
   namespace: string;
   database: string;
@@ -554,10 +583,26 @@ export class SurrealDBSession implements DatabaseSession<"async"> {
 
   constructor(
     protected readonly holder: SurrealHolder,
-    private readonly executor: SurrealQueryable,
+    /** The transaction executor, or null for the root session (whose queryable is the shared client, created lazily in ensureReady()). */
+    private readonly executor: SurrealQueryable | null,
     private readonly inTx: boolean,
     private readonly debug: boolean = false,
   ) {}
+
+  /** The queryable for this session: the transaction executor, or the shared client once connected. */
+  protected get queryable(): SurrealQueryable {
+    if (this.executor) return this.executor;
+    const db = this.holder.db;
+    if (!db) throw new YattaError("SurrealDB connection is not ready yet.");
+    return db;
+  }
+
+  /** The shared client, once ensureReady() has created it. */
+  protected requireDb(): Surreal {
+    const db = this.holder.db;
+    if (!db) throw new YattaError("SurrealDB connection is not ready yet.");
+    return db;
+  }
 
   /** Whether this session is currently inside a transaction. */
   get inTransaction(): boolean {
@@ -573,10 +618,20 @@ export class SurrealDBSession implements DatabaseSession<"async"> {
         throw new YattaError("SurrealDB connection is closed.");
       }
       try {
-        await this.holder.db.connect(this.holder.url);
-        await this.holder.db.use({ namespace: this.holder.namespace, database: this.holder.database });
+        if (!this.holder.db) {
+          // The client is created here, not in the constructor: its
+          // engines need @surrealdb/node, which only loads through a
+          // dynamic import (see loadSurrealNode).
+          const node = await loadSurrealNode();
+          this.holder.db = new Surreal({
+            engines: { ...createRemoteEngines(), ...node.createNodeEngines() },
+          });
+        }
+        const db = this.holder.db;
+        await db.connect(this.holder.url);
+        await db.use({ namespace: this.holder.namespace, database: this.holder.database });
         // Readiness probe: selecting the namespace/database must work.
-        await this.holder.db.query("INFO FOR DB;");
+        await db.query("INFO FOR DB;");
       } catch (err) {
         throw wrapSurrealError(err);
       }
@@ -603,7 +658,7 @@ export class SurrealDBSession implements DatabaseSession<"async"> {
     await this.ensureReady();
     const start = this.debug ? performance.now() : 0;
     try {
-      const collected = (await this.executor.query(surql, bindings)) as unknown[];
+      const collected = (await this.queryable.query(surql, bindings)) as unknown[];
       const first = collected[0];
       if (this.debug) {
         console.log(
@@ -1278,6 +1333,15 @@ export class SurrealDBSession implements DatabaseSession<"async"> {
   }
 
   /**
+   * No standalone FTS table exists on this driver: the BM25 indexes live
+   * on the table itself and the engine removes deleted rows from them,
+   * so there is nothing for Table.delete to clean up. Always false.
+   */
+  async ftsTableExists(_table: string): Promise<boolean> {
+    return false;
+  }
+
+  /**
    * Makes sure one table's full-text index exists: the shared analyzer
    * plus one FULLTEXT index per searchable column. Called by `search()`
    * so a first search never fails on a missing index, and by
@@ -1338,6 +1402,43 @@ export class SurrealDBSession implements DatabaseSession<"async"> {
     return this.transaction(fn);
   }
 
+  /**
+   * Creates the migration-marker table (`_yatta_migrations`) with
+   * DEFINE TABLE / DEFINE FIELD. Runs on this session, so it works on
+   * a transaction child session as well as the root adapter. The `id`
+   * is the server-generated record id, not a field, so it is not
+   * defined (like syncSchema skips non-`id` pk columns).
+   */
+  async ensureMigrationTable(): Promise<void> {
+    await this.ensureReady();
+    await this.runQuery(`DEFINE TABLE IF NOT EXISTS _yatta_migrations SCHEMAFULL TYPE NORMAL;`);
+    await this.runQuery(`DEFINE FIELD IF NOT EXISTS name ON TABLE _yatta_migrations TYPE string;`);
+    await this.runQuery(`DEFINE FIELD IF NOT EXISTS hash ON TABLE _yatta_migrations TYPE option<string>;`);
+    await this.runQuery(`DEFINE FIELD IF NOT EXISTS applied_at ON TABLE _yatta_migrations TYPE option<datetime>;`);
+    await this.runQuery(
+      `DEFINE INDEX IF NOT EXISTS uniq__yatta_migrations_name ON TABLE _yatta_migrations FIELDS name UNIQUE;`,
+    );
+  }
+
+  /** Names of migrations already recorded as applied. */
+  async listAppliedMigrations(): Promise<string[]> {
+    const rows = await this.runQuery(`SELECT name FROM _yatta_migrations;`);
+    return rows.map((r) => r.name as string);
+  }
+
+  /**
+   * Records one migration as applied (ignored when already present —
+   * the check-then-create runs under the migration lock, so no race).
+   */
+  async recordMigration(name: string): Promise<void> {
+    const applied = await this.listAppliedMigrations();
+    if (applied.includes(name)) return;
+    await this.runQuery(
+      `INSERT INTO _yatta_migrations (name, hash, applied_at) VALUES ($name, $hash, time::now());`,
+      { name, hash: "migration" },
+    );
+  }
+
   // ── Raw SurrealQL ──────────────────────────────────────────────────────
 
   /**
@@ -1365,7 +1466,7 @@ export class SurrealDBSession implements DatabaseSession<"async"> {
   async executeBatch(sql: string): Promise<void> {
     await this.ensureReady();
     try {
-      await this.executor.query(sql);
+      await this.queryable.query(sql);
     } catch (err) {
       throw wrapSurrealError(err, sql);
     }
@@ -1396,7 +1497,7 @@ export class SurrealDBSession implements DatabaseSession<"async"> {
     }
     let tx: SurrealTransaction;
     try {
-      tx = await this.holder.db.beginTransaction();
+      tx = await this.requireDb().beginTransaction();
     } catch (err) {
       throw wrapSurrealError(err);
     }
@@ -1438,14 +1539,15 @@ export class SurrealDBAdapter extends SurrealDBSession implements DatabaseAdapte
     const url = options.url ?? "mem://";
     const namespace = options.namespace ?? "yatta";
     const database = options.database ?? "yatta";
-    // Remote (ws/wss) engines alongside the embedded Node engines, so
-    // one client serves both endpoints. createNodeEngines registers
-    // mem/rocksdb/surrealkv; createRemoteEngines registers ws/wss/http.
-    const db = new Surreal({
-      engines: { ...createRemoteEngines(), ...createNodeEngines() },
-    });
+    // The Surreal client is NOT created here: its engines need
+    // @surrealdb/node, which only loads through a dynamic import (see
+    // loadSurrealNode), so the client is created lazily in ensureReady().
+    // Remote (ws/wss) engines are registered alongside the embedded Node
+    // engines there, so one client serves both endpoints.
+    // createNodeEngines registers mem/rocksdb/surrealkv;
+    // createRemoteEngines registers ws/wss/http.
     const holder: SurrealHolder = {
-      db,
+      db: null,
       url,
       namespace,
       database,
@@ -1456,7 +1558,7 @@ export class SurrealDBAdapter extends SurrealDBSession implements DatabaseAdapte
       activeTx: 0,
       ensuredSequences: new Set(),
     };
-    super(holder, db, false, options.debug ?? false);
+    super(holder, null, false, options.debug ?? false);
     this.path = url;
   }
 
@@ -1475,6 +1577,7 @@ export class SurrealDBAdapter extends SurrealDBSession implements DatabaseAdapte
    */
   async syncSchema(schema: DatabaseSchema): Promise<void> {
     await this.ensureReady();
+    await this.ensureMigrationTable();
     for (const [tableName, tableDef] of Object.entries(schema)) {
       qIdent(tableName);
       const pkCol = pkColumnName(tableDef);
@@ -1554,7 +1657,9 @@ export class SurrealDBAdapter extends SurrealDBSession implements DatabaseAdapte
     await this.ensureReady();
     const rows = await this.runQuery("INFO FOR DB;");
     const info = rows[0] as { tables?: Record<string, string> } | undefined;
-    return Object.keys(info?.tables ?? {}).sort();
+    // The migration-marker table is infrastructure, not a user table —
+    // the other adapters exclude it from listTables() the same way.
+    return Object.keys(info?.tables ?? {}).filter((t) => t !== "_yatta_migrations").sort();
   }
 
   async listColumns(table: string): Promise<IntrospectedColumn[]> {
@@ -1631,7 +1736,7 @@ export class SurrealDBAdapter extends SurrealDBSession implements DatabaseAdapte
     await this.ensureReady();
     let exported: unknown;
     try {
-      exported = await this.holder.db.export();
+      exported = await this.requireDb().export();
     } catch (err) {
       throw wrapSurrealError(err);
     }
@@ -1680,18 +1785,18 @@ export class SurrealDBAdapter extends SurrealDBSession implements DatabaseAdapte
     }
     this.holder.ensuredSequences.clear();
     try {
-      await this.holder.db.import(content);
+      await this.requireDb().import(content);
     } catch (err) {
       throw wrapSurrealError(err);
     }
   }
 
-  /** Closes the SurrealDB connection. Idempotent. */
+  /** Closes the SurrealDB connection. Idempotent. A never-connected adapter has no client to close. */
   async close(): Promise<void> {
     if (this.holder.closed) return;
     this.holder.closed = true;
     try {
-      await this.holder.db.close();
+      await this.holder.db?.close();
     } catch (err) {
       throw wrapSurrealError(err);
     }
